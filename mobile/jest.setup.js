@@ -1,18 +1,11 @@
 // Jest setup file. Runs before every test.
-//
-// Puts a fake fetch on the global scope so tests that call the API
-// client don't actually hit the network. Individual tests can
-// override this via global.fetch = jest.fn().
 
-// Silence the "act(...)" warnings from React 19 that appear even
-// when tests don't render anything. These come from internal React
-// scheduling, not from our code.
+// Silence React 19's act() environment warning during tests.
 global.IS_REACT_ACT_ENVIRONMENT = false;
 
-// A minimal fetch that returns a rejected promise. Tests that expect
-// a fetch call will mock it themselves. Tests that accidentally call
-// fetch without mocking will fail loudly instead of trying real
-// network I/O.
+// Provide a default fetch mock that rejects. Tests that expect a
+// fetch call will override this themselves; tests that accidentally
+// hit the network fail loudly instead of hanging.
 global.fetch = jest.fn(() =>
   Promise.reject(new Error('fetch was called without a mock'))
 );

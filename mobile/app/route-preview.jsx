@@ -3,7 +3,7 @@
 // Shows the route on a map, the summary line, the turn-by-turn steps,
 // and the narration.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -12,7 +12,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { Stack, useLocalSearchParams } from 'expo-router';
 
 import { RouteMap } from '@/components/MapView';
 import { RouteSummary } from '@/components/RouteSummary';
@@ -56,7 +56,7 @@ export default function RoutePreviewScreen() {
       try {
         const data = await narrateRoute({ fromPlaceId, toPlaceId, live: false });
         if (!cancelled) setNarration(data);
-      } catch (_err) {
+            } catch {
         if (!cancelled) setNarration(null);
       }
     }
@@ -88,9 +88,6 @@ export default function RoutePreviewScreen() {
 
   const seconds = estimateWalkingSeconds(route.distance_m);
 
-  // Markers: the first and last point of the route, labelled with the
-  // from/to names. Route geometry always has at least two points when
-  // the API returns success.
   const markers = [
     {
       lat: route.geometry[0].lat,

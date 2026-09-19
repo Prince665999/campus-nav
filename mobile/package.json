@@ -30,20 +30,26 @@
   },
   "private": true,
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@testing-library/react-native": "^14.0.1",
-    "eslint": "^10.11.0",
+    "eslint": "^9.39.5",
+    "eslint-config-expo": "^57.0.2",
     "eslint-config-prettier": "^10.1.8",
+    "eslint-import-resolver-alias": "^1.1.2",
+    "globals": "^17.12.0",
     "jest-expo": "^57.0.5",
     "prettier": "^3.9.8"
   },
   "jest": {
-  "preset": "jest-expo",
-  "setupFiles": ["<rootDir>/jest.setup.js"],
-  "moduleNameMapper": {
-    "^@/(.*)$": "<rootDir>/$1"
-  },
-  "transformIgnorePatterns": [
-    "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@unimodules/.*|unimodules|sentry-expo|native-base|react-native-svg|react-native-maps|@maplibre/maplibre-react-native)"
-  ]
-}
+    "preset": "jest-expo",
+    "setupFiles": [
+      "<rootDir>/jest.setup.js"
+    ],
+    "moduleNameMapper": {
+      "^@/(.*)$": "<rootDir>/$1"
+    },
+    "transformIgnorePatterns": [
+      "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@unimodules/.*|unimodules|sentry-expo|native-base|react-native-svg|react-native-maps|@maplibre/maplibre-react-native)"
+    ]
+  }
 }

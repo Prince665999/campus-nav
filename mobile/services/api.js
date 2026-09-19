@@ -26,7 +26,7 @@ async function request(path, options = {}) {
       try {
         const body = await response.json();
         if (body && body.detail) detail = body.detail;
-      } catch (_ignored) {
+            } catch {
         // Response wasn't JSON. Keep the generic message.
       }
       throw new Error(detail);

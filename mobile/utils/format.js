@@ -19,8 +19,8 @@ export function formatDistance(meters) {
 }
 
 export function formatDuration(seconds) {
+  if (seconds < 60) return '< 1 min';
   const minutes = Math.round(seconds / 60);
-  if (minutes < 1) return '< 1 min';
   if (minutes < 60) return `${minutes} min`;
   const hours = Math.floor(minutes / 60);
   const remainder = minutes % 60;
