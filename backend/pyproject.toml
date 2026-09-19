@@ -1,0 +1,44 @@
+[project]
+name = "campus-nav-backend"
+version = "0.1.0"
+description = "Backend for the Campus Navigation app"
+requires-python = ">=3.11"
+
+# ---------- Ruff ----------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "data",
+    ".venv",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The three frozen files keep their original style and are never edited.
+"core/campus_graph.py" = ["E", "F", "W", "I", "B", "UP"]
+"core/ai_navigator.py" = ["E", "F", "W", "I", "B", "UP"]
+"core/turn_by_turn.py" = ["E", "F", "W", "I", "B", "UP"]
+"core/tests/fixtures/synthetic_maps.py" = ["E501"]
+
+# ---------- Pytest ----------
+[tool.pytest.ini_options]
+testpaths = ["core/tests", "tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers"
+pythonpath = ["..", ".", "core", "core/tests"]

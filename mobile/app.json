@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "Campus Navigation",
+    "slug": "campus-nav",
+    "version": "0.5.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "scheme": "campusnav",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "tz.campusnav.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Campus Navigation uses your location to show your position on the campus map and to guide you to your destination."
+      }
+    },
+    "android": {
+      "package": "tz.campusnav.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "@maplibre/maplibre-react-native"
+    ],
+    "experiments": {
+      "typedRoutes": false
+    },
+    "extra": {
+      "apiBaseUrl": "http://localhost:8000",
+      "router": {},
+      "eas": {
+        "projectId": "50161181-8462-4251-87a2-b1036cdbf819"
+      }
+    }
+  }
+}

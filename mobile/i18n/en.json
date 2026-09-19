@@ -1,0 +1,39 @@
+{
+  "common": {
+    "loading": "Loading…",
+    "error": "Something went wrong",
+    "retry": "Try again",
+    "cancel": "Cancel",
+    "ok": "OK",
+    "search": "Search",
+    "noResults": "No places found",
+    "meters": "m",
+    "kilometers": "km"
+  },
+  "home": {
+    "title": "Where to?",
+    "searchPlaceholder": "Search a place…",
+    "recentTitle": "Recent",
+    "favoritesTitle": "Favorites",
+    "categoriesTitle": "Browse",
+    "nearbyTitle": "Near me"
+  },
+  "place": {
+    "takeMeThere": "Take me there",
+    "noDescription": "No description yet.",
+    "openNow": "Open now",
+    "closed": "Closed",
+    "wheelchairAccessible": "Wheelchair accessible",
+    "notAccessible": "Not wheelchair accessible",
+    "hasWifi": "Wi-Fi available"
+  },
+  "route": {
+    "title": "Route",
+    "startButton": "Start walking",
+    "distanceLabel": "Distance",
+    "estimatedTime": "About {minutes} min",
+    "turnByTurn": "Turn by turn",
+    "narration": "Walk description",
+    "noRoute": "No route found between those places."
+  }
+}
