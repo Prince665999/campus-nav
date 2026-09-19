@@ -1,27 +1,27 @@
-// Map component. Wraps react-native-maps.
+// MapView.jsx — MapLibre version.
 //
-// Draws:
-//   - the campus map (whatever the device provides)
-//   - the route line, if a geometry array is given
-//   - start and end markers
-//   - optionally, the user's position (Phase 6)
+// This replaces the react-native-maps version. The public interface
+// is identical: geometry, markers, style. Nothing outside this file
+// changes.
 //
-// All coordinates come from the API as { lat, lon }. react-native-maps
-// wants { latitude, longitude }. This component converts.
+// IMPORTANT: MapLibre requires the MapView to have flex: 1 or explicit
+// height/width. Without it, the map renders at zero size and you see
+// nothing. This is the single most common MapLibre bug on Android.
 
 import { useMemo, useRef, useEffect } from 'react';
 import { StyleSheet, View } from 'react-native';
-import MapView, { Marker, Polyline } from 'react-native-maps';
+import {
+  MapView,
+  Camera,
+  ShapeSource,
+  LineLayer,
+  MarkerView,
+} from '@maplibre/maplibre-react-native';
 
-// Default view if no route is given: this is only a fallback. A real
-// map view should always come with at least one coordinate to center
-// on, but if none is provided we still need to render something.
-const DEFAULT_REGION = {
-  latitude: -6.7500,
-  longitude: 39.2000,
-  latitudeDelta: 0.01,
-  longitudeDelta: 0.01,
-};
+// OpenFreeMap Liberty — free, no API key, no account.
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
+
+const DEFAULT_CENTER = [39.2000, -6.7500]; // [lon, lat] — note the order
 
 export function RouteMap({
   geometry = [],
@@ -29,95 +29,110 @@ export function RouteMap({
   userLocation = null,
   style,
 }) {
-  const mapRef = useRef(null);
+  const cameraRef = useRef(null);
 
-  // Convert API coords to react-native-maps coords.
+  // MapLibre uses GeoJSON coordinate order: [longitude, latitude].
+  // The API gives us { lat, lon }. Convert here.
   const routeCoords = useMemo(
-    () =>
-      geometry.map((p) => ({
-        latitude: p.lat,
-        longitude: p.lon,
-      })),
+    () => geometry.map((p) => [p.lon, p.lat]),
     [geometry]
   );
 
-  const markerCoords = useMemo(
-    () =>
-      markers.map((m) => ({
-        latitude: m.lat,
-        longitude: m.lon,
-        title: m.title,
-        description: m.description,
-      })),
-    [markers]
-  );
+  const lineGeoJSON = useMemo(() => {
+    if (routeCoords.length < 2) return null;
+    return {
+      type: 'Feature',
+      properties: {},
+      geometry: {
+        type: 'LineString',
+        coordinates: routeCoords,
+      },
+    };
+  }, [routeCoords]);
 
-  // Fit the map to the route the first time it appears.
+  // Fit the camera to the route when it appears.
   useEffect(() => {
-    if (routeCoords.length < 2 || !mapRef.current) return;
-    // react-native-maps' fitToCoordinates expects a small delay when
-    // the map just mounted, otherwise it fits to the pre-layout size.
+    if (routeCoords.length < 2 || !cameraRef.current) return;
+
+    const lons = routeCoords.map((c) => c[0]);
+    const lats = routeCoords.map((c) => c[1]);
+    const bounds = {
+      ne: [Math.max(...lons), Math.max(...lats)],
+      sw: [Math.min(...lons), Math.min(...lats)],
+      paddingTop: 40,
+      paddingRight: 40,
+      paddingBottom: 40,
+      paddingLeft: 40,
+    };
+
     const timeout = setTimeout(() => {
-      mapRef.current?.fitToCoordinates(routeCoords, {
-        edgePadding: { top: 40, right: 40, bottom: 40, left: 40 },
-        animated: true,
+      cameraRef.current?.setCamera({
+        bounds,
+        animationDuration: 500,
       });
     }, 200);
+
     return () => clearTimeout(timeout);
   }, [routeCoords]);
 
-  const initialRegion = useMemo(() => {
-    if (routeCoords.length > 0) {
-      return {
-        latitude: routeCoords[0].latitude,
-        longitude: routeCoords[0].longitude,
-        latitudeDelta: 0.005,
-        longitudeDelta: 0.005,
-      };
-    }
-    return DEFAULT_REGION;
-  }, [routeCoords]);
+  const initialCenter =
+    routeCoords.length > 0 ? routeCoords[0] : DEFAULT_CENTER;
 
   return (
     <View style={[styles.wrapper, style]}>
       <MapView
-        ref={mapRef}
         style={styles.map}
-        initialRegion={initialRegion}
-        showsUserLocation={false}
-        showsMyLocationButton={false}
-        showsCompass={true}
-        toolbarEnabled={false}
+        mapStyle={MAP_STYLE}
+        logoEnabled={false}
+        attributionEnabled={false}
+        compassEnabled={true}
       >
-        {routeCoords.length > 1 ? (
-          <Polyline
-            coordinates={routeCoords}
-            strokeColor="#2563eb"
-            strokeWidth={4}
-            lineCap="round"
-            lineJoin="round"
-          />
+        <Camera
+          ref={cameraRef}
+          defaultSettings={{
+            centerCoordinate: initialCenter,
+            zoomLevel: 16,
+          }}
+        />
+
+        {lineGeoJSON ? (
+          <ShapeSource id="routeSource" shape={lineGeoJSON}>
+            <LineLayer
+              id="routeLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 4,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
         ) : null}
 
-        {markerCoords.map((coord, i) => (
-          <Marker
+        {markers.map((marker, i) => (
+          <MarkerView
             key={i}
-            coordinate={{ latitude: coord.latitude, longitude: coord.longitude }}
-            title={coord.title}
-            description={coord.description}
-            pinColor={i === 0 ? '#16a34a' : '#dc2626'}
-          />
+            coordinate={[marker.lon, marker.lat]}
+            anchor={{ x: 0.5, y: 1.0 }}
+          >
+            <View style={styles.marker}>
+              <View
+                style={[
+                  styles.markerDot,
+                  { backgroundColor: i === 0 ? '#16a34a' : '#dc2626' },
+                ]}
+              />
+            </View>
+          </MarkerView>
         ))}
 
         {userLocation ? (
-          <Marker
-            coordinate={{
-              latitude: userLocation.lat,
-              longitude: userLocation.lon,
-            }}
-            pinColor="#2563eb"
-            title="You are here"
-          />
+          <MarkerView
+            coordinate={[userLocation.lon, userLocation.lat]}
+            anchor={{ x: 0.5, y: 0.5 }}
+          >
+            <View style={styles.userDot} />
+          </MarkerView>
         ) : null}
       </MapView>
     </View>
@@ -129,6 +144,29 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   map: {
-    ...StyleSheet.absoluteFillObject,
+    // flex: 1 is REQUIRED. Without it the map collapses to 0px on Android.
+    // The parent container in route-preview.jsx has height: 280, so
+    // flex: 1 fills that.
+    flex: 1,
+  },
+  marker: {
+    // MapLibre clips marker children that extend outside these bounds
+    // on Android. A small padding prevents the pin from being cut off.
+    padding: 4,
+  },
+  markerDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
+  userDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#2563eb',
+    borderWidth: 2,
+    borderColor: '#ffffff',
   },
 });
