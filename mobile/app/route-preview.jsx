@@ -1,7 +1,7 @@
 // Route preview screen.
 //
 // Shows the route on a map, the summary line, the turn-by-turn steps,
-// and the narration.
+// and the narration. "Start walking" navigates to the walking screen.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -12,7 +12,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { Stack, useLocalSearchParams } from 'expo-router';
+import { router, Stack, useLocalSearchParams } from 'expo-router';
 
 import { RouteMap } from '@/components/MapView';
 import { RouteSummary } from '@/components/RouteSummary';
@@ -56,7 +56,7 @@ export default function RoutePreviewScreen() {
       try {
         const data = await narrateRoute({ fromPlaceId, toPlaceId, live: false });
         if (!cancelled) setNarration(data);
-            } catch {
+      } catch {
         if (!cancelled) setNarration(null);
       }
     }
@@ -67,8 +67,16 @@ export default function RoutePreviewScreen() {
   }, [fromPlaceId, toPlaceId]);
 
   const startWalking = useCallback(() => {
-    // Phase 6 wires this up.
-  }, []);
+    if (!route) return;
+    router.push({
+      pathname: '/walking',
+      params: {
+        fromId: String(fromPlaceId),
+        toId: String(toPlaceId),
+        routeJson: JSON.stringify(route),
+      },
+    });
+  }, [route, fromPlaceId, toPlaceId]);
 
   if (loading) {
     return (

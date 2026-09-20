@@ -19,6 +19,7 @@ export default function RootLayout() {
         <Stack.Screen name="index" options={{ title: 'Campus Navigation' }} />
         <Stack.Screen name="place/[id]" options={{ title: 'Place' }} />
         <Stack.Screen name="route-preview" options={{ title: 'Route' }} />
+        <Stack.Screen name="walking" options={{ title: 'Walking' }} />
       </Stack>
     </SafeAreaProvider>
   );
