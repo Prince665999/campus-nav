@@ -1,4 +1,4 @@
-// Home screen. The app's landing page and search interface.
+// Home screen.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -14,20 +14,41 @@ import { SearchBar } from '@/components/SearchBar';
 import { PlaceCard } from '@/components/PlaceCard';
 import { CategoryChips } from '@/components/CategoryChips';
 import { useDebounce } from '@/hooks/useDebounce';
-import { listPlaces } from '@/services/api';
+import { listPlaces, listRecents, listFavorites } from '@/services/api';
 import { t } from '@/i18n';
 import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
+import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 
 export default function HomeScreen() {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState(null);
   const [results, setResults] = useState([]);
+  const [recents, setRecents] = useState([]);
+  const [favorites, setFavorites] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
+  const isSearching = debouncedQuery.length > 0 || category !== null;
 
-  // Fetch places whenever the debounced query or category changes.
+  // Load recents and favorites once on mount.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      listRecents({ limit: 5 }).catch(() => []),
+      listFavorites().catch(() => []),
+    ]).then(([r, f]) => {
+      if (!cancelled) {
+        setRecents(r);
+        setFavorites(f);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Search when query or category changes.
   useEffect(() => {
     let cancelled = false;
 
@@ -58,13 +79,17 @@ export default function HomeScreen() {
     router.push(`/place/${place.id}`);
   }, []);
 
+  // When searching, show the search results. When not, show recents
+  // and favorites. When neither exists, show a hint.
+  const showSearchResults = isSearching;
+
   return (
     <View style={styles.container}>
       <SearchBar
         value={query}
         onChangeText={setQuery}
         placeholder={t('home.searchPlaceholder')}
-        loading={loading && !error}
+        loading={loading && !error && isSearching}
       />
 
       <CategoryChips selected={category} onSelect={setCategory} />
@@ -73,27 +98,92 @@ export default function HomeScreen() {
         <View style={styles.state}>
           <Text style={styles.errorText}>{error}</Text>
         </View>
-      ) : results.length === 0 && !loading ? (
-        <View style={styles.state}>
-          <Text style={styles.emptyText}>{t('common.noResults')}</Text>
-        </View>
+      ) : showSearchResults ? (
+        results.length === 0 && !loading ? (
+          <View style={styles.state}>
+            <Text style={styles.emptyText}>{t('common.noResults')}</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={results}
+            keyExtractor={(item) => String(item.id)}
+            renderItem={({ item }) => (
+              <PlaceCard place={item} onPress={() => openPlace(item)} />
+            )}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.listContent}
+          />
+        )
       ) : (
         <FlatList
-          data={results}
-          keyExtractor={(item) => String(item.id)}
-          renderItem={({ item }) => (
-            <PlaceCard place={item} onPress={() => openPlace(item)} />
+          data={[{ key: 'sections' }]}
+          keyExtractor={(item) => item.key}
+          renderItem={() => (
+            <>
+              {recents.length > 0 ? (
+                <Section title={t('home.recentTitle')}>
+                  {recents.map((place) => (
+                    <PlaceCard
+                      key={`recent-${place.place_id}`}
+                      place={{
+                        id: place.place_id,
+                        name: place.name,
+                        name_sw: place.name_sw,
+                        category: place.category,
+                        location: place.location,
+                      }}
+                      onPress={() => openPlace({ id: place.place_id })}
+                    />
+                  ))}
+                </Section>
+              ) : null}
+
+              {favorites.length > 0 ? (
+                <Section title={t('home.favoritesTitle')}>
+                  {favorites.map((place) => (
+                    <PlaceCard
+                      key={`fav-${place.place_id}`}
+                      place={{
+                        id: place.place_id,
+                        name: place.name,
+                        name_sw: place.name_sw,
+                        category: place.category,
+                        location: place.location,
+                      }}
+                      onPress={() => openPlace({ id: place.place_id })}
+                      isFavorite
+                    />
+                  ))}
+                </Section>
+              ) : null}
+
+              {recents.length === 0 && favorites.length === 0 ? (
+                <View style={styles.state}>
+                  <Text style={styles.emptyText}>
+                    {t('home.emptyHint')}
+                  </Text>
+                </View>
+              ) : null}
+            </>
           )}
-          keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.listContent}
         />
       )}
 
-      {loading && results.length === 0 ? (
+      {loading && results.length === 0 && isSearching ? (
         <View style={styles.state}>
-          <ActivityIndicator color="#6b7280" />
+          <ActivityIndicator color={COLORS.textMuted} />
         </View>
       ) : null}
+    </View>
+  );
+}
+
+function Section({ title, children }) {
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      {children}
     </View>
   );
 }
@@ -101,7 +191,7 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f9fafb',
+    backgroundColor: COLORS.backgroundSubtle,
   },
   state: {
     paddingVertical: 40,
@@ -109,15 +199,30 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   errorText: {
-    color: '#dc2626',
+    color: COLORS.danger,
     fontSize: 15,
     textAlign: 'center',
   },
   emptyText: {
-    color: '#6b7280',
+    color: COLORS.textMuted,
     fontSize: 15,
+    textAlign: 'center',
   },
   listContent: {
     paddingBottom: 32,
+  },
+  section: {
+    marginTop: SPACING.md,
+    backgroundColor: COLORS.background,
+  },
+  sectionTitle: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    paddingHorizontal: SPACING.md,
+    paddingTop: SPACING.md,
+    paddingBottom: SPACING.sm,
   },
 });

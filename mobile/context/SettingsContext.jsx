@@ -3,10 +3,12 @@
 // Usage:
 //   const { settings, updateSetting } = useSettings();
 //   settings.voiceEnabled // true or false
+//   settings.language     // 'en' or 'sw'
 
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
 
 import { getJSON, setJSON } from '@/services/storage';
+import { setLanguage as setI18nLanguage } from '@/i18n';
 
 const STORAGE_KEY = 'campus-nav-settings-v1';
 
@@ -14,6 +16,7 @@ const DEFAULT_SETTINGS = {
   voiceEnabled: true,
   voiceRate: 0.95,
   units: 'metric',
+  language: 'en',
   wifiProximityEnabled: true,
 };
 
@@ -32,7 +35,10 @@ export function SettingsProvider({ children }) {
     let cancelled = false;
     getJSON(STORAGE_KEY).then((stored) => {
       if (cancelled) return;
-      if (stored) setSettings({ ...DEFAULT_SETTINGS, ...stored });
+      const merged = { ...DEFAULT_SETTINGS, ...(stored || {}) };
+      setSettings(merged);
+      // Apply the persisted language to the i18n module immediately.
+      setI18nLanguage(merged.language);
       setLoaded(true);
     });
     return () => {
@@ -44,6 +50,12 @@ export function SettingsProvider({ children }) {
     setSettings((prev) => {
       const next = { ...prev, [key]: value };
       setJSON(STORAGE_KEY, next);
+
+      // Language is special: it has a side effect on the i18n module.
+      if (key === 'language') {
+        setI18nLanguage(value);
+      }
+
       return next;
     });
   }, []);

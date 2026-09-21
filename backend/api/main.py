@@ -1,9 +1,7 @@
 """
 main.py
 
-The FastAPI application. Wires together every router, registers the
-error handlers, mounts the media static files, and configures CORS
-for local mobile development.
+The FastAPI application.
 """
 
 import logging
@@ -16,22 +14,29 @@ from .errors import (
     http_exception_handler,
     unhandled_exception_handler,
 )
-from .routers import areas, health, media, narrate, places, route
+from .routers import (
+    areas,
+    favorites,
+    health,
+    media,
+    narrate,
+    places,
+    reports,
+    route,
+)
 from .settings import MEDIA_DIR
 
 logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
-    """Build the FastAPI app. Separate from module-level creation so
-    tests can construct a fresh app if needed."""
     app = FastAPI(
         title="Campus Navigation API",
         description=(
             "Backend for the Campus Navigation mobile app. Wraps the "
             "existing A* routing engine and narration pipeline."
         ),
-        version="0.8.0",
+        version="0.10.0",
     )
 
     app.add_middleware(
@@ -51,21 +56,20 @@ def create_app() -> FastAPI:
     app.include_router(route.router)
     app.include_router(narrate.router)
     app.include_router(media.router)
+    app.include_router(favorites.router)
+    app.include_router(reports.router)
 
-    # Serve uploaded photos as static files at /media/<path>.
-    # The media_service writes them here; the response URLs point
-    # at this mount point.
     app.mount(
         "/media",
         StaticFiles(directory=str(MEDIA_DIR)),
         name="media",
     )
 
-    @app.get("/", tags=["root"])
+    @app.get("/", tags=["core"])
     def root():
         return {
             "name": "Campus Navigation API",
-            "version": "0.8.0",
+            "version": "0.10.0",
             "docs": "/docs",
             "health": "/api/health",
         }

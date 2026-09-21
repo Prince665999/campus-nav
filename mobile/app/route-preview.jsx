@@ -1,7 +1,4 @@
 // Route preview screen.
-//
-// Shows the route on a map, the summary line, the turn-by-turn steps,
-// and the narration. "Start walking" navigates to the walking screen.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -18,8 +15,10 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { RouteMap } from '@/components/MapView';
 import { RouteSummary } from '@/components/RouteSummary';
 import { computeRoute, narrateRoute } from '@/services/api';
+import { useSettings } from '@/context/SettingsContext';
 import { t } from '@/i18n';
 import { estimateWalkingSeconds, formatDistance } from '@/utils/format';
+import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 
 export default function RoutePreviewScreen() {
   const { fromId, toId } = useLocalSearchParams();
@@ -27,6 +26,7 @@ export default function RoutePreviewScreen() {
   const toPlaceId = Number(toId);
 
   const insets = useSafeAreaInsets();
+  const { settings } = useSettings();
 
   const [route, setRoute] = useState(null);
   const [narration, setNarration] = useState(null);
@@ -57,7 +57,12 @@ export default function RoutePreviewScreen() {
     let cancelled = false;
     async function load() {
       try {
-        const data = await narrateRoute({ fromPlaceId, toPlaceId, live: false });
+        const data = await narrateRoute({
+          fromPlaceId,
+          toPlaceId,
+          lang: settings.language,
+          live: false,
+        });
         if (!cancelled) setNarration(data);
       } catch {
         if (!cancelled) setNarration(null);
@@ -67,7 +72,7 @@ export default function RoutePreviewScreen() {
     return () => {
       cancelled = true;
     };
-  }, [fromPlaceId, toPlaceId]);
+  }, [fromPlaceId, toPlaceId, settings.language]);
 
   const startWalking = useCallback(() => {
     if (!route) return;
@@ -84,7 +89,7 @@ export default function RoutePreviewScreen() {
   if (loading) {
     return (
       <View style={styles.state}>
-        <ActivityIndicator color="#6b7280" />
+        <ActivityIndicator color={COLORS.textMuted} />
       </View>
     );
   }
@@ -114,7 +119,7 @@ export default function RoutePreviewScreen() {
 
   return (
     <>
-      <Stack.Screen options={{ title: 'Route' }} />
+      <Stack.Screen options={{ title: t('route.title') }} />
       <View style={styles.container}>
         <RouteMap
           geometry={route.geometry}
@@ -166,26 +171,31 @@ export default function RoutePreviewScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#ffffff' },
+  container: { flex: 1, backgroundColor: COLORS.background },
   state: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#f9fafb',
+    backgroundColor: COLORS.backgroundSubtle,
   },
-  errorText: { color: '#dc2626', fontSize: 15, textAlign: 'center', padding: 20 },
+  errorText: {
+    color: COLORS.danger,
+    fontSize: 15,
+    textAlign: 'center',
+    padding: 20,
+  },
   map: { height: 280 },
   body: { flex: 1 },
   bodyContent: { paddingBottom: 32 },
   section: {
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: SPACING.lg,
+    paddingVertical: SPACING.md,
     borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    borderBottomColor: COLORS.borderSubtle,
   },
   sectionTitle: {
-    fontSize: 13,
-    color: '#6b7280',
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
     fontWeight: '600',
     textTransform: 'uppercase',
     letterSpacing: 0.5,
@@ -194,22 +204,22 @@ const styles = StyleSheet.create({
   step: { flexDirection: 'row', marginBottom: 12 },
   stepDistance: {
     width: 60,
-    color: '#9ca3af',
+    color: COLORS.textFaint,
     fontSize: 13,
     paddingTop: 2,
   },
-  stepText: { flex: 1, color: '#111827', fontSize: 15, lineHeight: 22 },
+  stepText: { flex: 1, color: COLORS.text, fontSize: 15, lineHeight: 22 },
   narrationText: { color: '#374151', fontSize: 16, lineHeight: 24 },
   footer: {
     paddingTop: 16,
     paddingHorizontal: 16,
     borderTopWidth: 1,
-    borderTopColor: '#f3f4f6',
-    backgroundColor: '#ffffff',
+    borderTopColor: COLORS.borderSubtle,
+    backgroundColor: COLORS.background,
   },
   primaryButton: {
-    backgroundColor: '#111827',
-    borderRadius: 12,
+    backgroundColor: COLORS.primaryDark,
+    borderRadius: RADIUS.md,
     paddingVertical: 16,
     alignItems: 'center',
   },

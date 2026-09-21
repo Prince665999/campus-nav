@@ -1,29 +1,32 @@
 // Banner shown when the student has been off-route for several
-// consecutive GPS fixes. Offers a recalculate button.
+// consecutive GPS fixes.
 
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+
+import { t } from '@/i18n';
+import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 
 export function OffRouteBanner({ onRecalculate, onDismiss }) {
   return (
     <View style={styles.banner}>
       <View style={styles.body}>
-        <Text style={styles.title}>You seem off route</Text>
+        <Text style={styles.title}>{t('walking.offRouteTitle')}</Text>
         <Text style={styles.subtitle}>
-          Are you on a different path?
+          {t('walking.offRouteSubtitle')}
         </Text>
       </View>
       <TouchableOpacity
         style={styles.button}
         onPress={onRecalculate}
         accessibilityRole="button"
-        accessibilityLabel="Recalculate route"
+        accessibilityLabel={t('walking.recalculate')}
       >
-        <Text style={styles.buttonText}>Recalculate</Text>
+        <Text style={styles.buttonText}>{t('walking.recalculate')}</Text>
       </TouchableOpacity>
       <TouchableOpacity
         onPress={onDismiss}
         accessibilityRole="button"
-        accessibilityLabel="Dismiss"
+        accessibilityLabel={t('common.close')}
         style={styles.dismissButton}
       >
         <Text style={styles.dismissText}>✕</Text>
@@ -36,23 +39,23 @@ const styles = StyleSheet.create({
   banner: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#fef3c7',
+    backgroundColor: COLORS.warningBg,
     borderBottomWidth: 1,
-    borderBottomColor: '#fcd34d',
-    paddingHorizontal: 16,
+    borderBottomColor: COLORS.warningBorder,
+    paddingHorizontal: SPACING.md,
     paddingVertical: 12,
-    gap: 12,
+    gap: SPACING.sm,
   },
   body: { flex: 1 },
-  title: { fontSize: 15, fontWeight: '600', color: '#78350f' },
-  subtitle: { fontSize: 13, color: '#92400e', marginTop: 2 },
+  title: { fontSize: 15, fontWeight: '600', color: COLORS.warningText },
+  subtitle: { fontSize: 13, color: COLORS.warningTextSubtle, marginTop: 2 },
   button: {
-    backgroundColor: '#78350f',
+    backgroundColor: COLORS.warningText,
     paddingHorizontal: 14,
     paddingVertical: 8,
-    borderRadius: 8,
+    borderRadius: RADIUS.sm,
   },
   buttonText: { color: '#ffffff', fontSize: 14, fontWeight: '600' },
   dismissButton: { padding: 6 },
-  dismissText: { color: '#78350f', fontSize: 16, fontWeight: '600' },
+  dismissText: { color: COLORS.warningText, fontSize: 16, fontWeight: '600' },
 });

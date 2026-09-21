@@ -1,15 +1,10 @@
 // The card at the bottom of the walking screen.
-//
-// Shows the current instruction, the distance to the next turn, a
-// thin progress bar, and a compass arrow pointing at the next turn.
-//
-// The bottom edge uses safe-area inset so the card isn't covered by
-// the phone's navigation bar or home indicator.
 
 import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { CompassArrow } from '@/components/CompassArrow';
+import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 import { formatDistance } from '@/utils/format';
 
@@ -26,7 +21,7 @@ export function InstructionCard({
   if (!step) {
     return (
       <View style={[styles.card, { paddingBottom: insets.bottom + SPACING.md }]}>
-        <Text style={styles.instruction}>Calculating route…</Text>
+        <Text style={styles.instruction}>{t('walking.calculating')}</Text>
       </View>
     );
   }
@@ -53,10 +48,10 @@ export function InstructionCard({
 
           <View style={styles.meta}>
             <Text style={styles.metaItem}>
-              {formatDistance(distanceToNextStepM)} to next
+              {formatDistance(distanceToNextStepM)} {t('common.toNext')}
             </Text>
             <Text style={styles.metaItem}>
-              {formatDistance(distanceRemainingM)} left
+              {formatDistance(distanceRemainingM)} {t('common.left')}
             </Text>
           </View>
         </View>

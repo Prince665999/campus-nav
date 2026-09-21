@@ -60,7 +60,7 @@ INGEST_REPLACE = os.environ.get("INGEST_REPLACE", "false").lower() == "true"
 # Base URL used to build absolute photo URLs in API responses.
 # In development this is the LAN address of the machine running the API.
 # Phase 17 sets this to the production domain.
-MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://localhost:8000")
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://192.168.100.148:8000")
 
 # Maximum size of an uploaded photo, in bytes. 10 MB.
 MEDIA_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))

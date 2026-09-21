@@ -1,8 +1,11 @@
-// One result row in the search results.
+// One result row in the search results, or in the recents or
+// favorites list on Home.
 
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
-export function PlaceCard({ place, onPress }) {
+import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+
+export function PlaceCard({ place, onPress, isFavorite = false }) {
   const subtitle = place.category ? prettifyCategory(place.category) : null;
 
   return (
@@ -27,42 +30,49 @@ export function PlaceCard({ place, onPress }) {
           </Text>
         ) : null}
       </View>
+      {isFavorite ? (
+        <Text style={styles.star} accessibilityLabel="Favorite">
+          ★
+        </Text>
+      ) : null}
     </TouchableOpacity>
   );
 }
 
-// Turn "amenity=restaurant" into "Restaurant".
 function prettifyCategory(category) {
   const value = category.includes('=') ? category.split('=')[1] : category;
-  return value
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 const styles = StyleSheet.create({
   card: {
-    backgroundColor: '#ffffff',
-    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.background,
+    paddingHorizontal: SPACING.md,
     paddingVertical: 14,
     borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    borderBottomColor: COLORS.borderSubtle,
   },
-  body: {
-    flex: 1,
-  },
+  body: { flex: 1 },
   name: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#111827',
+    color: COLORS.text,
   },
   nameSw: {
     fontSize: 14,
-    color: '#6b7280',
+    color: COLORS.textMuted,
     marginTop: 2,
   },
   category: {
-    fontSize: 13,
-    color: '#9ca3af',
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textFaint,
     marginTop: 4,
+  },
+  star: {
+    fontSize: 20,
+    color: COLORS.warning,
+    marginLeft: SPACING.sm,
   },
 });

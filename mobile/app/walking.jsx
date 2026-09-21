@@ -1,24 +1,30 @@
 // Walking Mode screen.
 //
-// Live map with the student's snapped position, a compass arrow
-// pointing at the next turn, spoken instructions, and an off-route
-// banner when needed.
+// Live map with the student's snapped position, a compass arrow,
+// spoken instructions, an off-route banner, an approach photo, and
+// a report button. Navigates to the arrival screen on arrival.
 
-import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
-import { Stack, useLocalSearchParams } from 'expo-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { router, Stack, useLocalSearchParams } from 'expo-router';
 
 import { RouteMap } from '@/components/MapView';
 import { InstructionCard } from '@/components/InstructionCard';
 import { OffRouteBanner } from '@/components/OffRouteBanner';
+import { ApproachPhoto } from '@/components/ApproachPhoto';
+import { ReportSheet } from '@/components/ReportSheet';
 import { useWalkingProgress } from '@/hooks/useWalkingProgress';
 import { useCompass } from '@/hooks/useCompass';
 import { useSettings } from '@/context/SettingsContext';
-import { computeRoute } from '@/services/api';
+import { computeRoute, listMediaForPlace, recordRecent } from '@/services/api';
+import { closestApproachPhoto } from '@/utils/media';
 import * as tts from '@/services/tts';
 import { bearingDeg } from '@/utils/geo';
-import { t } from '@/i18n';
+import { t, ttsLanguageForCurrentLang } from '@/i18n';
 import { COLORS } from '@/constants/theme';
+
+const APPROACH_PHOTO_DISTANCE_M = 60;
+const ARRIVAL_DISTANCE_M = 15;
 
 export default function WalkingScreen() {
   const { fromId, toId, routeJson } = useLocalSearchParams();
@@ -37,6 +43,10 @@ export default function WalkingScreen() {
   const [loading, setLoading] = useState(!route);
   const [error, setError] = useState(null);
   const [bannerDismissed, setBannerDismissed] = useState(false);
+  const [approachPhotos, setApproachPhotos] = useState([]);
+  const [photoDismissed, setPhotoDismissed] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const arrivedRef = useRef(false);
 
   const { settings } = useSettings();
   const { heading } = useCompass();
@@ -60,6 +70,28 @@ export default function WalkingScreen() {
     load();
   });
 
+  // Load destination photos once.
+  useEffect(() => {
+    let cancelled = false;
+    listMediaForPlace(Number(toId))
+      .then((items) => {
+        if (!cancelled) setApproachPhotos(items);
+      })
+      .catch(() => {
+        if (!cancelled) setApproachPhotos([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [toId]);
+
+  // Record this destination as a recent visit.
+  useEffect(() => {
+    recordRecent(Number(toId)).catch(() => {
+      // Non-fatal. Recents are a convenience, not a requirement.
+    });
+  }, [toId]);
+
   const {
     permissionGranted,
     position,
@@ -76,7 +108,10 @@ export default function WalkingScreen() {
   useEffect(() => {
     if (!settings.voiceEnabled) return;
     if (!currentStep) return;
-    tts.speak(currentStep.instruction, { rate: settings.voiceRate });
+    tts.speak(currentStep.instruction, {
+      rate: settings.voiceRate,
+      lang: ttsLanguageForCurrentLang(),
+    });
   }, [currentStep, settings.voiceEnabled, settings.voiceRate]);
 
   // Stop speech when leaving the screen.
@@ -86,19 +121,47 @@ export default function WalkingScreen() {
     };
   }, []);
 
+  // When the student arrives, go to the arrival screen.
+  // "Arrived" means within ARRIVAL_DISTANCE_M of the destination.
+  // The `arrived` flag ensures the navigation fires exactly once.
+  useEffect(() => {
+  if (arrivedRef.current) return;
+  if (!route) return;
+  if (distanceRemainingM > ARRIVAL_DISTANCE_M) return;
+  arrivedRef.current = true;
+  router.replace({
+    pathname: '/arrival',
+    params: { toId: String(toId) },
+  });
+  }, [distanceRemainingM, route, toId]);
+
+  // Pick the approach photo whose bearing best matches the direction
+  // we're approaching from.
+  const approachPhoto = (() => {
+    if (approachPhotos.length === 0) return null;
+    if (distanceRemainingM > APPROACH_PHOTO_DISTANCE_M) return null;
+
+    if (!position || !route?.geometry?.length) {
+      return approachPhotos.find((p) => p.is_primary) || approachPhotos[0];
+    }
+
+    const last = route.geometry[route.geometry.length - 1];
+    const approachBearing = bearingDeg(
+      position.lat,
+      position.lon,
+      last.lat,
+      last.lon
+    );
+
+    return closestApproachPhoto(approachPhotos, approachBearing);
+  })();
+
   // Bearing from the student's current position to the next step's
-  // location, or to the destination if on the last step. Used to
-  // point the compass arrow.
-  //
-  // The next step's location isn't in the route response (steps only
-  // have at_m), so we approximate: use the geometry point at that
-  // distance along the route. Simpler and accurate enough for a
-  // campus walk.
+  // location, or to the destination if on the last step.
   const bearing = (() => {
     if (!position || !route || !route.geometry || route.geometry.length < 2) {
       return null;
     }
-    // Compute the target distance along the route.
     const steps = route.steps;
     let targetAtM;
     if (currentStepIndex < steps.length - 1) {
@@ -107,7 +170,6 @@ export default function WalkingScreen() {
       targetAtM = route.distance_m;
     }
 
-    // Walk the geometry accumulating distance until we reach targetAtM.
     let cumulative = 0;
     for (let i = 0; i < route.geometry.length - 1; i++) {
       const a = route.geometry[i];
@@ -121,7 +183,6 @@ export default function WalkingScreen() {
       }
       cumulative += segLen;
     }
-    // Fallback: bearing to the last geometry point.
     const last = route.geometry[route.geometry.length - 1];
     return bearingDeg(position.lat, position.lon, last.lat, last.lon);
   })();
@@ -129,6 +190,7 @@ export default function WalkingScreen() {
   const handleRecalculate = useCallback(async () => {
     if (!position) return;
     setBannerDismissed(false);
+    setPhotoDismissed(false);
     resetOffRoute();
     tts.reset();
     try {
@@ -146,7 +208,7 @@ export default function WalkingScreen() {
   if (loading) {
     return (
       <>
-        <Stack.Screen options={{ title: 'Walking' }} />
+        <Stack.Screen options={{ title: t('walking.title') }} />
         <View style={styles.state}>
           <ActivityIndicator color={COLORS.textMuted} />
         </View>
@@ -157,7 +219,7 @@ export default function WalkingScreen() {
   if (error || !route) {
     return (
       <>
-        <Stack.Screen options={{ title: 'Walking' }} />
+        <Stack.Screen options={{ title: t('walking.title') }} />
         <View style={styles.state}>
           <Text style={styles.errorText}>{error || t('common.error')}</Text>
         </View>
@@ -168,10 +230,10 @@ export default function WalkingScreen() {
   if (permissionGranted === false) {
     return (
       <>
-        <Stack.Screen options={{ title: 'Walking' }} />
+        <Stack.Screen options={{ title: t('walking.title') }} />
         <View style={styles.state}>
           <Text style={styles.errorText}>
-            Location permission is needed to guide you.
+            {t('walking.permissionNeeded')}
           </Text>
         </View>
       </>
@@ -191,12 +253,24 @@ export default function WalkingScreen() {
     },
   ];
 
+  const showApproachPhoto = approachPhoto && !photoDismissed;
+
   return (
     <>
       <Stack.Screen
         options={{
-          title: 'Walking',
+          title: t('walking.title'),
           headerBackVisible: false,
+          headerRight: () => (
+            <TouchableOpacity
+              onPress={() => setReportOpen(true)}
+              style={styles.headerButton}
+              accessibilityRole="button"
+              accessibilityLabel={t('report.reportProblem')}
+            >
+              <Text style={styles.headerButtonText}>⚑</Text>
+            </TouchableOpacity>
+          ),
         }}
       />
       <View style={styles.container}>
@@ -216,6 +290,14 @@ export default function WalkingScreen() {
           />
         </View>
 
+        {showApproachPhoto ? (
+          <ApproachPhoto
+            photo={approachPhoto}
+            destinationName={route.to_name}
+            onDismiss={() => setPhotoDismissed(true)}
+          />
+        ) : null}
+
         <View style={styles.cardWrapper}>
           <InstructionCard
             step={currentStep}
@@ -227,12 +309,16 @@ export default function WalkingScreen() {
           />
         </View>
       </View>
+
+      <ReportSheet
+        visible={reportOpen}
+        onClose={() => setReportOpen(false)}
+        placeId={Number(toId)}
+      />
     </>
   );
 }
 
-// Local haversine — same formula as utils/geo.js, inlined here to
-// avoid importing the whole module for one call inside a render.
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const phi1 = (lat1 * Math.PI) / 180;
@@ -263,4 +349,6 @@ const styles = StyleSheet.create({
   mapWrapper: { flex: 1 },
   map: { flex: 1 },
   cardWrapper: { backgroundColor: COLORS.background },
+  headerButton: { padding: 6 },
+  headerButtonText: { fontSize: 22, color: COLORS.text },
 });

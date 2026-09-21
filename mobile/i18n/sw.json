@@ -1,0 +1,115 @@
+{
+  "common": {
+    "loading": "Inapakia…",
+    "error": "Kuna hitilafu",
+    "retry": "Jaribu tena",
+    "cancel": "Ghairi",
+    "ok": "Sawa",
+    "search": "Tafuta",
+    "noResults": "Hakuna mahali palipopatikana",
+    "meters": "m",
+    "kilometers": "km",
+    "toNext": "hadi kona",
+    "left": "zilizobaki",
+    "close": "Funga"
+  },
+  "home": {
+    "title": "Unakwenda wapi?",
+    "searchPlaceholder": "Tafuta mahali…",
+    "recentTitle": "Hivi karibuni",
+    "favoritesTitle": "Vipendwa",
+    "categoriesTitle": "Vinjari",
+    "nearbyTitle": "Karibu nami",
+    "emptyHint": "Tafuta mahali au vinjari kwa aina hapa chini."
+  },
+  "place": {
+    "takeMeThere": "Nipeleke hapo",
+    "noDescription": "Bado hakuna maelezo.",
+    "description": "Maelezo",
+    "openingHours": "Saa za kufungua",
+    "accessibility": "Ufikivu",
+    "wheelchairAccessible": "Inafikika kwa kiti cha magurudumu",
+    "notAccessible": "Haifikiwi kwa kiti cha magurudumu",
+    "hasWifi": "Wi-Fi inapatikana",
+    "photos": "Picha",
+    "photo": "Picha",
+    "addFavorite": "Ongeza kwenye vipendwa",
+    "removeFavorite": "Ondoa kwenye vipendwa"
+  },
+  "route": {
+    "title": "Njia",
+    "startButton": "Anza kutembea",
+    "distanceLabel": "Umbali",
+    "estimatedTime": "Dakika {minutes}",
+    "turnByTurn": "Maelekezo ya hatua kwa hatua",
+    "narration": "Maelezo ya safari",
+    "noRoute": "Hakuna njia kati ya mahali hapo."
+  },
+  "walking": {
+    "title": "Kutembea",
+    "offRouteTitle": "Unaonekana uko nje ya njia",
+    "offRouteSubtitle": "Umepitia njia nyingine?",
+    "recalculate": "Hesabu tena",
+    "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
+    "approaching": "Unakaribia {name}",
+    "calculating": "Inahesabu njia…"
+  },
+  "arrival": {
+    "title": "Kufika",
+    "arrived": "Umefika",
+    "wasHelpful": "Je, maelekezo yalikusaidia?",
+    "helpful": "Ndiyo",
+    "notHelpful": "Sio sana",
+    "thanks": "Asante kwa maoni yako.",
+    "savePlace": "Hifadhi mahali hapa",
+    "saved": "Imehifadhiwa kwenye vipendwa",
+    "done": "Maliza"
+  },
+  "report": {
+    "title": "Ripoti tatizo",
+    "reportProblem": "Ripoti tatizo",
+    "whatWrong": "Nini kilienda vibaya?",
+    "detailsOptional": "Maelezo (si lazima)",
+    "detailsPlaceholder": "Kitu kingine unataka kuongeza?",
+    "submit": "Tuma ripoti",
+    "thanks": "Asante — tutaangalia.",
+    "kinds": {
+      "wrong_direction": "Maelekezo yalikuwa si sahihi",
+      "blocked": "Njia imezuiwa",
+      "bad_photo": "Picha si sahihi",
+      "wrong_name": "Jina si sahihi",
+      "missing_path": "Njia haipo",
+      "missing_place": "Mahali haupo",
+      "incorrect_info": "Taarifa si sahihi",
+      "other": "Kitu kingine"
+    }
+  },
+  "settings": {
+    "title": "Mipangilio",
+    "voice": "Sauti",
+    "voiceDescription": "Soma kila maelekezo unapofika.",
+    "speakInstructions": "Soma maelekezo kwa sauti",
+    "language": "Lugha",
+    "languageDescription": "Lugha ya kiolesura na sauti.",
+    "units": "Vipimo",
+    "unitsMetric": "Metric",
+    "unitsImperial": "Imperial",
+    "wifi": "Wi-Fi",
+    "wifiNotifications": "Taarifa za Wi-Fi",
+    "wifiDescription": "Onyesha arifa unapokaribia sehemu ya Wi-Fi.",
+    "version": "Campus Navigation toleo {version}"
+  },
+  "categories": {
+    "all": "Zote",
+    "lectureHalls": "Madarasa",
+    "food": "Chakula",
+    "restaurant": "Mgahawa",
+    "fastFood": "Chakula cha haraka",
+    "banks": "Benki na ATM",
+    "toilets": "Vyoo",
+    "water": "Maji",
+    "offices": "Ofisi",
+    "hostels": "Hosteli",
+    "library": "Maktaba"
+  }
+}

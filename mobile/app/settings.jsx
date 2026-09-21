@@ -5,17 +5,32 @@
 import { StyleSheet, Switch, Text, TouchableOpacity, View } from 'react-native';
 
 import { useSettings } from '@/context/SettingsContext';
-import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+import { AVAILABLE_LANGUAGES, t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 
 export default function SettingsScreen() {
   const { settings, updateSetting } = useSettings();
 
   return (
     <View style={styles.container}>
-      <Section title="Voice">
+      <Section title={t('settings.language')}>
+        <View style={styles.segmented}>
+          {AVAILABLE_LANGUAGES.map((lang) => (
+            <SegmentButton
+              key={lang.code}
+              label={lang.label}
+              active={settings.language === lang.code}
+              onPress={() => updateSetting('language', lang.code)}
+            />
+          ))}
+        </View>
+        <Text style={styles.hint}>{t('settings.languageDescription')}</Text>
+      </Section>
+
+      <Section title={t('settings.voice')}>
         <Row
-          label="Speak instructions"
-          description="Read each turn aloud as you reach it."
+          label={t('settings.speakInstructions')}
+          description={t('settings.voiceDescription')}
         >
           <Switch
             value={settings.voiceEnabled}
@@ -24,25 +39,25 @@ export default function SettingsScreen() {
         </Row>
       </Section>
 
-      <Section title="Units">
+      <Section title={t('settings.units')}>
         <View style={styles.segmented}>
           <SegmentButton
-            label="Metric"
+            label={t('settings.unitsMetric')}
             active={settings.units === 'metric'}
             onPress={() => updateSetting('units', 'metric')}
           />
           <SegmentButton
-            label="Imperial"
+            label={t('settings.unitsImperial')}
             active={settings.units === 'imperial'}
             onPress={() => updateSetting('units', 'imperial')}
           />
         </View>
       </Section>
 
-      <Section title="Wi-Fi">
+      <Section title={t('settings.wifi')}>
         <Row
-          label="Wi-Fi notifications"
-          description="Show a banner when you're near a mapped Wi-Fi spot."
+          label={t('settings.wifiNotifications')}
+          description={t('settings.wifiDescription')}
         >
           <Switch
             value={settings.wifiProximityEnabled}
@@ -52,7 +67,9 @@ export default function SettingsScreen() {
       </Section>
 
       <View style={styles.footer}>
-        <Text style={styles.footerText}>Campus Navigation v0.7.0</Text>
+        <Text style={styles.footerText}>
+          {t('settings.version', { version: '0.9.0' })}
+        </Text>
       </View>
     </View>
   );
@@ -112,6 +129,11 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
     marginBottom: SPACING.md,
   },
+  hint: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textFaint,
+    marginTop: SPACING.sm,
+  },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -135,7 +157,7 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingVertical: 10,
     alignItems: 'center',
-    borderRadius: 8,
+    borderRadius: RADIUS.sm,
   },
   segmentActive: { backgroundColor: COLORS.background },
   segmentText: { fontSize: FONT_SIZE.body, color: COLORS.textMuted },

@@ -1,13 +1,4 @@
 // Place detail screen.
-//
-// Reached by tapping a search result. Shows everything the API knows
-// about one place, and offers a "Take me there" button that goes to
-// route preview.
-//
-// The route needs a "from" too. For now, we use the first place in
-// the database as a stand-in starting point — a real "from" arrives
-// in Phase 6 with GPS. The user never sees this; the preview just
-// uses it to compute a route.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -20,16 +11,29 @@ import {
 } from 'react-native';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 
-import { getPlace, listPlaces } from '@/services/api';
+import {
+  addFavorite,
+  getPlace,
+  isFavorite,
+  listMediaForPlace,
+  listPlaces,
+  removeFavorite,
+} from '@/services/api';
+import { PhotoCarousel } from '@/components/PhotoCarousel';
+import { ReportSheet } from '@/components/ReportSheet';
 import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 
 export default function PlaceDetailScreen() {
   const { id } = useLocalSearchParams();
   const placeId = Number(id);
 
   const [place, setPlace] = useState(null);
+  const [photos, setPhotos] = useState([]);
+  const [favorited, setFavorited] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [reportOpen, setReportOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,8 +41,16 @@ export default function PlaceDetailScreen() {
       setLoading(true);
       setError(null);
       try {
-        const data = await getPlace(placeId);
-        if (!cancelled) setPlace(data);
+        const [placeData, photoData, favFlag] = await Promise.all([
+          getPlace(placeId),
+          listMediaForPlace(placeId).catch(() => []),
+          isFavorite(placeId).catch(() => false),
+        ]);
+        if (!cancelled) {
+          setPlace(placeData);
+          setPhotos(photoData);
+          setFavorited(favFlag);
+        }
       } catch (err) {
         if (!cancelled) setError(err.message || t('common.error'));
       } finally {
@@ -51,10 +63,23 @@ export default function PlaceDetailScreen() {
     };
   }, [placeId]);
 
+  const toggleFavorite = useCallback(async () => {
+    const next = !favorited;
+    setFavorited(next); // optimistic update
+    try {
+      if (next) {
+        await addFavorite(placeId);
+      } else {
+        await removeFavorite(placeId);
+      }
+    } catch {
+      // Revert on failure.
+      setFavorited(!next);
+    }
+  }, [favorited, placeId]);
+
   const takeMeThere = useCallback(async () => {
     if (!place) return;
-    // Find a temporary "from" place — the first place that isn't this
-    // one. Replaced with real GPS in Phase 6.
     try {
       const others = await listPlaces({ limit: 5 });
       const from = others.find((p) => p.id !== place.id) || others[0];
@@ -77,7 +102,7 @@ export default function PlaceDetailScreen() {
   if (loading) {
     return (
       <View style={styles.state}>
-        <ActivityIndicator color="#6b7280" />
+        <ActivityIndicator color={COLORS.textMuted} />
       </View>
     );
   }
@@ -92,32 +117,54 @@ export default function PlaceDetailScreen() {
 
   return (
     <>
-      <Stack.Screen options={{ title: place.name }} />
+      <Stack.Screen
+        options={{
+          title: place.name,
+          headerRight: () => (
+            <TouchableOpacity
+              onPress={toggleFavorite}
+              style={styles.headerButton}
+              accessibilityRole="button"
+              accessibilityLabel={
+                favorited ? t('place.removeFavorite') : t('place.addFavorite')
+              }
+            >
+              <Text style={[styles.star, favorited && styles.starActive]}>
+                {favorited ? '★' : '☆'}
+              </Text>
+            </TouchableOpacity>
+          ),
+        }}
+      />
       <ScrollView style={styles.container}>
+        <PhotoCarousel photos={photos} />
+
         <View style={styles.header}>
           <Text style={styles.name}>{place.name}</Text>
           {place.name_sw ? (
             <Text style={styles.nameSw}>{place.name_sw}</Text>
           ) : null}
           {place.category ? (
-            <Text style={styles.category}>{prettifyCategory(place.category)}</Text>
+            <Text style={styles.category}>
+              {prettifyCategory(place.category)}
+            </Text>
           ) : null}
         </View>
 
-        <Section title="Description">
+        <Section title={t('place.description')}>
           <Text style={styles.body}>
             {place.description || t('place.noDescription')}
           </Text>
         </Section>
 
         {place.opening_hours ? (
-          <Section title="Opening hours">
+          <Section title={t('place.openingHours')}>
             <Text style={styles.body}>{place.opening_hours}</Text>
           </Section>
         ) : null}
 
         {place.wheelchair ? (
-          <Section title="Accessibility">
+          <Section title={t('place.accessibility')}>
             <Text style={styles.body}>
               {place.wheelchair === 'yes'
                 ? t('place.wheelchairAccessible')
@@ -146,8 +193,22 @@ export default function PlaceDetailScreen() {
               {t('place.takeMeThere')}
             </Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.reportLink}
+            onPress={() => setReportOpen(true)}
+            accessibilityRole="button"
+          >
+            <Text style={styles.reportLinkText}>{t('report.reportProblem')}</Text>
+          </TouchableOpacity>
         </View>
       </ScrollView>
+
+      <ReportSheet
+        visible={reportOpen}
+        onClose={() => setReportOpen(false)}
+        placeId={place.id}
+      />
     </>
   );
 }
@@ -167,50 +228,68 @@ function prettifyCategory(category) {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#ffffff' },
+  container: { flex: 1, backgroundColor: COLORS.background },
   state: {
     flex: 1,
     paddingVertical: 60,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#f9fafb',
+    backgroundColor: COLORS.backgroundSubtle,
   },
-  errorText: { color: '#dc2626', fontSize: 15, textAlign: 'center', padding: 20 },
+  errorText: {
+    color: COLORS.danger,
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
+    padding: SPACING.lg,
+  },
+  headerButton: { padding: 6 },
+  star: { fontSize: 24, color: COLORS.textFaint },
+  starActive: { color: COLORS.warning },
   header: {
-    padding: 20,
+    padding: SPACING.lg,
     borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    borderBottomColor: COLORS.borderSubtle,
   },
-  name: { fontSize: 24, fontWeight: '700', color: '#111827' },
-  nameSw: { fontSize: 16, color: '#6b7280', marginTop: 4 },
+  name: { fontSize: FONT_SIZE.hero, fontWeight: '700', color: COLORS.text },
+  nameSw: { fontSize: 16, color: COLORS.textMuted, marginTop: 4 },
   category: {
-    fontSize: 13,
-    color: '#9ca3af',
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textFaint,
     marginTop: 8,
     textTransform: 'uppercase',
     letterSpacing: 0.5,
   },
   section: {
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: SPACING.lg,
+    paddingVertical: SPACING.md,
     borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    borderBottomColor: COLORS.borderSubtle,
   },
   sectionTitle: {
-    fontSize: 13,
-    color: '#6b7280',
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
     fontWeight: '600',
     textTransform: 'uppercase',
     letterSpacing: 0.5,
     marginBottom: 8,
   },
-  body: { fontSize: 15, color: '#374151', lineHeight: 22 },
-  actions: { padding: 20 },
+  body: { fontSize: FONT_SIZE.body, color: '#374151', lineHeight: 22 },
+  actions: { padding: SPACING.lg },
   primaryButton: {
-    backgroundColor: '#111827',
-    borderRadius: 12,
+    backgroundColor: COLORS.primaryDark,
+    borderRadius: RADIUS.md,
     paddingVertical: 16,
     alignItems: 'center',
   },
   primaryButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
+  reportLink: {
+    marginTop: SPACING.md,
+    alignItems: 'center',
+    paddingVertical: SPACING.sm,
+  },
+  reportLinkText: {
+    color: COLORS.primary,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '500',
+  },
 });

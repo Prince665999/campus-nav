@@ -2,6 +2,8 @@
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { CATEGORIES } from '@/constants/categories';
+import { t } from '@/i18n';
+import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 
 export function CategoryChips({ selected, onSelect }) {
   return (
@@ -15,16 +17,16 @@ export function CategoryChips({ selected, onSelect }) {
         const isSelected = selected === cat.key;
         return (
           <TouchableOpacity
-            key={cat.label}
+            key={cat.key ?? 'all'}
             style={[styles.chip, isSelected && styles.chipSelected]}
             onPress={() => onSelect(cat.key)}
             accessibilityRole="button"
             accessibilityState={{ selected: isSelected }}
-            accessibilityLabel={cat.label}
+            accessibilityLabel={t(cat.labelKey)}
           >
             <Text style={styles.icon}>{cat.icon}</Text>
             <Text style={[styles.label, isSelected && styles.labelSelected]}>
-              {cat.label}
+              {t(cat.labelKey)}
             </Text>
           </TouchableOpacity>
         );
@@ -35,37 +37,30 @@ export function CategoryChips({ selected, onSelect }) {
 
 const styles = StyleSheet.create({
   scroll: {
-    marginTop: 4,
-    marginBottom: 8,
+    marginTop: SPACING.xs,
+    marginBottom: SPACING.sm,
+    maxHeight: 44,
   },
   scrollContent: {
-    paddingHorizontal: 16,
-    gap: 8,
+    paddingHorizontal: SPACING.md,
+    gap: SPACING.sm,
   },
   chip: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#ffffff',
+    backgroundColor: COLORS.background,
     borderWidth: 1,
-    borderColor: '#e5e7eb',
-    borderRadius: 20,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.pill,
     paddingHorizontal: 14,
     paddingVertical: 8,
     gap: 6,
   },
   chipSelected: {
-    backgroundColor: '#111827',
-    borderColor: '#111827',
+    backgroundColor: COLORS.primaryDark,
+    borderColor: COLORS.primaryDark,
   },
-  icon: {
-    fontSize: 14,
-  },
-  label: {
-    fontSize: 14,
-    color: '#374151',
-    fontWeight: '500',
-  },
-  labelSelected: {
-    color: '#ffffff',
-  },
+  icon: { fontSize: 14 },
+  label: { fontSize: 14, color: '#374151', fontWeight: '500' },
+  labelSelected: { color: '#ffffff' },
 });

@@ -8,7 +8,10 @@
     "search": "Search",
     "noResults": "No places found",
     "meters": "m",
-    "kilometers": "km"
+    "kilometers": "km",
+    "toNext": "to next",
+    "left": "left",
+    "close": "Close"
   },
   "home": {
     "title": "Where to?",
@@ -16,16 +19,22 @@
     "recentTitle": "Recent",
     "favoritesTitle": "Favorites",
     "categoriesTitle": "Browse",
-    "nearbyTitle": "Near me"
+    "nearbyTitle": "Near me",
+    "emptyHint": "Search for a place or browse categories below."
   },
   "place": {
     "takeMeThere": "Take me there",
     "noDescription": "No description yet.",
-    "openNow": "Open now",
-    "closed": "Closed",
+    "description": "Description",
+    "openingHours": "Opening hours",
+    "accessibility": "Accessibility",
     "wheelchairAccessible": "Wheelchair accessible",
     "notAccessible": "Not wheelchair accessible",
-    "hasWifi": "Wi-Fi available"
+    "hasWifi": "Wi-Fi available",
+    "photos": "Photos",
+    "photo": "Photo",
+    "addFavorite": "Add to favorites",
+    "removeFavorite": "Remove from favorites"
   },
   "route": {
     "title": "Route",
@@ -35,5 +44,72 @@
     "turnByTurn": "Turn by turn",
     "narration": "Walk description",
     "noRoute": "No route found between those places."
+  },
+  "walking": {
+    "title": "Walking",
+    "offRouteTitle": "You seem off route",
+    "offRouteSubtitle": "Are you on a different path?",
+    "recalculate": "Recalculate",
+    "permissionNeeded": "Location permission is needed to guide you.",
+    "approaching": "You're approaching {name}",
+    "calculating": "Calculating route…"
+  },
+  "arrival": {
+    "title": "Arrival",
+    "arrived": "You've arrived",
+    "wasHelpful": "Was this helpful?",
+    "helpful": "Yes",
+    "notHelpful": "Not really",
+    "thanks": "Thanks for the feedback.",
+    "savePlace": "Save this place",
+    "saved": "Saved to favorites",
+    "done": "Done"
+  },
+  "report": {
+    "title": "Report a problem",
+    "reportProblem": "Report a problem",
+    "whatWrong": "What went wrong?",
+    "detailsOptional": "Details (optional)",
+    "detailsPlaceholder": "Anything else you want to add?",
+    "submit": "Send report",
+    "thanks": "Thanks — we'll look into it.",
+    "kinds": {
+      "wrong_direction": "The directions were wrong",
+      "blocked": "The path is blocked",
+      "bad_photo": "The photo is wrong",
+      "wrong_name": "The name is wrong",
+      "missing_path": "A path is missing",
+      "missing_place": "A place is missing",
+      "incorrect_info": "The information is wrong",
+      "other": "Something else"
+    }
+  },
+  "settings": {
+    "title": "Settings",
+    "voice": "Voice",
+    "voiceDescription": "Read each turn aloud as you reach it.",
+    "speakInstructions": "Speak instructions",
+    "language": "Language",
+    "languageDescription": "Interface and voice language.",
+    "units": "Units",
+    "unitsMetric": "Metric",
+    "unitsImperial": "Imperial",
+    "wifi": "Wi-Fi",
+    "wifiNotifications": "Wi-Fi notifications",
+    "wifiDescription": "Show a banner when you're near a mapped Wi-Fi spot.",
+    "version": "Campus Navigation v{version}"
+  },
+  "categories": {
+    "all": "All",
+    "lectureHalls": "Lecture halls",
+    "food": "Food",
+    "restaurant": "Restaurant",
+    "fastFood": "Fast food",
+    "banks": "Banks & ATMs",
+    "toilets": "Toilets",
+    "water": "Water",
+    "offices": "Offices",
+    "hostels": "Hostels",
+    "library": "Library"
   }
 }

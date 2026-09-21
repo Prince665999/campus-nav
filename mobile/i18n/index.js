@@ -1,20 +1,27 @@
-// Tiny i18n helper. No library, just a lookup.
+// i18n helper. No library, just lookups.
 //
 // Usage in a component:
 //   import { t } from '@/i18n';
 //   <Text>{t('home.title')}</Text>
 //
 // Interpolation:
-//   t('route.estimatedTime', { minutes: 12 })
+//   t('walking.approaching', { name: 'Library' })
 //
-// Currently only English is loaded. Phase 9 adds a language toggle
-// and loads sw.json instead when the user picks Kiswahili.
+// The current language is set once by the Settings context on app
+// start and whenever the student changes it.
 
 import en from './en.json';
+import sw from './sw.json';
 
 const TRANSLATIONS = {
   en,
+  sw,
 };
+
+export const AVAILABLE_LANGUAGES = [
+  { code: 'en', label: 'English' },
+  { code: 'sw', label: 'Kiswahili' },
+];
 
 let _currentLang = 'en';
 
@@ -52,7 +59,7 @@ export function t(key, params) {
     return key;
   }
 
-  // Simple {placeholder} interpolation.
+  // {placeholder} interpolation.
   if (params) {
     value = value.replace(/\{(\w+)\}/g, (match, name) => {
       return params[name] != null ? String(params[name]) : match;
@@ -60,4 +67,13 @@ export function t(key, params) {
   }
 
   return value;
+}
+
+// TTS language codes. The phone's text-to-speech engine picks a
+// voice based on these. Falls back to the base language code if the
+// country-specific one isn't available — the engine handles that
+// automatically.
+export function ttsLanguageForCurrentLang() {
+  if (_currentLang === 'sw') return 'sw-TZ';
+  return 'en-TZ';
 }

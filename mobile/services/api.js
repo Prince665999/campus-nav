@@ -1,9 +1,11 @@
 // The API client. Every network call goes through here.
 //
-// Every function returns a Promise. Errors are thrown with a message
-// the UI can show directly.
+// Requests that need device identity automatically include the
+// X-Device-Id header. The header is added in the request() wrapper
+// so individual callers don't have to think about it.
 
 import { API_BASE_URL, API_TIMEOUT_MS } from '@/constants/config';
+import { getDeviceId } from '@/services/session';
 
 async function request(path, options = {}) {
   const url = API_BASE_URL + path;
@@ -11,22 +13,32 @@ async function request(path, options = {}) {
   const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
 
   try {
+    // The device ID is sent on every request. The backend ignores it
+    // for endpoints that don't need it, and hashes it for the ones
+    // that do.
+    const deviceId = await getDeviceId();
+
     const response = await fetch(url, {
       ...options,
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
+        'X-Device-Id': deviceId,
         ...(options.headers || {}),
       },
     });
 
+    // 204 No Content has no body. Return null.
+    if (response.status === 204) {
+      return null;
+    }
+
     if (!response.ok) {
-      // The API returns {detail, code} on errors. Try to read it.
       let detail = `Request failed (${response.status})`;
       try {
         const body = await response.json();
         if (body && body.detail) detail = body.detail;
-            } catch {
+      } catch {
         // Response wasn't JSON. Keep the generic message.
       }
       throw new Error(detail);
@@ -83,6 +95,14 @@ export async function listAreas({ q, category, landmark_only, limit } = {}) {
 }
 
 // ---------------------------------------------------------------
+// Media
+// ---------------------------------------------------------------
+
+export async function listMediaForPlace(placeId) {
+  return request(`/api/media/place/${placeId}`);
+}
+
+// ---------------------------------------------------------------
 // Route
 // ---------------------------------------------------------------
 
@@ -109,6 +129,63 @@ export async function narrateRoute({ fromPlaceId, toPlaceId, lang = 'en', live =
     live: String(live),
   });
   return request(`/api/narrate?${params.toString()}`);
+}
+
+// ---------------------------------------------------------------
+// Destinations: recents and favorites
+// ---------------------------------------------------------------
+
+export async function listRecents({ limit = 5 } = {}) {
+  return request(`/api/destinations/recent?limit=${limit}`);
+}
+
+export async function recordRecent(placeId) {
+  return request('/api/destinations/recent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ place_id: placeId }),
+  });
+}
+
+export async function listFavorites() {
+  return request('/api/destinations/favorites');
+}
+
+export async function addFavorite(placeId) {
+  return request('/api/destinations/favorites', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ place_id: placeId }),
+  });
+}
+
+export async function removeFavorite(placeId) {
+  return request(`/api/destinations/favorites/${placeId}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function isFavorite(placeId) {
+  const result = await request(`/api/destinations/favorites/${placeId}/exists`);
+  return result.is_favorite;
+}
+
+// ---------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------
+
+export async function createReport({ kind, body, placeId, edgeId, photoUrl }) {
+  return request('/api/reports', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind,
+      body: body || null,
+      place_id: placeId || null,
+      edge_id: edgeId || null,
+      photo_url: photoUrl || null,
+    }),
+  });
 }
 
 // ---------------------------------------------------------------
