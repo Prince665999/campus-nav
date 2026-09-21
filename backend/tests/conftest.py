@@ -14,20 +14,26 @@ import pytest
 @pytest.fixture
 def temp_db(tmp_path, monkeypatch):
     """
-    Point DATABASE_URL at a fresh SQLite file for the duration of one
-    test. Reloads settings and session so the engine is rebuilt
-    against the new URL, then creates the schema.
+    Point DATABASE_URL and MEDIA_DIR at temp locations for the
+    duration of one test. Reloads settings and session so the engine
+    is rebuilt against the new URL, then creates the schema.
     """
     db_file = tmp_path / "test.db"
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file}")
+    monkeypatch.setenv("MEDIA_DIR", str(media_dir))
 
     import importlib
 
     import backend.api.settings as settings_module
     import backend.api.db.session as session_module
+    import backend.api.services.media_service as media_service_module
 
     importlib.reload(settings_module)
     importlib.reload(session_module)
+    importlib.reload(media_service_module)
 
     from backend.api.db.init_db import init_db
 

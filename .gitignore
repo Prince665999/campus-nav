@@ -34,3 +34,5 @@ htmlcov/
 uploads/ 
 chroma_db/ 
 data/ 
+backend/data/media/*
+!backend/data/media/.gitkeep

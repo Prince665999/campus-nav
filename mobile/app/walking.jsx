@@ -1,29 +1,33 @@
 // Walking Mode screen.
 //
-// Live map with the student's snapped position, the current
-// instruction in a card below, and an off-route banner when needed.
+// Live map with the student's snapped position, a compass arrow
+// pointing at the next turn, spoken instructions, and an off-route
+// banner when needed.
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
-import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { Stack, useLocalSearchParams } from 'expo-router';
 
 import { RouteMap } from '@/components/MapView';
 import { InstructionCard } from '@/components/InstructionCard';
 import { OffRouteBanner } from '@/components/OffRouteBanner';
 import { useWalkingProgress } from '@/hooks/useWalkingProgress';
+import { useCompass } from '@/hooks/useCompass';
+import { useSettings } from '@/context/SettingsContext';
 import { computeRoute } from '@/services/api';
+import * as tts from '@/services/tts';
+import { bearingDeg } from '@/utils/geo';
 import { t } from '@/i18n';
+import { COLORS } from '@/constants/theme';
 
 export default function WalkingScreen() {
   const { fromId, toId, routeJson } = useLocalSearchParams();
 
-  // The route is passed in as a JSON string from the preview screen
-  // (avoids re-fetching it). Fall back to fetching if it's missing.
   const [route, setRoute] = useState(() => {
     if (routeJson) {
       try {
         return JSON.parse(routeJson);
-      } catch (_e) {
+      } catch {
         return null;
       }
     }
@@ -33,6 +37,9 @@ export default function WalkingScreen() {
   const [loading, setLoading] = useState(!route);
   const [error, setError] = useState(null);
   const [bannerDismissed, setBannerDismissed] = useState(false);
+
+  const { settings } = useSettings();
+  const { heading } = useCompass();
 
   // Load the route if it wasn't passed in.
   useState(() => {
@@ -57,6 +64,7 @@ export default function WalkingScreen() {
     permissionGranted,
     position,
     currentStep,
+    currentStepIndex,
     distanceRemainingM,
     distanceToNextStepM,
     offRoute,
@@ -64,10 +72,65 @@ export default function WalkingScreen() {
     resetOffRoute,
   } = useWalkingProgress(route);
 
+  // Speak each instruction once when it becomes current.
+  useEffect(() => {
+    if (!settings.voiceEnabled) return;
+    if (!currentStep) return;
+    tts.speak(currentStep.instruction, { rate: settings.voiceRate });
+  }, [currentStep, settings.voiceEnabled, settings.voiceRate]);
+
+  // Stop speech when leaving the screen.
+  useEffect(() => {
+    return () => {
+      tts.stop();
+    };
+  }, []);
+
+  // Bearing from the student's current position to the next step's
+  // location, or to the destination if on the last step. Used to
+  // point the compass arrow.
+  //
+  // The next step's location isn't in the route response (steps only
+  // have at_m), so we approximate: use the geometry point at that
+  // distance along the route. Simpler and accurate enough for a
+  // campus walk.
+  const bearing = (() => {
+    if (!position || !route || !route.geometry || route.geometry.length < 2) {
+      return null;
+    }
+    // Compute the target distance along the route.
+    const steps = route.steps;
+    let targetAtM;
+    if (currentStepIndex < steps.length - 1) {
+      targetAtM = steps[currentStepIndex + 1].at_m;
+    } else {
+      targetAtM = route.distance_m;
+    }
+
+    // Walk the geometry accumulating distance until we reach targetAtM.
+    let cumulative = 0;
+    for (let i = 0; i < route.geometry.length - 1; i++) {
+      const a = route.geometry[i];
+      const b = route.geometry[i + 1];
+      const segLen = haversine(a.lat, a.lon, b.lat, b.lon);
+      if (cumulative + segLen >= targetAtM) {
+        const fraction = (targetAtM - cumulative) / segLen;
+        const targetLat = a.lat + (b.lat - a.lat) * fraction;
+        const targetLon = a.lon + (b.lon - a.lon) * fraction;
+        return bearingDeg(position.lat, position.lon, targetLat, targetLon);
+      }
+      cumulative += segLen;
+    }
+    // Fallback: bearing to the last geometry point.
+    const last = route.geometry[route.geometry.length - 1];
+    return bearingDeg(position.lat, position.lon, last.lat, last.lon);
+  })();
+
   const handleRecalculate = useCallback(async () => {
     if (!position) return;
     setBannerDismissed(false);
     resetOffRoute();
+    tts.reset();
     try {
       const data = await computeRoute({
         fromLat: position.lat,
@@ -75,10 +138,8 @@ export default function WalkingScreen() {
         toPlaceId: Number(toId),
       });
       setRoute(data);
-    } catch (_err) {
-      // Silently keep the old route if recalculation fails — the
-      // student is still moving and old directions are better than
-      // none.
+    } catch {
+      // Silently keep the old route if recalculation fails.
     }
   }, [position, toId, resetOffRoute]);
 
@@ -87,7 +148,7 @@ export default function WalkingScreen() {
       <>
         <Stack.Screen options={{ title: 'Walking' }} />
         <View style={styles.state}>
-          <ActivityIndicator color="#6b7280" />
+          <ActivityIndicator color={COLORS.textMuted} />
         </View>
       </>
     );
@@ -117,8 +178,6 @@ export default function WalkingScreen() {
     );
   }
 
-  // Build markers: start and end from the route, plus the student's
-  // snapped position when we have a fix.
   const markers = [
     {
       lat: route.geometry[0].lat,
@@ -163,6 +222,8 @@ export default function WalkingScreen() {
             distanceToNextStepM={distanceToNextStepM}
             distanceRemainingM={distanceRemainingM}
             progress={progress}
+            heading={heading}
+            bearing={bearing}
           />
         </View>
       </View>
@@ -170,16 +231,30 @@ export default function WalkingScreen() {
   );
 }
 
+// Local haversine — same formula as utils/geo.js, inlined here to
+// avoid importing the whole module for one call inside a render.
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const phi1 = (lat1 * Math.PI) / 180;
+  const phi2 = (lat2 * Math.PI) / 180;
+  const dphi = ((lat2 - lat1) * Math.PI) / 180;
+  const dlambda = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dphi / 2) ** 2 +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#ffffff' },
+  container: { flex: 1, backgroundColor: COLORS.background },
   state: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#f9fafb',
+    backgroundColor: COLORS.backgroundSubtle,
   },
   errorText: {
-    color: '#dc2626',
+    color: COLORS.danger,
     fontSize: 15,
     textAlign: 'center',
     padding: 24,
@@ -187,5 +262,5 @@ const styles = StyleSheet.create({
   },
   mapWrapper: { flex: 1 },
   map: { flex: 1 },
-  cardWrapper: { backgroundColor: '#ffffff' },
+  cardWrapper: { backgroundColor: COLORS.background },
 });

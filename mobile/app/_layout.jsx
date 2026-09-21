@@ -1,26 +1,53 @@
 // Root layout for Expo Router. Every screen lives inside this.
 
-import { Stack } from 'expo-router';
+import { Link, Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { Text, TouchableOpacity } from 'react-native';
+
+import { SettingsProvider } from '@/context/SettingsContext';
+import { COLORS } from '@/constants/theme';
+
+function SettingsButton() {
+  return (
+    <Link href="/settings" asChild>
+      <TouchableOpacity
+        style={{ paddingHorizontal: 12, paddingVertical: 4 }}
+        accessibilityRole="button"
+        accessibilityLabel="Settings"
+      >
+        <Text style={{ fontSize: 20 }}>⚙️</Text>
+      </TouchableOpacity>
+    </Link>
+  );
+}
 
 export default function RootLayout() {
   return (
     <SafeAreaProvider>
-      <StatusBar style="auto" />
-      <Stack
-        screenOptions={{
-          headerStyle: { backgroundColor: '#ffffff' },
-          headerTintColor: '#111827',
-          headerTitleStyle: { fontWeight: '600' },
-          contentStyle: { backgroundColor: '#f9fafb' },
-        }}
-      >
-        <Stack.Screen name="index" options={{ title: 'Campus Navigation' }} />
-        <Stack.Screen name="place/[id]" options={{ title: 'Place' }} />
-        <Stack.Screen name="route-preview" options={{ title: 'Route' }} />
-        <Stack.Screen name="walking" options={{ title: 'Walking' }} />
-      </Stack>
+      <SettingsProvider>
+        <StatusBar style="auto" />
+        <Stack
+          screenOptions={{
+            headerStyle: { backgroundColor: COLORS.background },
+            headerTintColor: COLORS.text,
+            headerTitleStyle: { fontWeight: '600' },
+            contentStyle: { backgroundColor: COLORS.backgroundSubtle },
+          }}
+        >
+          <Stack.Screen
+            name="index"
+            options={{
+              title: 'Campus Navigation',
+              headerRight: () => <SettingsButton />,
+            }}
+          />
+          <Stack.Screen name="place/[id]" options={{ title: 'Place' }} />
+          <Stack.Screen name="route-preview" options={{ title: 'Route' }} />
+          <Stack.Screen name="walking" options={{ title: 'Walking' }} />
+          <Stack.Screen name="settings" options={{ title: 'Settings' }} />
+        </Stack>
+      </SettingsProvider>
     </SafeAreaProvider>
   );
 }

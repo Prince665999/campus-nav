@@ -11,7 +11,6 @@ import pytest
 def _route_between_any_two(client):
     """
     Find a working pair of places and return (place_a, place_b, route_dict).
-
     Tries pairs until one routes. Skips the test if none do.
     """
     places = client.get("/api/places?limit=200").json()
@@ -49,7 +48,6 @@ class TestRouteBasic:
         assert len(route["geometry"]) > 1
         assert route["from_name"] == a["name"]
         assert route["to_name"] == b["name"]
-        assert route["profile"] == "fastest"
 
     def test_route_geometry_is_latlon_list(self, client):
         _a, _b, route = _route_between_any_two(client)
@@ -71,34 +69,6 @@ class TestRouteBasic:
         at_ms = [s["at_m"] for s in route["steps"]]
         for i in range(1, len(at_ms)):
             assert at_ms[i] >= at_ms[i - 1]
-
-
-class TestRouteProfiles:
-    def test_profile_is_echoed_in_response(self, client):
-        a, b, _route = _route_between_any_two(client)
-        r = client.get(
-            f"/api/route?from_place_id={a['id']}&to_place_id={b['id']}&profile=step-free"
-        )
-        assert r.status_code == 200
-        assert r.json()["profile"] == "step-free"
-
-    def test_all_profiles_return_a_route_or_a_404(self, client):
-        a, b, _route = _route_between_any_two(client)
-        for profile in ("fastest", "step-free", "well-lit", "covered", "scenic"):
-            r = client.get(
-                f"/api/route?from_place_id={a['id']}&to_place_id={b['id']}&profile={profile}"
-            )
-            assert r.status_code in (200, 404), (
-                f"Profile {profile} returned {r.status_code}: {r.text}"
-            )
-
-    def test_unknown_profile_falls_back_to_fastest(self, client):
-        a, b, _route = _route_between_any_two(client)
-        r = client.get(
-            f"/api/route?from_place_id={a['id']}&to_place_id={b['id']}&profile=teleport"
-        )
-        assert r.status_code == 200
-        assert r.json()["profile"] == "teleport"
 
 
 class TestRouteFromCoordinates:

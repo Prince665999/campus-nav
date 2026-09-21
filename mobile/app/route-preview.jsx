@@ -13,6 +13,7 @@ import {
   View,
 } from 'react-native';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { RouteMap } from '@/components/MapView';
 import { RouteSummary } from '@/components/RouteSummary';
@@ -24,6 +25,8 @@ export default function RoutePreviewScreen() {
   const { fromId, toId } = useLocalSearchParams();
   const fromPlaceId = Number(fromId);
   const toPlaceId = Number(toId);
+
+  const insets = useSafeAreaInsets();
 
   const [route, setRoute] = useState(null);
   const [narration, setNarration] = useState(null);
@@ -147,7 +150,7 @@ export default function RoutePreviewScreen() {
           ) : null}
         </ScrollView>
 
-        <View style={styles.footer}>
+        <View style={[styles.footer, { paddingBottom: insets.bottom + 16 }]}>
           <TouchableOpacity
             style={styles.primaryButton}
             onPress={startWalking}
@@ -198,7 +201,8 @@ const styles = StyleSheet.create({
   stepText: { flex: 1, color: '#111827', fontSize: 15, lineHeight: 22 },
   narrationText: { color: '#374151', fontSize: 16, lineHeight: 24 },
   footer: {
-    padding: 16,
+    paddingTop: 16,
+    paddingHorizontal: 16,
     borderTopWidth: 1,
     borderTopColor: '#f3f4f6',
     backgroundColor: '#ffffff',

@@ -16,28 +16,22 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 
-# backend/ — the folder that contains this file's parent's parent.
 BACKEND_DIR = Path(__file__).resolve().parent.parent
-
-# backend/data/ — where map.osm and the SQLite database live.
 DATA_DIR = BACKEND_DIR / "data"
 
-# The OSM extract that the pipeline reads.
 MAP_OSM_PATH = Path(os.environ.get("MAP_OSM_PATH", DATA_DIR / "map.osm"))
-
-# The SQLite database the pipeline writes and the API reads.
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "campus.db"))
-
-# Where graph snapshots are written (used from Phase 13 onward).
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
+
+# Where uploaded photos live. Served as static files by the API.
+MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", DATA_DIR / "media"))
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
 # Database URL
 # ---------------------------------------------------------------------------
 
-# SQLAlchemy connection string. Defaults to the SQLite file above.
-# Phase 13 changes this to a Postgres URL via the environment.
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "sqlite:///" + str(DATABASE_PATH).replace("\\", "/"),
@@ -56,8 +50,24 @@ IS_DEV = ENVIRONMENT == "dev"
 # Ingest behaviour
 # ---------------------------------------------------------------------------
 
-# If True, ingest.py wipes the places/areas/path_edges tables before
-# writing. If False, it upserts by osm_id. For the first run this
-# doesn't matter; from the second run onward you want False so manual
-# edits survive.
 INGEST_REPLACE = os.environ.get("INGEST_REPLACE", "false").lower() == "true"
+
+
+# ---------------------------------------------------------------------------
+# Media
+# ---------------------------------------------------------------------------
+
+# Base URL used to build absolute photo URLs in API responses.
+# In development this is the LAN address of the machine running the API.
+# Phase 17 sets this to the production domain.
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://localhost:8000")
+
+# Maximum size of an uploaded photo, in bytes. 10 MB.
+MEDIA_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
+
+# The three sizes every uploaded photo is reduced to, as (name, max dimension).
+MEDIA_VARIANTS = [
+    ("thumb", 200),
+    ("card", 800),
+    ("full", 1600),
+]
