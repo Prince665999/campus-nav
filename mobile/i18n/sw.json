@@ -15,7 +15,7 @@
   },
   "home": {
     "title": "Unakwenda wapi?",
-    "searchPlaceholder": "Tafuta mahali…",
+    "searchPlaceholder": "Tafuta mahali au uliza swali…",
     "recentTitle": "Hivi karibuni",
     "favoritesTitle": "Vipendwa",
     "categoriesTitle": "Vinjari",
@@ -64,6 +64,16 @@
     "savePlace": "Hifadhi mahali hapa",
     "saved": "Imehifadhiwa kwenye vipendwa",
     "done": "Maliza"
+  },
+  "chat": {
+    "title": "Ujumbe",
+    "titleWalk": "Uliza kuhusu safari hii",
+    "greetingGeneral": "Habari! Niambie unakwenda wapi — jaribu \"nipeleke maktaba\".",
+    "greetingWalk": "Niulize kuhusu safari hii. Naweza kukuambia kilicho karibu na kinachofuata.",
+    "placeholder": "Uliza kitu…",
+    "send": "Tuma",
+    "error": "Samahani, sikuweza kufikia msaidizi. Jaribu tena baadaye.",
+    "foundDestination": "Nimeipata. Nafungua njia kwa {name}."
   },
   "report": {
     "title": "Ripoti tatizo",

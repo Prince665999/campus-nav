@@ -15,7 +15,7 @@
   },
   "home": {
     "title": "Where to?",
-    "searchPlaceholder": "Search a place…",
+    "searchPlaceholder": "Search a place or ask a question…",
     "recentTitle": "Recent",
     "favoritesTitle": "Favorites",
     "categoriesTitle": "Browse",
@@ -64,6 +64,16 @@
     "savePlace": "Save this place",
     "saved": "Saved to favorites",
     "done": "Done"
+  },
+  "chat": {
+    "title": "Chat",
+    "titleWalk": "Ask about this walk",
+    "greetingGeneral": "Hi! Ask me where you want to go — try \"take me to the library\".",
+    "greetingWalk": "Ask me anything about this walk. I can tell you what's around and what's coming up.",
+    "placeholder": "Ask something…",
+    "send": "Send",
+    "error": "Sorry, I couldn't reach the assistant. Try again in a moment.",
+    "foundDestination": "Found it. Opening the route to {name}."
   },
   "report": {
     "title": "Report a problem",

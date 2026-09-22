@@ -2,7 +2,7 @@
 
 import { StyleSheet, TextInput, View, ActivityIndicator } from 'react-native';
 
-export function SearchBar({ value, onChangeText, placeholder, loading }) {
+export function SearchBar({ value, onChangeText, placeholder, loading,onSubmit }) {
   return (
     <View style={styles.wrapper}>
       <TextInput
@@ -10,6 +10,8 @@ export function SearchBar({ value, onChangeText, placeholder, loading }) {
         value={value}
         onChangeText={onChangeText}
         placeholder={placeholder}
+        returnKeyType="search"
+        onSubmitEditing={onSubmit}
         placeholderTextColor="#9ca3af"
         autoCapitalize="none"
         autoCorrect={false}

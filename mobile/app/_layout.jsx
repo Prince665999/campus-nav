@@ -46,6 +46,7 @@ function AppStack() {
       <Stack.Screen name="route-preview" options={{ title: 'Route' }} />
       <Stack.Screen name="walking" options={{ title: 'Walking' }} />
       <Stack.Screen name="arrival" options={{ title: 'Arrival' }} />
+      <Stack.Screen name="chat" options={{ title: 'Chat' }} />
       <Stack.Screen name="settings" options={{ title: 'Settings' }} />
     </Stack>
   );

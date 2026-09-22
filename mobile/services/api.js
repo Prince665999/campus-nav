@@ -1,8 +1,4 @@
 // The API client. Every network call goes through here.
-//
-// Requests that need device identity automatically include the
-// X-Device-Id header. The header is added in the request() wrapper
-// so individual callers don't have to think about it.
 
 import { API_BASE_URL, API_TIMEOUT_MS } from '@/constants/config';
 import { getDeviceId } from '@/services/session';
@@ -13,9 +9,6 @@ async function request(path, options = {}) {
   const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
 
   try {
-    // The device ID is sent on every request. The backend ignores it
-    // for endpoints that don't need it, and hashes it for the ones
-    // that do.
     const deviceId = await getDeviceId();
 
     const response = await fetch(url, {
@@ -28,10 +21,7 @@ async function request(path, options = {}) {
       },
     });
 
-    // 204 No Content has no body. Return null.
-    if (response.status === 204) {
-      return null;
-    }
+    if (response.status === 204) return null;
 
     if (!response.ok) {
       let detail = `Request failed (${response.status})`;
@@ -39,7 +29,7 @@ async function request(path, options = {}) {
         const body = await response.json();
         if (body && body.detail) detail = body.detail;
       } catch {
-        // Response wasn't JSON. Keep the generic message.
+        // Not JSON. Keep the generic message.
       }
       throw new Error(detail);
     }
@@ -132,7 +122,7 @@ export async function narrateRoute({ fromPlaceId, toPlaceId, lang = 'en', live =
 }
 
 // ---------------------------------------------------------------
-// Destinations: recents and favorites
+// Destinations
 // ---------------------------------------------------------------
 
 export async function listRecents({ limit = 5 } = {}) {
@@ -185,6 +175,53 @@ export async function createReport({ kind, body, placeId, edgeId, photoUrl }) {
       edge_id: edgeId || null,
       photo_url: photoUrl || null,
     }),
+  });
+}
+
+// ---------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------
+
+export async function extractDestination(message) {
+  return request('/api/chat/extract-destination', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message }),
+  });
+}
+
+export async function startChatSession() {
+  return request('/api/chat/session', { method: 'POST' });
+}
+
+export async function endChatSession(sessionId) {
+  return request(`/api/chat/session/${sessionId}`, { method: 'DELETE' });
+}
+
+export async function sendChatMessage({
+  message,
+  sessionId,
+  fromPlaceId,
+  toPlaceId,
+  currentStepIndex,
+  distanceFromStartM,
+  currentLat,
+  currentLon,
+}) {
+  const body = {
+    message,
+    session_id: sessionId || null,
+    from_place_id: fromPlaceId ?? null,
+    to_place_id: toPlaceId ?? null,
+    current_step_index: currentStepIndex ?? null,
+    distance_from_start_m: distanceFromStartM ?? null,
+    current_lat: currentLat ?? null,
+    current_lon: currentLon ?? null,
+  };
+  return request('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 

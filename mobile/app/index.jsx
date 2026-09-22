@@ -14,7 +14,12 @@ import { SearchBar } from '@/components/SearchBar';
 import { PlaceCard } from '@/components/PlaceCard';
 import { CategoryChips } from '@/components/CategoryChips';
 import { useDebounce } from '@/hooks/useDebounce';
-import { listPlaces, listRecents, listFavorites } from '@/services/api';
+import {
+  extractDestination,
+  listPlaces,
+  listRecents,
+  listFavorites,
+} from '@/services/api';
 import { t } from '@/i18n';
 import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
 import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
@@ -31,7 +36,6 @@ export default function HomeScreen() {
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
 
-  // Load recents and favorites once on mount.
   useEffect(() => {
     let cancelled = false;
     Promise.all([
@@ -48,7 +52,6 @@ export default function HomeScreen() {
     };
   }, []);
 
-  // Search when query or category changes.
   useEffect(() => {
     let cancelled = false;
 
@@ -79,8 +82,38 @@ export default function HomeScreen() {
     router.push(`/place/${place.id}`);
   }, []);
 
-  // When searching, show the search results. When not, show recents
-  // and favorites. When neither exists, show a hint.
+  // When the student taps a result, they've chosen a place. That's
+  // the standard flow.
+  //
+  // When they press "Send" on the keyboard with a full sentence, we
+  // try the destination extractor — this is the AI-assist path.
+  const tryResolveSentence = useCallback(async () => {
+    const text = query.trim();
+    if (!text || text.length < 5) return;
+
+    // Only try if the text looks like a sentence, not a single word.
+    if (text.split(/\s+/).length < 3) return;
+
+    try {
+      const extracted = await extractDestination(text);
+      if (extracted.matched) {
+        // Find a "from" place. Same temporary approach as elsewhere.
+        const others = await listPlaces({ limit: 5 });
+        const from = others.find((p) => p.id !== extracted.place_id) || others[0];
+        if (!from) return;
+        router.push({
+          pathname: '/route-preview',
+          params: {
+            fromId: String(from.id),
+            toId: String(extracted.place_id),
+          },
+        });
+      }
+    } catch {
+      // Silent. The student can still tap a search result below.
+    }
+  }, [query]);
+
   const showSearchResults = isSearching;
 
   return (
@@ -88,6 +121,7 @@ export default function HomeScreen() {
       <SearchBar
         value={query}
         onChangeText={setQuery}
+        onSubmit={tryResolveSentence}
         placeholder={t('home.searchPlaceholder')}
         loading={loading && !error && isSearching}
       />
@@ -159,9 +193,7 @@ export default function HomeScreen() {
 
               {recents.length === 0 && favorites.length === 0 ? (
                 <View style={styles.state}>
-                  <Text style={styles.emptyText}>
-                    {t('home.emptyHint')}
-                  </Text>
+                  <Text style={styles.emptyText}>{t('home.emptyHint')}</Text>
                 </View>
               ) : null}
             </>
@@ -208,9 +240,7 @@ const styles = StyleSheet.create({
     fontSize: 15,
     textAlign: 'center',
   },
-  listContent: {
-    paddingBottom: 32,
-  },
+  listContent: { paddingBottom: 32 },
   section: {
     marginTop: SPACING.md,
     backgroundColor: COLORS.background,

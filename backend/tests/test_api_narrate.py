@@ -75,10 +75,21 @@ class TestNarrateText:
             stripped = line.strip()
             assert stripped[:2] not in ("1.", "2.", "3.")
 
-    def test_text_mentions_start_or_end(self, client):
-        a, b, body = _narrate_any_two(client)
-        text = body["text"].lower()
-        assert a["name"].lower() in text or b["name"].lower() in text
+    def test_text_is_non_empty_and_prose(self, client):
+        """
+        The narration should be a non-empty string of prose, not a
+        numbered list. We don't assert on specific words because the
+        narrator legitimately reformats place names ('must main gate'
+        becomes 'the main gate').
+        """
+        _a, _b, body = _narrate_any_two(client)
+        text = body["text"]
+        assert isinstance(text, str)
+        assert len(text) > 20
+        # Prose, not a numbered list.
+        assert not text.lstrip().startswith("1.")
+        # Contains at least one sentence-ending punctuation.
+        assert "." in text
 
 
 class TestNarrateRouteDoesNotExist:

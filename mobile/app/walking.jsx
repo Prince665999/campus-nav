@@ -1,11 +1,13 @@
 // Walking Mode screen.
-//
-// Live map with the student's snapped position, a compass arrow,
-// spoken instructions, an off-route banner, an approach photo, and
-// a report button. Navigates to the arrival screen on arrival.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 
 import { RouteMap } from '@/components/MapView';
@@ -46,12 +48,12 @@ export default function WalkingScreen() {
   const [approachPhotos, setApproachPhotos] = useState([]);
   const [photoDismissed, setPhotoDismissed] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+
   const arrivedRef = useRef(false);
 
   const { settings } = useSettings();
   const { heading } = useCompass();
 
-  // Load the route if it wasn't passed in.
   useState(() => {
     if (route) return;
     async function load() {
@@ -70,7 +72,6 @@ export default function WalkingScreen() {
     load();
   });
 
-  // Load destination photos once.
   useEffect(() => {
     let cancelled = false;
     listMediaForPlace(Number(toId))
@@ -85,11 +86,8 @@ export default function WalkingScreen() {
     };
   }, [toId]);
 
-  // Record this destination as a recent visit.
   useEffect(() => {
-    recordRecent(Number(toId)).catch(() => {
-      // Non-fatal. Recents are a convenience, not a requirement.
-    });
+    recordRecent(Number(toId)).catch(() => {});
   }, [toId]);
 
   const {
@@ -104,7 +102,6 @@ export default function WalkingScreen() {
     resetOffRoute,
   } = useWalkingProgress(route);
 
-  // Speak each instruction once when it becomes current.
   useEffect(() => {
     if (!settings.voiceEnabled) return;
     if (!currentStep) return;
@@ -114,29 +111,23 @@ export default function WalkingScreen() {
     });
   }, [currentStep, settings.voiceEnabled, settings.voiceRate]);
 
-  // Stop speech when leaving the screen.
   useEffect(() => {
     return () => {
       tts.stop();
     };
   }, []);
 
-  // When the student arrives, go to the arrival screen.
-  // "Arrived" means within ARRIVAL_DISTANCE_M of the destination.
-  // The `arrived` flag ensures the navigation fires exactly once.
   useEffect(() => {
-  if (arrivedRef.current) return;
-  if (!route) return;
-  if (distanceRemainingM > ARRIVAL_DISTANCE_M) return;
-  arrivedRef.current = true;
-  router.replace({
-    pathname: '/arrival',
-    params: { toId: String(toId) },
-  });
+    if (arrivedRef.current) return;
+    if (!route) return;
+    if (distanceRemainingM > ARRIVAL_DISTANCE_M) return;
+    arrivedRef.current = true;
+    router.replace({
+      pathname: '/arrival',
+      params: { toId: String(toId) },
+    });
   }, [distanceRemainingM, route, toId]);
 
-  // Pick the approach photo whose bearing best matches the direction
-  // we're approaching from.
   const approachPhoto = (() => {
     if (approachPhotos.length === 0) return null;
     if (distanceRemainingM > APPROACH_PHOTO_DISTANCE_M) return null;
@@ -156,8 +147,6 @@ export default function WalkingScreen() {
     return closestApproachPhoto(approachPhotos, approachBearing);
   })();
 
-  // Bearing from the student's current position to the next step's
-  // location, or to the destination if on the last step.
   const bearing = (() => {
     if (!position || !route || !route.geometry || route.geometry.length < 2) {
       return null;
@@ -201,9 +190,32 @@ export default function WalkingScreen() {
       });
       setRoute(data);
     } catch {
-      // Silently keep the old route if recalculation fails.
+      // Silent.
     }
   }, [position, toId, resetOffRoute]);
+
+  const openChat = useCallback(() => {
+    router.push({
+      pathname: '/chat',
+      params: {
+        fromPlaceId: String(fromId),
+        toPlaceId: String(toId),
+        currentStepIndex: String(currentStepIndex ?? 0),
+        distanceFromStartM: String(
+          (route?.distance_m || 0) - distanceRemainingM
+        ),
+        currentLat: position ? String(position.lat) : '',
+        currentLon: position ? String(position.lon) : '',
+      },
+    });
+  }, [
+    fromId,
+    toId,
+    currentStepIndex,
+    route?.distance_m,
+    distanceRemainingM,
+    position,
+  ]);
 
   if (loading) {
     return (
@@ -232,9 +244,7 @@ export default function WalkingScreen() {
       <>
         <Stack.Screen options={{ title: t('walking.title') }} />
         <View style={styles.state}>
-          <Text style={styles.errorText}>
-            {t('walking.permissionNeeded')}
-          </Text>
+          <Text style={styles.errorText}>{t('walking.permissionNeeded')}</Text>
         </View>
       </>
     );
@@ -262,14 +272,24 @@ export default function WalkingScreen() {
           title: t('walking.title'),
           headerBackVisible: false,
           headerRight: () => (
-            <TouchableOpacity
-              onPress={() => setReportOpen(true)}
-              style={styles.headerButton}
-              accessibilityRole="button"
-              accessibilityLabel={t('report.reportProblem')}
-            >
-              <Text style={styles.headerButtonText}>⚑</Text>
-            </TouchableOpacity>
+            <View style={styles.headerButtons}>
+              <TouchableOpacity
+                onPress={openChat}
+                style={styles.headerButton}
+                accessibilityRole="button"
+                accessibilityLabel={t('chat.titleWalk')}
+              >
+                <Text style={styles.headerButtonText}>💬</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setReportOpen(true)}
+                style={styles.headerButton}
+                accessibilityRole="button"
+                accessibilityLabel={t('report.reportProblem')}
+              >
+                <Text style={styles.headerButtonText}>⚑</Text>
+              </TouchableOpacity>
+            </View>
           ),
         }}
       />
@@ -349,6 +369,7 @@ const styles = StyleSheet.create({
   mapWrapper: { flex: 1 },
   map: { flex: 1 },
   cardWrapper: { backgroundColor: COLORS.background },
+  headerButtons: { flexDirection: 'row' },
   headerButton: { padding: 6 },
-  headerButtonText: { fontSize: 22, color: COLORS.text },
+  headerButtonText: { fontSize: 20, color: COLORS.text },
 });

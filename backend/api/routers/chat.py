@@ -1,0 +1,300 @@
+"""
+chat.py
+
+Chat endpoints:
+
+  POST /api/chat/extract-destination
+  POST /api/chat/session
+  DELETE /api/chat/session/{id}
+  POST /api/chat
+"""
+
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from .. import cache
+from ..dependencies import db_session
+from ..schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    ExtractDestinationRequest,
+    ExtractDestinationResponse,
+    StartChatSessionResponse,
+)
+from ..services import cache_service, chat_service
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+# How many turns of memory to keep per session.
+MAX_HISTORY_TURNS = 10
+
+# Session TTL in Redis. 1 hour of inactivity and the conversation is
+# forgotten.
+SESSION_TTL_S = 60 * 60
+
+# How far around the student to include in the nearby-places context.
+NEARBY_RADIUS_M = 200
+
+# How many nearby places to include. More than this and the prompt
+# gets long and the model gets distracted.
+NEARBY_LIMIT = 15
+
+
+def _history_key(session_id: str) -> str:
+    return f"chat:{session_id}"
+
+
+def _load_history(session_id: str) -> list:
+    if not session_id:
+        return []
+    raw = cache.get(_history_key(session_id))
+    if not raw or not isinstance(raw, list):
+        return []
+    return raw
+
+
+def _save_history(session_id: str, history: list):
+    if not session_id:
+        return
+    cache.set(
+        _history_key(session_id),
+        history[-MAX_HISTORY_TURNS * 2 :],
+        ttl_s=SESSION_TTL_S,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Destination extraction
+# ---------------------------------------------------------------------------
+
+@router.post("/extract-destination", response_model=ExtractDestinationResponse)
+def extract_destination(
+    body: ExtractDestinationRequest,
+    session: Session = Depends(db_session),
+):
+    """
+    Turn free text into a place ID.
+    """
+    place_id, confidence = chat_service.extract_destination(session, body.message)
+    return ExtractDestinationResponse(
+        place_id=place_id,
+        confidence=confidence or "low",
+        matched=place_id is not None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle
+# ---------------------------------------------------------------------------
+
+@router.post("/session", response_model=StartChatSessionResponse)
+def start_session():
+    """
+    Start a new chat session. Returns an ID the client uses for
+    subsequent /api/chat requests.
+    """
+    return StartChatSessionResponse(session_id=str(uuid.uuid4()))
+
+
+@router.delete("/session/{session_id}", status_code=204)
+def end_session(session_id: str):
+    """
+    End a chat session and discard its memory.
+    """
+    cache.delete(_history_key(session_id))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# In-walk chat
+# ---------------------------------------------------------------------------
+
+@router.post("", response_model=ChatResponse)
+def chat(
+    body: ChatRequest,
+    session: Session = Depends(db_session),
+):
+    """
+    Answer a question about the current walk.
+
+    Uses three sources when available: the route timeline, the
+    narration the student already heard, and the places near their
+    current position.
+    """
+    session_id = body.session_id
+    history = _load_history(session_id) if session_id else []
+
+    reply = _build_answer(body, session)
+
+    if session_id:
+        history.append({"role": "user", "content": body.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_history(session_id, history)
+
+    return ChatResponse(reply=reply, session_id=session_id)
+
+
+def _build_answer(body: ChatRequest, session: Session) -> str:
+    """
+    Gather the three context sources and call the chat service.
+    """
+    has_route_context = (
+        body.from_place_id is not None
+        and body.to_place_id is not None
+        and body.current_step_index is not None
+        and body.distance_from_start_m is not None
+    )
+
+    if not has_route_context:
+        return (
+            "I can help once you're on a route. Start a walk and ask "
+            "me about what you see."
+        )
+
+    # ---- Source 1: the route timeline ----
+    try:
+        from backend.core.campus_graph import a_star
+
+        from ..services.graph_service import get_edge_tags, get_graph, get_nodes
+        from ..services.narration_service import _build_events
+        from ..services.routing_service import _resolve_endpoint
+
+        graph = get_graph()
+        nodes = get_nodes()
+        edge_tags = get_edge_tags()
+
+        from_node, from_name = _resolve_endpoint(
+            session, graph, nodes, place_id=body.from_place_id
+        )
+        to_node, to_name = _resolve_endpoint(
+            session, graph, nodes, place_id=body.to_place_id
+        )
+        if from_node is None or to_node is None:
+            return "I can't find that route anymore."
+
+        path, distance = a_star(graph, nodes, from_node, to_node)
+        if not path:
+            return "That route isn't available right now."
+
+        _steps, events, _dest_pos = _build_events(
+            path, nodes, edge_tags, graph, distance, from_name, to_name
+        )
+    except Exception as e:
+        logger.warning("Chat timeline rebuild failed: %s", e)
+        return "I couldn't reach the route right now. Try again in a moment."
+
+    # ---- Source 2: the narration the student already heard ----
+    narration_text = _load_cached_narration(session, body)
+
+    # ---- Source 3: nearby places ----
+    nearby = _load_nearby_places(session, body.current_lat, body.current_lon)
+
+    # ---- Compose and answer ----
+    return chat_service.answer_walk_question(
+        question=body.message,
+        start_name=from_name,
+        end_name=to_name,
+        distance_m=distance,
+        events=events,
+        current_step_index=body.current_step_index,
+        distance_from_start_m=body.distance_from_start_m,
+        narration_text=narration_text,
+        nearby_places=nearby,
+    )
+
+
+def _load_cached_narration(session: Session, body: ChatRequest) -> str | None:
+    """
+    Look up the narration that was generated for this route. If it's
+    cached (Phase 12), return the text. Otherwise return None.
+    """
+    try:
+        # Rebuild the timeline hash. The narration service caches by
+        # a hash of the timeline, so we need to compute the same hash.
+        from backend.core.campus_graph import a_star
+
+        from ..services.graph_service import get_edge_tags, get_graph, get_nodes
+        from ..services.narration_service import _build_events
+        from ..services.routing_service import _resolve_endpoint
+
+        graph = get_graph()
+        nodes = get_nodes()
+        edge_tags = get_edge_tags()
+
+        from_node, _ = _resolve_endpoint(
+            session, graph, nodes, place_id=body.from_place_id
+        )
+        to_node, to_name = _resolve_endpoint(
+            session, graph, nodes, place_id=body.to_place_id
+        )
+        if from_node is None or to_node is None:
+            return None
+
+        path, distance = a_star(graph, nodes, from_node, to_node)
+        if not path:
+            return None
+
+        _, from_name = _resolve_endpoint(
+            session, graph, nodes, place_id=body.from_place_id
+        )
+        _steps, events, _dest_pos = _build_events(
+            path, nodes, edge_tags, graph, distance, from_name, to_name
+        )
+
+        # The narration service hashes the events to build a cache key.
+        timeline_repr = "\n".join(
+            f"{round(e[0])}|{e[1]}|{e[2]}" for e in events
+        )
+        r_hash = cache_service.route_hash(timeline_repr)
+
+        # Try both languages; prefer English.
+        for lang in ("en", "sw"):
+            cached = cache_service.get_cached_narration(r_hash, lang=lang)
+            if cached:
+                return cached
+        return None
+    except Exception as e:
+        logger.warning("Narration cache lookup failed: %s", e)
+        return None
+
+
+def _load_nearby_places(
+    session: Session,
+    lat: float | None,
+    lon: float | None,
+) -> list | None:
+    """
+    Query the places table for places within NEARBY_RADIUS_M of the
+    student. Returns a list of dicts, or None if there's no position.
+    """
+    if lat is None or lon is None:
+        return None
+
+    try:
+        from backend.core.campus_graph import haversine_m
+
+        from ..models.place import Place
+
+        rows = session.query(Place).all()
+        nearby = []
+        for p in rows:
+            d = haversine_m(lat, lon, p.lat, p.lon)
+            if d <= NEARBY_RADIUS_M:
+                nearby.append(
+                    {
+                        "name": p.name,
+                        "distance_m": d,
+                        "category": p.category,
+                    }
+                )
+
+        nearby.sort(key=lambda x: x["distance_m"])
+        return nearby[:NEARBY_LIMIT] or None
+    except Exception as e:
+        logger.warning("Nearby places lookup failed: %s", e)
+        return None

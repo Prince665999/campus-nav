@@ -5,6 +5,7 @@ The FastAPI application.
 """
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,7 @@ from .dependencies import require_admin
 from .errors import http_exception_handler, unhandled_exception_handler
 from .routers import (
     areas,
+    chat,
     favorites,
     health,
     media,
@@ -37,6 +39,13 @@ from .settings import MEDIA_DIR
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def lifespan(app):
+    """Startup and shutdown hooks."""
+    init_db()
+    yield
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Campus Navigation API",
@@ -44,7 +53,8 @@ def create_app() -> FastAPI:
             "Backend for the Campus Navigation mobile app and the "
             "admin website."
         ),
-        version="0.14.0",
+        version="0.15.0",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -58,10 +68,6 @@ def create_app() -> FastAPI:
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
-    @app.on_event("startup")
-    def _ensure_schema():
-        init_db()
-
     # Public routers
     app.include_router(health.router)
     app.include_router(places.router)
@@ -71,8 +77,9 @@ def create_app() -> FastAPI:
     app.include_router(media.router)
     app.include_router(favorites.router)
     app.include_router(reports.router)
+    app.include_router(chat.router)
 
-    # Admin routers — every one is protected by require_admin.
+    # Admin routers
     admin_prefix = "/api/admin"
     admin_deps = [Depends(require_admin)]
 
@@ -108,7 +115,7 @@ def create_app() -> FastAPI:
     def root():
         return {
             "name": "Campus Navigation API",
-            "version": "0.14.0",
+            "version": "0.15.0",
             "docs": "/docs",
             "health": "/api/health",
         }
