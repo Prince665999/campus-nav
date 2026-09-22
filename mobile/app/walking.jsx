@@ -15,8 +15,10 @@ import { InstructionCard } from '@/components/InstructionCard';
 import { OffRouteBanner } from '@/components/OffRouteBanner';
 import { ApproachPhoto } from '@/components/ApproachPhoto';
 import { ReportSheet } from '@/components/ReportSheet';
+import { WifiBanner } from '@/components/WifiBanner';
 import { useWalkingProgress } from '@/hooks/useWalkingProgress';
 import { useCompass } from '@/hooks/useCompass';
+import { useNearbyWifi } from '@/hooks/useNearbyWifi';
 import { useSettings } from '@/context/SettingsContext';
 import { computeRoute, listMediaForPlace, recordRecent } from '@/services/api';
 import { closestApproachPhoto } from '@/utils/media';
@@ -101,6 +103,13 @@ export default function WalkingScreen() {
     progress,
     resetOffRoute,
   } = useWalkingProgress(route);
+
+  // Wi-Fi proximity. Uses the same position the walk is already
+  // tracking, so no extra location cost.
+  const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
+    position,
+    enabled: settings.wifiProximityEnabled,
+  });
 
   useEffect(() => {
     if (!settings.voiceEnabled) return;
@@ -299,6 +308,10 @@ export default function WalkingScreen() {
             onRecalculate={handleRecalculate}
             onDismiss={() => setBannerDismissed(true)}
           />
+        ) : null}
+
+        {wifiSpot ? (
+          <WifiBanner spot={wifiSpot} onDismiss={dismissWifi} />
         ) : null}
 
         <View style={styles.mapWrapper}>

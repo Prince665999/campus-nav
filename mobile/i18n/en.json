@@ -75,6 +75,11 @@
     "error": "Sorry, I couldn't reach the assistant. Try again in a moment.",
     "foundDestination": "Found it. Opening the route to {name}."
   },
+  "wifi": {
+    "available": "Wi-Fi available here",
+    "availableNamed": "Wi-Fi: {ssid}",
+    "connect": "Connect"
+  },
   "report": {
     "title": "Report a problem",
     "reportProblem": "Report a problem",

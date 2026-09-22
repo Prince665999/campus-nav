@@ -75,6 +75,11 @@
     "error": "Samahani, sikuweza kufikia msaidizi. Jaribu tena baadaye.",
     "foundDestination": "Nimeipata. Nafungua njia kwa {name}."
   },
+  "wifi": {
+    "available": "Wi-Fi inapatikana hapa",
+    "availableNamed": "Wi-Fi: {ssid}",
+    "connect": "Ungana"
+  },
   "report": {
     "title": "Ripoti tatizo",
     "reportProblem": "Ripoti tatizo",

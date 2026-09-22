@@ -1,6 +1,4 @@
 // Settings screen.
-//
-// Language, voice, units, and Wi-Fi notification preferences.
 
 import { StyleSheet, Switch, Text, TouchableOpacity, View } from 'react-native';
 
@@ -39,6 +37,18 @@ export default function SettingsScreen() {
         </Row>
       </Section>
 
+      <Section title={t('settings.wifi')}>
+        <Row
+          label={t('settings.wifiNotifications')}
+          description={t('settings.wifiDescription')}
+        >
+          <Switch
+            value={settings.wifiProximityEnabled}
+            onValueChange={(v) => updateSetting('wifiProximityEnabled', v)}
+          />
+        </Row>
+      </Section>
+
       <Section title={t('settings.units')}>
         <View style={styles.segmented}>
           <SegmentButton
@@ -54,21 +64,9 @@ export default function SettingsScreen() {
         </View>
       </Section>
 
-      <Section title={t('settings.wifi')}>
-        <Row
-          label={t('settings.wifiNotifications')}
-          description={t('settings.wifiDescription')}
-        >
-          <Switch
-            value={settings.wifiProximityEnabled}
-            onValueChange={(v) => updateSetting('wifiProximityEnabled', v)}
-          />
-        </Row>
-      </Section>
-
       <View style={styles.footer}>
         <Text style={styles.footerText}>
-          {t('settings.version', { version: '0.9.0' })}
+          {t('settings.version', { version: '0.16.0' })}
         </Text>
       </View>
     </View>

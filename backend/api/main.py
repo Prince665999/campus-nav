@@ -24,6 +24,7 @@ from .routers import (
     places,
     reports,
     route,
+    wifi,
 )
 from .routers.admin import (
     map_health as admin_map_health,
@@ -53,7 +54,7 @@ def create_app() -> FastAPI:
             "Backend for the Campus Navigation mobile app and the "
             "admin website."
         ),
-        version="0.15.0",
+        version="0.16.0",
         lifespan=lifespan,
     )
 
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
     app.include_router(favorites.router)
     app.include_router(reports.router)
     app.include_router(chat.router)
+    app.include_router(wifi.router)
 
     # Admin routers
     admin_prefix = "/api/admin"
@@ -115,7 +117,7 @@ def create_app() -> FastAPI:
     def root():
         return {
             "name": "Campus Navigation API",
-            "version": "0.15.0",
+            "version": "0.16.0",
             "docs": "/docs",
             "health": "/api/health",
         }
