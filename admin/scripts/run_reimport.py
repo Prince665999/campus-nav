@@ -64,6 +64,17 @@ def main():
         sys.exit(1)
 
     _print_report(report)
+
+    from backend.api.services import cache_service
+    from backend.api import cache
+
+    if cache.is_available():
+        cache_service.invalidate_routes()
+        cache_service.invalidate_narrations()
+        print("  Cache invalidated (map changed).")
+    else:
+        print("  Cache not available; nothing to invalidate.")
+
     print()
 
 

@@ -1,7 +1,5 @@
 """
 models/__init__.py
-
-Explicit re-exports.
 """
 
 from .area import Area
@@ -12,6 +10,7 @@ from .path_edge import PathEdge
 from .place import Place
 from .recent_destination import RecentDestination
 from .report import Report
+from .route_cache import RouteCache
 
 __all__ = [
     "Base",
@@ -23,4 +22,5 @@ __all__ = [
     "RecentDestination",
     "Favorite",
     "Report",
+    "RouteCache",
 ]

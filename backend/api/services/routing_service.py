@@ -2,14 +2,17 @@
 routing_service.py
 
 Wraps campus_graph.a_star and generate_turn_by_turn for the /api/route
-endpoint.
+endpoint. Checks the cache first, then computes if needed, then writes
+the result back.
 
-Profiles are locked to "fastest" and are not exposed anywhere. The
-concept exists in routing_profiles.py as a hook for future cost
-adjustments, but callers cannot select one and the API does not
-mention it.
+Cache layers, in order:
+  1. Redis, if available. Fastest.
+  2. The route_cache table, if the route is popular and was written
+     by a previous request.
+  3. Live computation via A*, if neither hit.
 """
 
+import json
 import math
 
 from sqlalchemy.orm import Session
@@ -19,19 +22,15 @@ from backend.core.campus_graph import (
     generate_turn_by_turn,
     haversine_m,
 )
-from backend.core.routing_profiles import get_profile
 
 from ..models.place import Place
+from ..models.route_cache import RouteCache
 from ..schemas.common import LatLon
 from ..schemas.route import RouteResponse, TurnStep
-
-
-# The only profile that exists in practice. Not exposed anywhere.
-_ACTIVE_PROFILE = "fastest"
+from . import cache_service
 
 
 def _find_nearest_node(graph, nodes, lat, lon):
-    """Return the node_id closest to (lat, lon) that is in the graph."""
     best_id = None
     best_dist = math.inf
     for node_id in graph:
@@ -44,14 +43,6 @@ def _find_nearest_node(graph, nodes, lat, lon):
 
 
 def _resolve_endpoint(session, graph, nodes, place_id=None, lat=None, lon=None):
-    """
-    Return (node_id, display_name) for one endpoint of a route.
-
-    If place_id is given, look up the place and use its coordinates —
-    then find the nearest graph node (which may be a footpath connector
-    the place's entrance sits on).
-    If lat/lon is given, find the nearest graph node directly.
-    """
     if place_id is not None:
         place = session.query(Place).filter_by(id=place_id).one_or_none()
         if place is None:
@@ -64,48 +55,12 @@ def _resolve_endpoint(session, graph, nodes, place_id=None, lat=None, lon=None):
     return None, None
 
 
-def _apply_profile(graph, edge_tags):
-    """
-    Return a new adjacency dict where each edge weight is
-    length * profile.cost(tags).
-
-    Currently the active profile is "fastest", whose cost function
-    returns 1.0 — so this is mathematically a no-op and the returned
-    graph has the same weights as the input. The hook exists so a
-    future cost adjustment is a change to routing_profiles.py, not to
-    this file.
-    """
-    profile = get_profile(_ACTIVE_PROFILE)
-    out = {}
-    for node_id, neighbours in graph.items():
-        adjusted = []
-        for neighbour_id, length in neighbours:
-            key = frozenset((node_id, neighbour_id))
-            tags = edge_tags.get(key, {})
-            cost = profile.cost(tags)
-            adjusted.append((neighbour_id, length * cost))
-        out[node_id] = adjusted
-    return out
-
-
-def compute_route(
-    session: Session,
-    graph,
-    nodes,
-    edge_tags,
-    from_place_id=None,
-    from_lat=None,
-    from_lon=None,
-    to_place_id=None,
-    to_lat=None,
-    to_lon=None,
+def _compute_route_uncached(
+    session, graph, nodes, edge_tags,
+    from_place_id, from_lat, from_lon,
+    to_place_id, to_lat, to_lon,
 ) -> RouteResponse | None:
-    """
-    Compute a walking route. Shortest distance.
-
-    Returns None if either endpoint can't be resolved or if no path
-    exists. Does not accept a profile — the profile is fixed.
-    """
+    """Compute a route without touching the cache."""
     from_node, from_name = _resolve_endpoint(
         session, graph, nodes, from_place_id, from_lat, from_lon
     )
@@ -118,8 +73,7 @@ def compute_route(
     if from_node == to_node:
         return None
 
-    costed = _apply_profile(graph, edge_tags)
-    path, distance = a_star(costed, nodes, from_node, to_node)
+    path, distance = a_star(graph, nodes, from_node, to_node)
     if not path:
         return None
 
@@ -141,3 +95,134 @@ def compute_route(
         from_name=from_name,
         to_name=to_name,
     )
+
+
+def _route_to_dict(route: RouteResponse) -> dict:
+    """Serialise a RouteResponse to the dict shape the cache stores."""
+    return route.model_dump(mode="json")
+
+
+def _dict_to_route(data: dict) -> RouteResponse:
+    """Deserialise the cached dict back into a RouteResponse."""
+    return RouteResponse.model_validate(data)
+
+
+def compute_route(
+    session: Session,
+    graph,
+    nodes,
+    edge_tags,
+    from_place_id=None,
+    from_lat=None,
+    from_lon=None,
+    to_place_id=None,
+    to_lat=None,
+    to_lon=None,
+) -> RouteResponse | None:
+    """
+    Compute a route, checking the cache first.
+
+    Only routes between two place IDs are cached. Coordinate-based
+    routes (used for recalculation) fall straight through to
+    computation, because the coordinate varies and caching per
+    coordinate would create too many keys.
+    """
+    cacheable = (
+        from_place_id is not None
+        and to_place_id is not None
+        and from_lat is None
+        and from_lon is None
+        and to_lat is None
+        and to_lon is None
+    )
+
+    if not cacheable:
+        return _compute_route_uncached(
+            session, graph, nodes, edge_tags,
+            from_place_id, from_lat, from_lon,
+            to_place_id, to_lat, to_lon,
+        )
+
+    # ---- Redis cache check ----
+    key = cache_service.route_key(from_place_id, to_place_id)
+    cached = cache_service.get_cached_route(key)
+    if cached is not None:
+        try:
+            return _dict_to_route(cached)
+        except Exception:
+            # Cached data doesn't match the current schema. Ignore
+            # it and recompute.
+            pass
+
+    # ---- Durable cache check ----
+    row = (
+        session.query(RouteCache)
+        .filter_by(
+            start_place_id=from_place_id,
+            end_place_id=to_place_id,
+            profile="fastest",
+        )
+        .one_or_none()
+    )
+    if row is not None:
+        try:
+            route = _dict_to_route(json.loads(row.path_json))
+            # Refresh the Redis copy so the next request hits the
+            # fast layer.
+            cache_service.set_cached_route(key, _route_to_dict(route))
+            return route
+        except Exception:
+            # Corrupt or stale row. Fall through to computation.
+            pass
+
+    # ---- Compute ----
+    route = _compute_route_uncached(
+        session, graph, nodes, edge_tags,
+        from_place_id, from_lat, from_lon,
+        to_place_id, to_lat, to_lon,
+    )
+    if route is None:
+        return None
+
+    # ---- Write back ----
+    route_dict = _route_to_dict(route)
+    cache_service.set_cached_route(key, route_dict)
+    _upsert_durable_cache(session, from_place_id, to_place_id, route_dict)
+
+    return route
+
+
+def _upsert_durable_cache(
+    session: Session,
+    from_place_id: int,
+    to_place_id: int,
+    route_dict: dict,
+):
+    """
+    Write a row to route_cache, or increment its hit_count if the
+    row exists.
+    """
+    existing = (
+        session.query(RouteCache)
+        .filter_by(
+            start_place_id=from_place_id,
+            end_place_id=to_place_id,
+            profile="fastest",
+        )
+        .one_or_none()
+    )
+
+    if existing is None:
+        session.add(
+            RouteCache(
+                start_place_id=from_place_id,
+                end_place_id=to_place_id,
+                profile="fastest",
+                path_json=json.dumps(route_dict),
+                distance_m=route_dict["distance_m"],
+                hit_count=1,
+            )
+        )
+    else:
+        existing.path_json = json.dumps(route_dict)
+        existing.hit_count += 1

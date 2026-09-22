@@ -1,7 +1,9 @@
 """
 narration_service.py
 
-Wraps narration.narrate() for the /api/narrate endpoint.
+Wraps narration.narrate() for /api/narrate. Checks the narration
+cache before generating, since narration is expensive (either the
+model call or the local timeline assembly).
 """
 
 import os
@@ -22,13 +24,12 @@ from backend.core.campus_graph import a_star, generate_turn_by_turn
 from backend.core.narration import narrate
 
 from ..schemas.narration import NarrationResponse
+from . import cache_service
 from .routing_service import _resolve_endpoint
 from .graph_service import get_areas
 
 
 def _build_events(path, nodes, edge_tags, graph, distance, start_name, end_name):
-    """Reproduce the timeline assembly that ai_navigator.py does, but
-    return the events list instead of the whole narration."""
     steps = generate_turn_by_turn(path, nodes)
     areas = get_areas()
     areas_along = dedupe_areas(area_extents_along_route(path, nodes, areas))
@@ -52,9 +53,13 @@ def narrate_route(
     live: bool = False,
 ) -> NarrationResponse | None:
     """
-    Compute a route and narrate it. Returns None if the route doesn't
-    exist. Uses local narration unless live=True.
+    Compute a route and narrate it. Checks the cache first.
+
+    The cache key includes the language, so English and Kiswahili
+    narrations of the same route are cached separately.
     """
+    # Compute the route first — needed either way for the
+    # narration timeline and for the route hash.
     from_node, from_name = _resolve_endpoint(
         session, graph, nodes, place_id=from_place_id
     )
@@ -74,6 +79,26 @@ def narrate_route(
         path, nodes, edge_tags, graph, distance, from_name, to_name
     )
 
+    # Compute the route hash from the event timeline, which is what
+    # narration is actually based on. Two routes with the same
+    # timeline get the same narration cached.
+    timeline_repr = "\n".join(
+        f"{round(e[0])}|{e[1]}|{e[2]}" for e in events
+    )
+    r_hash = cache_service.route_hash(timeline_repr)
+
+    # ---- Cache check ----
+    cached_text = cache_service.get_cached_narration(r_hash, lang=lang)
+    if cached_text is not None:
+        return NarrationResponse(
+            text=cached_text,
+            source="local",  # we can't tell which produced it, so
+                             # report local — the source field is
+                             # informational only
+            lang=lang,
+        )
+
+    # ---- Generate ----
     text = narrate(
         start_name=from_name,
         end_name=to_name,
@@ -83,6 +108,9 @@ def narrate_route(
         api_key=None,
         lang=lang,
     )
+
+    # ---- Write back ----
+    cache_service.set_cached_narration(r_hash, text, lang=lang)
 
     source = "groq" if (live and os.environ.get("GROQ_API_KEY")) else "local"
 

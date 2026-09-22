@@ -1,11 +1,7 @@
 """
 settings.py
 
-Env-driven configuration. Every value the backend needs at runtime
-comes from here, and every value has a sensible default for local
-development. Nothing in this file reads from a hardcoded path.
-
-Reads from environment variables; never raises when they're missing.
+Env-driven configuration.
 """
 
 import os
@@ -23,7 +19,6 @@ MAP_OSM_PATH = Path(os.environ.get("MAP_OSM_PATH", DATA_DIR / "map.osm"))
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "campus.db"))
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 
-# Where uploaded photos live. Served as static files by the API.
 MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", DATA_DIR / "media"))
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -57,17 +52,33 @@ INGEST_REPLACE = os.environ.get("INGEST_REPLACE", "false").lower() == "true"
 # Media
 # ---------------------------------------------------------------------------
 
-# Base URL used to build absolute photo URLs in API responses.
-# In development this is the LAN address of the machine running the API.
-# Phase 17 sets this to the production domain.
 MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://192.168.100.148:8000")
-
-# Maximum size of an uploaded photo, in bytes. 10 MB.
 MEDIA_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 
-# The three sizes every uploaded photo is reduced to, as (name, max dimension).
 MEDIA_VARIANTS = [
     ("thumb", 200),
     ("card", 800),
     ("full", 1600),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+# Redis URL. Defaults to a local Redis on the standard port. If Redis
+# isn't running, the cache falls through gracefully — the app still
+# works, just without caching.
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+# How long a cached route stays warm. 24 hours means a route computed
+# today is still cached tomorrow morning, which covers the "same
+# routes every day" pattern of campus walking.
+ROUTE_CACHE_TTL_S = int(os.environ.get("ROUTE_CACHE_TTL_S", 24 * 60 * 60))
+
+# Same for narration. Narration changes rarely, so a long TTL is fine.
+NARRATION_CACHE_TTL_S = int(os.environ.get("NARRATION_CACHE_TTL_S", 24 * 60 * 60))
+
+# Set CACHE_ENABLED=false to disable all caching. Useful in tests
+# and for debugging a suspected cache issue.
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
