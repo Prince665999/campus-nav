@@ -1,0 +1,38 @@
+name: Admin CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "admin/**"
+      - ".github/workflows/admin-ci.yml"
+  pull_request:
+    paths:
+      - "admin/**"
+      - ".github/workflows/admin-ci.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: admin/site/package-lock.json
+
+      - name: Install dependencies
+        working-directory: admin/site
+        run: npm ci
+
+      - name: Lint
+        working-directory: admin/site
+        run: npx next lint --max-warnings=0
+
+      - name: Build
+        working-directory: admin/site
+        run: npx next build

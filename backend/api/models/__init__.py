@@ -2,6 +2,7 @@
 models/__init__.py
 """
 
+from .admin_user import AdminUser
 from .area import Area
 from .base import Base, TimestampMixin
 from .favorite import Favorite
@@ -23,4 +24,5 @@ __all__ = [
     "Favorite",
     "Report",
     "RouteCache",
+    "AdminUser",
 ]
