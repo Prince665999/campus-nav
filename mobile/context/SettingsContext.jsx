@@ -1,9 +1,4 @@
 // App-wide settings that persist across restarts.
-//
-// Usage:
-//   const { settings, updateSetting } = useSettings();
-//   settings.voiceEnabled // true or false
-//   settings.language     // 'en' or 'sw'
 
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
 
@@ -21,6 +16,7 @@ const DEFAULT_SETTINGS = {
   largeText: false,
   hapticsEnabled: true,
   reduceMotion: false,
+  hasSeenOnboarding: false,
 };
 
 const SettingsContext = createContext({
@@ -33,14 +29,12 @@ export function SettingsProvider({ children }) {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [loaded, setLoaded] = useState(false);
 
-  // Load persisted settings on mount.
   useEffect(() => {
     let cancelled = false;
     getJSON(STORAGE_KEY).then((stored) => {
       if (cancelled) return;
       const merged = { ...DEFAULT_SETTINGS, ...(stored || {}) };
       setSettings(merged);
-      // Apply the persisted language to the i18n module immediately.
       setI18nLanguage(merged.language);
       setLoaded(true);
     });
@@ -54,7 +48,6 @@ export function SettingsProvider({ children }) {
       const next = { ...prev, [key]: value };
       setJSON(STORAGE_KEY, next);
 
-      // Language is special: it has a side effect on the i18n module.
       if (key === 'language') {
         setI18nLanguage(value);
       }

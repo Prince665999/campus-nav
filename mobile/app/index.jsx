@@ -1,4 +1,8 @@
 // Home screen.
+//
+// Two states: searching (query or category selected) shows results,
+// not searching shows recents and favorites. On first launch,
+// redirects to onboarding.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -14,6 +18,7 @@ import { SearchBar } from '@/components/SearchBar';
 import { PlaceCard } from '@/components/PlaceCard';
 import { CategoryChips } from '@/components/CategoryChips';
 import { useDebounce } from '@/hooks/useDebounce';
+import { useSettings } from '@/context/SettingsContext';
 import {
   extractDestination,
   listPlaces,
@@ -25,6 +30,8 @@ import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
 import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 
 export default function HomeScreen() {
+  const { settings } = useSettings();
+
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState(null);
   const [results, setResults] = useState([]);
@@ -36,6 +43,14 @@ export default function HomeScreen() {
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
 
+  // First launch: redirect to onboarding.
+  useEffect(() => {
+    if (settings.loaded && !settings.hasSeenOnboarding) {
+      router.replace('/onboarding');
+    }
+  }, [settings.loaded, settings.hasSeenOnboarding]);
+
+  // Load recents and favorites once on mount.
   useEffect(() => {
     let cancelled = false;
     Promise.all([
@@ -52,6 +67,7 @@ export default function HomeScreen() {
     };
   }, []);
 
+  // Search when query or category changes.
   useEffect(() => {
     let cancelled = false;
 
@@ -82,6 +98,8 @@ export default function HomeScreen() {
     router.push(`/place/${place.id}`);
   }, []);
 
+  // Sentence-to-destination. Fires when the student presses the
+  // keyboard's search key with more than a couple of words.
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
@@ -102,7 +120,7 @@ export default function HomeScreen() {
         });
       }
     } catch {
-      // Silent.
+      // Silent. The student can still tap a search result below.
     }
   }, [query]);
 
