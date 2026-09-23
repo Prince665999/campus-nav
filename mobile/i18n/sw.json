@@ -23,6 +23,13 @@
     "nearbyTitle": "Karibu nami",
     "emptyHint": "Tafuta mahali au vinjari kwa aina hapa chini."
   },
+  "start": {
+    "title": "Unaanza kutoka wapi?",
+    "subtitle": "Hatukuweza kupata mahali ulipo. Chagua mahali pa kuanzia.",
+    "findingLocation": "Inatafuta mahali ulipo…",
+    "noPlaces": "Hakuna mahali panapatikana. Jaribu tena.",
+    "couldNotResolve": "Hatukuweza kubaini pa kuanzia."
+  },
   "place": {
     "takeMeThere": "Nipeleke hapo",
     "noDescription": "Bado hakuna maelezo.",

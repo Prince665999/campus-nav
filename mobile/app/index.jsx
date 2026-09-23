@@ -13,8 +13,10 @@ import { router } from 'expo-router';
 import { SearchBar } from '@/components/SearchBar';
 import { PlaceCard } from '@/components/PlaceCard';
 import { CategoryChips } from '@/components/CategoryChips';
+import { StartingPointSheet } from '@/components/StartingPointSheet';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
+import { useStartingPoint } from '@/hooks/useStartingPoint';
 import {
   extractDestination,
   listPlaces,
@@ -35,25 +37,22 @@ export default function HomeScreen() {
   const [favorites, setFavorites] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [resolvingStart, setResolvingStart] = useState(false);
 
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
 
+  const {
+    state: startState,
+    nearbyPlaces,
+    resolveStart,
+    choosePlace,
+    cancelPick,
+  } = useStartingPoint();
+
   // First launch: redirect to onboarding.
-  //
-  // `loaded` comes from the context (it says whether storage has been
-  // read). `hasSeenOnboarding` comes from `settings` (it's a stored
-  // preference). They live in different places, which is easy to
-  // confuse.
   useEffect(() => {
-    console.log(
-      'Home: loaded=',
-      loaded,
-      'seen=',
-      settings.hasSeenOnboarding
-    );
     if (loaded && !settings.hasSeenOnboarding) {
-      console.log('Home: redirecting to onboarding');
       router.replace('/onboarding');
     }
   }, [loaded, settings.hasSeenOnboarding]);
@@ -106,29 +105,54 @@ export default function HomeScreen() {
     router.push(`/place/${place.id}`);
   }, []);
 
+  // Sentence-to-destination. Resolves a start, then navigates.
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
     if (text.split(/\s+/).length < 3) return;
 
+    setResolvingStart(true);
+
     try {
       const extracted = await extractDestination(text);
-      if (extracted.matched) {
-        const others = await listPlaces({ limit: 5 });
-        const from = others.find((p) => p.id !== extracted.place_id) || others[0];
-        if (!from) return;
-        router.push({
-          pathname: '/route-preview',
-          params: {
-            fromId: String(from.id),
-            toId: String(extracted.place_id),
-          },
-        });
+      if (!extracted.matched) {
+        setResolvingStart(false);
+        return;
       }
+
+      const start = await resolveStart({
+        destinationPlaceId: extracted.place_id,
+      });
+
+      if (!start) {
+        setResolvingStart(false);
+        return;
+      }
+
+      const params = {
+        toId: String(extracted.place_id),
+      };
+
+      if (start.lat != null && start.lon != null) {
+        params.fromLat = String(start.lat);
+        params.fromLon = String(start.lon);
+      } else if (start.placeId != null) {
+        params.fromId = String(start.placeId);
+      } else {
+        setResolvingStart(false);
+        return;
+      }
+
+      router.push({
+        pathname: '/route-preview',
+        params,
+      });
     } catch {
       // Silent.
+    } finally {
+      setResolvingStart(false);
     }
-  }, [query]);
+  }, [query, resolveStart]);
 
   const showSearchResults = isSearching;
 
@@ -223,6 +247,13 @@ export default function HomeScreen() {
           <ActivityIndicator color={COLORS.textMuted} />
         </View>
       ) : null}
+
+      <StartingPointSheet
+        visible={startState === 'needPick'}
+        places={nearbyPlaces}
+        onChoose={choosePlace}
+        onCancel={cancelPick}
+      />
     </View>
   );
 }

@@ -1,28 +1,46 @@
 // Wraps expo-location.
 //
-// Only one subscription is active at a time. Calling watch() while
-// another watch is running returns the existing subscription rather
-// than starting a second one — the OS warns loudly if you subscribe
-// twice.
+// Two ways to get a position:
+//   - watch() — continuous updates, used in Walking Mode.
+//   - getPositionOnce() — one shot, with a timeout, used when the app
+//     needs a starting point for a route.
+//
+// Only one watch subscription is active at a time.
 
 import * as Location from 'expo-location';
 
 let _subscription = null;
 
 // Ask for foreground location permission. Returns true if granted.
-//
-// Safe to call more than once — if permission is already granted, it
-// returns true without showing a prompt.
 export async function requestPermission() {
   const { status } = await Location.requestForegroundPermissionsAsync();
   return status === 'granted';
 }
 
-// Get the current position once.
-export async function getCurrentPosition() {
-  return Location.getCurrentPositionAsync({
-    accuracy: Location.Accuracy.Balanced,
-  });
+// Get the current position once, with a timeout.
+//
+// Returns { lat, lon, accuracyM } or null if the fix doesn't arrive
+// within `timeoutMs`. A GPS fix can take several seconds on a cold
+// start — the timeout prevents the caller from hanging indefinitely.
+export async function getPositionOnce({ timeoutMs = 8000 } = {}) {
+  try {
+    const result = await Promise.race([
+      Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      }),
+      new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+
+    if (!result) return null;
+
+    return {
+      lat: result.coords.latitude,
+      lon: result.coords.longitude,
+      accuracyM: result.coords.accuracy,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // Subscribe to continuous position updates.
@@ -37,11 +55,7 @@ export async function watch(onPosition, onError) {
   _subscription = await Location.watchPositionAsync(
     {
       accuracy: Location.Accuracy.High,
-      // Wait at least 1 metre of movement before reporting. Filters
-      // out GPS drift while the student is standing still.
       distanceInterval: 1,
-      // Report at most once per second. Balances freshness against
-      // battery drain.
       timeInterval: 1000,
     },
     (loc) => {

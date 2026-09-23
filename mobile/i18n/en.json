@@ -23,6 +23,13 @@
     "nearbyTitle": "Near me",
     "emptyHint": "Search for a place or browse categories below."
   },
+  "start": {
+    "title": "Where are you starting from?",
+    "subtitle": "We couldn't find your location. Pick a place to start from.",
+    "findingLocation": "Finding your location…",
+    "noPlaces": "No places available. Try again.",
+    "couldNotResolve": "Couldn't work out where to start from."
+  },
   "place": {
     "takeMeThere": "Take me there",
     "noDescription": "No description yet.",

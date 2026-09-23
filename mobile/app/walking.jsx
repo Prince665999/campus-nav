@@ -21,6 +21,7 @@ import { useWalkingProgress } from '@/hooks/useWalkingProgress';
 import { useCompass } from '@/hooks/useCompass';
 import { useNearbyWifi } from '@/hooks/useNearbyWifi';
 import { useSettings } from '@/context/SettingsContext';
+import { updateCachedPosition } from '@/hooks/useStartingPoint';
 import { computeRoute, listMediaForPlace, recordRecent } from '@/services/api';
 import { closestApproachPhoto } from '@/utils/media';
 import * as tts from '@/services/tts';
@@ -34,7 +35,7 @@ const APPROACH_PHOTO_DISTANCE_M = 60;
 const ARRIVAL_DISTANCE_M = 15;
 
 export default function WalkingScreen() {
-  const { fromId, toId, routeJson } = useLocalSearchParams();
+  const { fromId, toId, fromLat, fromLon, routeJson } = useLocalSearchParams();
 
   const [route, setRoute] = useState(() => {
     if (routeJson) {
@@ -65,8 +66,10 @@ export default function WalkingScreen() {
     async function load() {
       try {
         const data = await computeRoute({
-          fromPlaceId: Number(fromId),
+          fromPlaceId: fromId ? Number(fromId) : null,
           toPlaceId: Number(toId),
+          fromLat: fromLat ? Number(fromLat) : null,
+          fromLon: fromLon ? Number(fromLon) : null,
         });
         setRoute(data);
       } catch (err) {
@@ -110,6 +113,14 @@ export default function WalkingScreen() {
     resetOffRoute,
   } = useWalkingProgress(route);
 
+  // Cache the current position so other screens can use it as a
+  // starting point without asking for location again.
+  useEffect(() => {
+    if (position) {
+      updateCachedPosition({ lat: position.lat, lon: position.lon });
+    }
+  }, [position]);
+
   // Wi-Fi proximity.
   const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
     position,
@@ -134,8 +145,7 @@ export default function WalkingScreen() {
     haptics.turnPulse();
   }, [currentStepIndex, currentStep]);
 
-  // Warning pulse when the student goes off-route. Fires once per
-  // transition from on-route to off-route.
+  // Warning pulse when the student goes off-route.
   useEffect(() => {
     if (offRoute) {
       haptics.offRoutePulse();
@@ -149,8 +159,7 @@ export default function WalkingScreen() {
     };
   }, []);
 
-  // When the student arrives, go to the arrival screen. The ref
-  // ensures the navigation fires exactly once.
+  // When the student arrives, go to the arrival screen.
   useEffect(() => {
     if (arrivedRef.current) return;
     if (!route) return;
@@ -237,7 +246,7 @@ export default function WalkingScreen() {
     router.push({
       pathname: '/chat',
       params: {
-        fromPlaceId: String(fromId),
+        fromPlaceId: fromId ? String(fromId) : '',
         toPlaceId: String(toId),
         currentStepIndex: String(currentStepIndex ?? 0),
         distanceFromStartM: String(
@@ -318,11 +327,7 @@ export default function WalkingScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={t('chat.titleWalk')}
               >
-                <MaterialIcons
-                  name={ICONS.chat}
-                  size={22}
-                  color={COLORS.text}
-                />
+                <MaterialIcons name={ICONS.chat} size={22} color={COLORS.text} />
               </TouchableOpacity>
               <TouchableOpacity
                 onPress={() => setReportOpen(true)}

@@ -10,19 +10,22 @@ import {
   View,
 } from 'react-native';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { MaterialIcons } from '@expo/vector-icons';
 
 import {
   addFavorite,
   getPlace,
   isFavorite,
   listMediaForPlace,
-  listPlaces,
   removeFavorite,
 } from '@/services/api';
 import { PhotoCarousel } from '@/components/PhotoCarousel';
 import { ReportSheet } from '@/components/ReportSheet';
+import { StartingPointSheet } from '@/components/StartingPointSheet';
+import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { t } from '@/i18n';
-import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
 
 export default function PlaceDetailScreen() {
   const { id } = useLocalSearchParams();
@@ -34,6 +37,15 @@ export default function PlaceDetailScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [reportOpen, setReportOpen] = useState(false);
+  const [resolvingStart, setResolvingStart] = useState(false);
+
+  const {
+    state: startState,
+    nearbyPlaces,
+    resolveStart,
+    choosePlace,
+    cancelPick,
+  } = useStartingPoint();
 
   useEffect(() => {
     let cancelled = false;
@@ -65,7 +77,7 @@ export default function PlaceDetailScreen() {
 
   const toggleFavorite = useCallback(async () => {
     const next = !favorited;
-    setFavorited(next); // optimistic update
+    setFavorited(next);
     try {
       if (next) {
         await addFavorite(placeId);
@@ -73,31 +85,52 @@ export default function PlaceDetailScreen() {
         await removeFavorite(placeId);
       }
     } catch {
-      // Revert on failure.
       setFavorited(!next);
     }
   }, [favorited, placeId]);
 
+  // Take me there — resolve a start, then navigate.
   const takeMeThere = useCallback(async () => {
     if (!place) return;
+    setResolvingStart(true);
+    setError(null);
+
     try {
-      const others = await listPlaces({ limit: 5 });
-      const from = others.find((p) => p.id !== place.id) || others[0];
-      if (!from) {
-        setError('No other places to route from.');
+      const start = await resolveStart({ destinationPlaceId: place.id });
+
+      if (!start) {
+        // The student cancelled the picker.
+        setResolvingStart(false);
         return;
       }
+
+      // Two possible shapes: { lat, lon } or { placeId, placeName }.
+      const params = {
+        toId: String(place.id),
+      };
+
+      if (start.lat != null && start.lon != null) {
+        params.fromLat = String(start.lat);
+        params.fromLon = String(start.lon);
+      } else if (start.placeId != null) {
+        params.fromId = String(start.placeId);
+      } else {
+        // Shouldn't happen, but be defensive.
+        setError(t('start.couldNotResolve'));
+        setResolvingStart(false);
+        return;
+      }
+
       router.push({
         pathname: '/route-preview',
-        params: {
-          fromId: String(from.id),
-          toId: String(place.id),
-        },
+        params,
       });
     } catch (err) {
       setError(err.message || t('common.error'));
+    } finally {
+      setResolvingStart(false);
     }
-  }, [place]);
+  }, [place, resolveStart]);
 
   if (loading) {
     return (
@@ -129,9 +162,11 @@ export default function PlaceDetailScreen() {
                 favorited ? t('place.removeFavorite') : t('place.addFavorite')
               }
             >
-              <Text style={[styles.star, favorited && styles.starActive]}>
-                {favorited ? '★' : '☆'}
-              </Text>
+              <MaterialIcons
+                name={favorited ? ICONS.favoriteFilled : ICONS.favoriteOutline}
+                size={22}
+                color={favorited ? COLORS.warning : COLORS.text}
+              />
             </TouchableOpacity>
           ),
         }}
@@ -184,14 +219,29 @@ export default function PlaceDetailScreen() {
 
         <View style={styles.actions}>
           <TouchableOpacity
-            style={styles.primaryButton}
+            style={[
+              styles.primaryButton,
+              resolvingStart && styles.primaryButtonDisabled,
+            ]}
             onPress={takeMeThere}
+            disabled={resolvingStart}
             accessibilityRole="button"
             accessibilityLabel={t('place.takeMeThere')}
           >
-            <Text style={styles.primaryButtonText}>
-              {t('place.takeMeThere')}
-            </Text>
+            {resolvingStart ? (
+              <View style={styles.buttonContent}>
+                <ActivityIndicator color="#ffffff" size="small" />
+                <Text style={[styles.primaryButtonText, styles.buttonTextSpaced]}>
+                  {startState === 'locating'
+                    ? t('start.findingLocation')
+                    : t('common.loading')}
+                </Text>
+              </View>
+            ) : (
+              <Text style={styles.primaryButtonText}>
+                {t('place.takeMeThere')}
+              </Text>
+            )}
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -208,6 +258,13 @@ export default function PlaceDetailScreen() {
         visible={reportOpen}
         onClose={() => setReportOpen(false)}
         placeId={place.id}
+      />
+
+      <StartingPointSheet
+        visible={startState === 'needPick'}
+        places={nearbyPlaces}
+        onChoose={choosePlace}
+        onCancel={cancelPick}
       />
     </>
   );
@@ -242,9 +299,13 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     padding: SPACING.lg,
   },
-  headerButton: { padding: 6 },
-  star: { fontSize: 24, color: COLORS.textFaint },
-  starActive: { color: COLORS.warning },
+  headerButton: {
+    padding: 8,
+    minWidth: TOUCH.minWidth,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   header: {
     padding: SPACING.lg,
     borderBottomWidth: 1,
@@ -279,8 +340,16 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primaryDark,
     borderRadius: RADIUS.md,
     paddingVertical: 16,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  primaryButtonDisabled: { opacity: 0.7 },
+  buttonContent: {
+    flexDirection: 'row',
     alignItems: 'center',
   },
+  buttonTextSpaced: { marginLeft: SPACING.sm },
   primaryButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
   reportLink: {
     marginTop: SPACING.md,

@@ -18,12 +18,17 @@ import { computeRoute, narrateRoute } from '@/services/api';
 import { useSettings } from '@/context/SettingsContext';
 import { t } from '@/i18n';
 import { estimateWalkingSeconds, formatDistance } from '@/utils/format';
-import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 export default function RoutePreviewScreen() {
-  const { fromId, toId } = useLocalSearchParams();
-  const fromPlaceId = Number(fromId);
+  const { fromId, toId, fromLat, fromLon } = useLocalSearchParams();
+
+  // Either an ID or coordinates, depending on how the student got
+  // here. The route service accepts both.
+  const fromPlaceId = fromId ? Number(fromId) : null;
   const toPlaceId = Number(toId);
+  const fromLatNum = fromLat ? Number(fromLat) : null;
+  const fromLonNum = fromLon ? Number(fromLon) : null;
 
   const insets = useSafeAreaInsets();
   const { settings } = useSettings();
@@ -39,7 +44,12 @@ export default function RoutePreviewScreen() {
       setLoading(true);
       setError(null);
       try {
-        const data = await computeRoute({ fromPlaceId, toPlaceId });
+        const data = await computeRoute({
+          fromPlaceId,
+          toPlaceId,
+          fromLat: fromLatNum,
+          fromLon: fromLonNum,
+        });
         if (!cancelled) setRoute(data);
       } catch (err) {
         if (!cancelled) setError(err.message || t('common.error'));
@@ -51,7 +61,7 @@ export default function RoutePreviewScreen() {
     return () => {
       cancelled = true;
     };
-  }, [fromPlaceId, toPlaceId]);
+  }, [fromPlaceId, toPlaceId, fromLatNum, fromLonNum]);
 
   useEffect(() => {
     let cancelled = false;
@@ -76,15 +86,23 @@ export default function RoutePreviewScreen() {
 
   const startWalking = useCallback(() => {
     if (!route) return;
+    // Pass the route along. The walking screen uses the from/to
+    // params for recalculation and the routeJson for the geometry.
+    const params = {
+      toId: String(toPlaceId),
+      routeJson: JSON.stringify(route),
+    };
+    if (fromPlaceId != null) {
+      params.fromId = String(fromPlaceId);
+    } else if (fromLatNum != null && fromLonNum != null) {
+      params.fromLat = String(fromLatNum);
+      params.fromLon = String(fromLonNum);
+    }
     router.push({
       pathname: '/walking',
-      params: {
-        fromId: String(fromPlaceId),
-        toId: String(toPlaceId),
-        routeJson: JSON.stringify(route),
-      },
+      params,
     });
-  }, [route, fromPlaceId, toPlaceId]);
+  }, [route, fromPlaceId, toPlaceId, fromLatNum, fromLonNum]);
 
   if (loading) {
     return (
@@ -127,7 +145,10 @@ export default function RoutePreviewScreen() {
           style={styles.map}
         />
 
-        <ScrollView style={styles.body} contentContainerStyle={styles.bodyContent}>
+        <ScrollView
+          style={styles.body}
+          contentContainerStyle={styles.bodyContent}
+        >
           <RouteSummary
             fromName={route.from_name}
             toName={route.to_name}
@@ -180,7 +201,7 @@ const styles = StyleSheet.create({
   },
   errorText: {
     color: COLORS.danger,
-    fontSize: 15,
+    fontSize: FONT_SIZE.body,
     textAlign: 'center',
     padding: 20,
   },
@@ -221,7 +242,9 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primaryDark,
     borderRadius: RADIUS.md,
     paddingVertical: 16,
+    minHeight: TOUCH.minHeight,
     alignItems: 'center',
+    justifyContent: 'center',
   },
   primaryButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
 });
