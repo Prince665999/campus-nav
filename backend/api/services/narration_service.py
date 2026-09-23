@@ -1,9 +1,8 @@
 """
 narration_service.py
 
-Wraps narration.narrate() for /api/narrate. Checks the narration
-cache before generating, since narration is expensive (either the
-model call or the local timeline assembly).
+Wraps narration.narrate() for /api/narrate. Accepts either a place ID
+or coordinates for the from endpoint.
 """
 
 import os
@@ -30,12 +29,15 @@ from .graph_service import get_areas
 
 
 def _build_events(path, nodes, edge_tags, graph, distance, start_name, end_name):
+    """Reproduce the timeline assembly that ai_navigator.py does."""
     steps = generate_turn_by_turn(path, nodes)
     areas = get_areas()
     areas_along = dedupe_areas(area_extents_along_route(path, nodes, areas))
     areas_along = filter_areas(areas_along, distance, start_name, end_name)
     path_notes = path_notes_along_route(path, nodes, edge_tags)
-    branches = path_branches_along_route(path, nodes, graph, edge_tags, total_m=distance)
+    branches = path_branches_along_route(
+        path, nodes, graph, edge_tags, total_m=distance
+    )
     branches = remove_branches_at_turns(branches, steps)
     dest_pos = destination_view(path, nodes, areas, end_name)
     events = build_timeline(steps, areas_along, path_notes, branches)
@@ -47,25 +49,33 @@ def narrate_route(
     graph,
     nodes,
     edge_tags,
-    from_place_id: int,
-    to_place_id: int,
+    from_place_id: int | None = None,
+    from_lat: float | None = None,
+    from_lon: float | None = None,
+    to_place_id: int = None,
     lang: str = "en",
     live: bool = False,
 ) -> NarrationResponse | None:
     """
-    Compute a route and narrate it. Checks the cache first.
-
-    The cache key includes the language, so English and Kiswahili
-    narrations of the same route are cached separately.
+    Compute a route and narrate it. The from endpoint can be either a
+    place ID or coordinates; the to endpoint is always a place ID.
     """
-    # Compute the route first — needed either way for the
-    # narration timeline and for the route hash.
-    from_node, from_name = _resolve_endpoint(
-        session, graph, nodes, place_id=from_place_id
-    )
+    # Resolve the from endpoint.
+    if from_place_id is not None:
+        from_node, from_name = _resolve_endpoint(
+            session, graph, nodes, place_id=from_place_id
+        )
+    elif from_lat is not None and from_lon is not None:
+        from_node, from_name = _resolve_endpoint(
+            session, graph, nodes, lat=from_lat, lon=from_lon
+        )
+    else:
+        return None
+
     to_node, to_name = _resolve_endpoint(
         session, graph, nodes, place_id=to_place_id
     )
+
     if from_node is None or to_node is None:
         return None
     if from_node == to_node:
@@ -79,9 +89,8 @@ def narrate_route(
         path, nodes, edge_tags, graph, distance, from_name, to_name
     )
 
-    # Compute the route hash from the event timeline, which is what
-    # narration is actually based on. Two routes with the same
-    # timeline get the same narration cached.
+    # Cache key from the timeline. Two routes with the same timeline
+    # share a cached narration.
     timeline_repr = "\n".join(
         f"{round(e[0])}|{e[1]}|{e[2]}" for e in events
     )
@@ -92,9 +101,7 @@ def narrate_route(
     if cached_text is not None:
         return NarrationResponse(
             text=cached_text,
-            source="local",  # we can't tell which produced it, so
-                             # report local — the source field is
-                             # informational only
+            source="local",
             lang=lang,
         )
 

@@ -2,19 +2,6 @@
 // tracking. Given a route, it tracks the student's position, snaps
 // it to the route, and exposes the current step, distance remaining,
 // distance to next turn, off-route state, and progress fraction.
-//
-// Usage:
-//   const {
-//     permissionGranted,
-//     position,        // { lat, lon } — the SNAPPED position
-//     rawPosition,     // { lat, lon } — the raw GPS fix
-//     currentStepIndex,
-//     currentStep,
-//     distanceRemainingM,
-//     distanceToNextStepM,
-//     offRoute,
-//     progress,
-//   } = useWalkingProgress(route);
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -54,16 +41,11 @@ export function useWalkingProgress(route) {
 
   // Once permission is granted and the route is available, start
   // watching the position.
-  //
-  // This effect also resets the off-route detector at the top, so a
-  // new route starts with a clean slate. That replaces the previous
-  // approach of comparing against a ref during render, which React
-  // 19's react-hooks/refs rule rejects.
   useEffect(() => {
     if (!permissionGranted || !route || !route.geometry) return;
 
-    // Reset per-route state. The detector is a ref, so resetting it
-    // here is fine — refs are meant to be mutated in effects.
+    // Reset the detector and its warm-up counter when the route
+    // changes. A new route means a new reference frame.
     detectorRef.current.reset();
 
     let stop = null;
@@ -74,15 +56,16 @@ export function useWalkingProgress(route) {
 
       setRawPosition({ lat: loc.lat, lon: loc.lon });
 
-      const snapped = snapToRoute({ lat: loc.lat, lon: loc.lon }, route.geometry);
+      const snapped = snapToRoute(
+        { lat: loc.lat, lon: loc.lon },
+        route.geometry
+      );
       if (!snapped) return;
 
       setSnappedPosition({ lat: snapped.lat, lon: snapped.lon });
       setDistanceFromStart(snapped.distanceFromStartM);
 
       const isOffRoute = detectorRef.current.record(snapped.offRouteM);
-      // Only call setOffRoute when the value actually changes, which
-      // avoids a render on every GPS fix.
       setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
     }).then((stopFn) => {
       stop = stopFn;
@@ -102,7 +85,11 @@ export function useWalkingProgress(route) {
   const step = stepIndex >= 0 ? steps[stepIndex] : null;
 
   const remaining = distanceRemaining(totalDistance, distanceFromStart);
-  const nextStepDistance = distanceToNextStep(steps, stepIndex, distanceFromStart);
+  const nextStepDistance = distanceToNextStep(
+    steps,
+    stepIndex,
+    distanceFromStart
+  );
   const progress = progressFraction(totalDistance, distanceFromStart);
 
   const resetOffRoute = useCallback(() => {
