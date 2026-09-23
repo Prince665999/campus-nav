@@ -1,9 +1,12 @@
 // Horizontal scroll of category filter chips.
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
 import { CATEGORIES } from '@/constants/categories';
 import { t } from '@/i18n';
-import { COLORS, RADIUS, SPACING } from '@/constants/theme';
+import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
 
 export function CategoryChips({ selected, onSelect }) {
   return (
@@ -24,8 +27,16 @@ export function CategoryChips({ selected, onSelect }) {
             accessibilityState={{ selected: isSelected }}
             accessibilityLabel={t(cat.labelKey)}
           >
-            <Text style={styles.icon}>{cat.icon}</Text>
-            <Text style={[styles.label, isSelected && styles.labelSelected]}>
+            <MaterialIcons
+              name={ICONS[cat.iconKey] || ICONS.place}
+              size={16}
+              color={isSelected ? '#ffffff' : COLORS.textMuted}
+              style={styles.icon}
+            />
+            <Text
+              style={[styles.label, isSelected && styles.labelSelected]}
+              numberOfLines={1}
+            >
               {t(cat.labelKey)}
             </Text>
           </TouchableOpacity>
@@ -39,11 +50,13 @@ const styles = StyleSheet.create({
   scroll: {
     marginTop: SPACING.xs,
     marginBottom: SPACING.sm,
-    maxHeight: 44,
+    maxHeight: TOUCH.minHeight + 8,
+    flexGrow: 0,
   },
   scrollContent: {
     paddingHorizontal: SPACING.md,
     gap: SPACING.sm,
+    alignItems: 'center',
   },
   chip: {
     flexDirection: 'row',
@@ -52,15 +65,19 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
     borderRadius: RADIUS.pill,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+    paddingHorizontal: 12,
+    height: TOUCH.minHeight,
     gap: 6,
   },
   chipSelected: {
     backgroundColor: COLORS.primaryDark,
     borderColor: COLORS.primaryDark,
   },
-  icon: { fontSize: 14 },
-  label: { fontSize: 14, color: '#374151', fontWeight: '500' },
+  icon: { marginTop: 1 },
+  label: {
+    fontSize: 14,
+    color: COLORS.text,
+    fontWeight: '500',
+  },
   labelSelected: { color: '#ffffff' },
 });

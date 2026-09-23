@@ -6,15 +6,96 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 
 const NAV_ITEMS = [
-  { href: '/dashboard', label: 'Dashboard', icon: '📊' },
-  { href: '/map-health', label: 'Map Health', icon: '🩺' },
-  { href: '/report-queue', label: 'Reports', icon: '🚩' },
-  { href: '/photo-manager', label: 'Photos', icon: '📷' },
-  { href: '/place-editor', label: 'Places', icon: '📍' },
-  { href: '/route-tester', label: 'Route Tester', icon: '🧭' },
-  { href: '/reimport-view', label: 'Re-import', icon: '🔄' },
-  { href: '/roles', label: 'Roles', icon: '👥' },
+  { href: '/dashboard', label: 'Dashboard', icon: 'dashboard' },
+  { href: '/map-health', label: 'Map Health', icon: 'health' },
+  { href: '/report-queue', label: 'Reports', icon: 'flag' },
+  { href: '/photo-manager', label: 'Photos', icon: 'camera' },
+  { href: '/place-editor', label: 'Places', icon: 'pin' },
+  { href: '/route-tester', label: 'Route Tester', icon: 'compass' },
+  { href: '/reimport-view', label: 'Re-import', icon: 'refresh' },
+  { href: '/roles', label: 'Roles', icon: 'people' },
 ];
+
+// Minimal inline SVGs, one per icon. Sized 16, stroke-based, using
+// `currentColor` so they inherit the sidebar's text colour.
+function Icon({ name }) {
+  const common = {
+    width: 16,
+    height: 16,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  };
+
+  switch (name) {
+    case 'dashboard':
+      return (
+        <svg {...common}>
+          <rect x="3" y="3" width="7" height="9" />
+          <rect x="14" y="3" width="7" height="5" />
+          <rect x="14" y="12" width="7" height="9" />
+          <rect x="3" y="16" width="7" height="5" />
+        </svg>
+      );
+    case 'health':
+      return (
+        <svg {...common}>
+          <path d="M3 12h4l2-6 4 12 2-6h6" />
+        </svg>
+      );
+    case 'flag':
+      return (
+        <svg {...common}>
+          <path d="M4 22V4h12l-2 4 2 4H4" />
+          <line x1="4" y1="22" x2="4" y2="4" />
+        </svg>
+      );
+    case 'camera':
+      return (
+        <svg {...common}>
+          <path d="M4 8h3l2-3h6l2 3h3v10H4z" />
+          <circle cx="12" cy="13" r="3" />
+        </svg>
+      );
+    case 'pin':
+      return (
+        <svg {...common}>
+          <path d="M12 22s7-6 7-12a7 7 0 10-14 0c0 6 7 12 7 12z" />
+          <circle cx="12" cy="10" r="2.5" />
+        </svg>
+      );
+    case 'compass':
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="9" />
+          <polygon points="15 9 13 13 9 15 11 11 15 9" />
+        </svg>
+      );
+    case 'refresh':
+      return (
+        <svg {...common}>
+          <path d="M3 12a9 9 0 0115-6.7L21 8" />
+          <path d="M21 3v5h-5" />
+          <path d="M21 12a9 9 0 01-15 6.7L3 16" />
+          <path d="M3 21v-5h5" />
+        </svg>
+      );
+    case 'people':
+      return (
+        <svg {...common}>
+          <circle cx="9" cy="8" r="3" />
+          <path d="M3 21v-2a6 6 0 016-6h0a6 6 0 016 6v2" />
+          <circle cx="17" cy="9" r="2.5" />
+          <path d="M16 21v-1a4 4 0 014-4h0a4 4 0 014 4v1" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -25,7 +106,6 @@ export function Sidebar() {
       await fetch('/api/admin/logout', { method: 'POST' });
       router.push('/login');
     } catch {
-      // Navigate anyway.
       router.push('/login');
     }
   }
@@ -60,7 +140,8 @@ export function Sidebar() {
 
       <nav style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
         {NAV_ITEMS.map((item) => {
-          const isActive = pathname === item.href || pathname.startsWith(item.href + '/');
+          const isActive =
+            pathname === item.href || pathname.startsWith(item.href + '/');
           return (
             <Link
               key={item.href}
@@ -79,7 +160,16 @@ export function Sidebar() {
                 fontWeight: isActive ? 600 : 500,
               }}
             >
-              <span style={{ fontSize: 16 }}>{item.icon}</span>
+              <span
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  width: 20,
+                }}
+              >
+                <Icon name={item.icon} />
+              </span>
               <span>{item.label}</span>
             </Link>
           );

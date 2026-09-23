@@ -33,6 +33,40 @@ export default function SettingsScreen() {
           <Switch
             value={settings.voiceEnabled}
             onValueChange={(v) => updateSetting('voiceEnabled', v)}
+            accessibilityLabel={t('settings.speakInstructions')}
+          />
+        </Row>
+      </Section>
+
+      <Section title={t('settings.accessibility')}>
+        <Row
+          label={t('settings.largeText')}
+          description={t('settings.largeTextDescription')}
+        >
+          <Switch
+            value={settings.largeText}
+            onValueChange={(v) => updateSetting('largeText', v)}
+            accessibilityLabel={t('settings.largeText')}
+          />
+        </Row>
+        <Row
+          label={t('settings.haptics')}
+          description={t('settings.hapticsDescription')}
+        >
+          <Switch
+            value={settings.hapticsEnabled}
+            onValueChange={(v) => updateSetting('hapticsEnabled', v)}
+            accessibilityLabel={t('settings.haptics')}
+          />
+        </Row>
+        <Row
+          label={t('settings.reduceMotion')}
+          description={t('settings.reduceMotionDescription')}
+        >
+          <Switch
+            value={settings.reduceMotion}
+            onValueChange={(v) => updateSetting('reduceMotion', v)}
+            accessibilityLabel={t('settings.reduceMotion')}
           />
         </Row>
       </Section>
@@ -45,6 +79,7 @@ export default function SettingsScreen() {
           <Switch
             value={settings.wifiProximityEnabled}
             onValueChange={(v) => updateSetting('wifiProximityEnabled', v)}
+            accessibilityLabel={t('settings.wifiNotifications')}
           />
         </Row>
       </Section>
@@ -66,7 +101,7 @@ export default function SettingsScreen() {
 
       <View style={styles.footer}>
         <Text style={styles.footerText}>
-          {t('settings.version', { version: '0.16.0' })}
+          {t('settings.version', { version: '0.18.0' })}
         </Text>
       </View>
     </View>
@@ -103,6 +138,7 @@ function SegmentButton({ label, active, onPress }) {
       onPress={onPress}
       accessibilityRole="button"
       accessibilityState={{ selected: active }}
+      accessibilityLabel={label}
     >
       <Text style={[styles.segmentText, active && styles.segmentTextActive]}>
         {label}
@@ -153,8 +189,10 @@ const styles = StyleSheet.create({
   },
   segment: {
     flex: 1,
-    paddingVertical: 10,
+    paddingVertical: 12,
+    minHeight: 48,
     alignItems: 'center',
+    justifyContent: 'center',
     borderRadius: RADIUS.sm,
   },
   segmentActive: { backgroundColor: COLORS.background },

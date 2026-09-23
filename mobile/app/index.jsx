@@ -82,22 +82,14 @@ export default function HomeScreen() {
     router.push(`/place/${place.id}`);
   }, []);
 
-  // When the student taps a result, they've chosen a place. That's
-  // the standard flow.
-  //
-  // When they press "Send" on the keyboard with a full sentence, we
-  // try the destination extractor — this is the AI-assist path.
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
-
-    // Only try if the text looks like a sentence, not a single word.
     if (text.split(/\s+/).length < 3) return;
 
     try {
       const extracted = await extractDestination(text);
       if (extracted.matched) {
-        // Find a "from" place. Same temporary approach as elsewhere.
         const others = await listPlaces({ limit: 5 });
         const from = others.find((p) => p.id !== extracted.place_id) || others[0];
         if (!from) return;
@@ -110,7 +102,7 @@ export default function HomeScreen() {
         });
       }
     } catch {
-      // Silent. The student can still tap a search result below.
+      // Silent.
     }
   }, [query]);
 
@@ -232,12 +224,12 @@ const styles = StyleSheet.create({
   },
   errorText: {
     color: COLORS.danger,
-    fontSize: 15,
+    fontSize: FONT_SIZE.body,
     textAlign: 'center',
   },
   emptyText: {
     color: COLORS.textMuted,
-    fontSize: 15,
+    fontSize: FONT_SIZE.body,
     textAlign: 'center',
   },
   listContent: { paddingBottom: 32 },

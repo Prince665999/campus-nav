@@ -20,7 +20,17 @@ export function CompassArrow({ heading, bearing, distanceM, size = 84 }) {
   const arrowRotation = hasHeading && hasBearing ? bearing - heading : 0;
 
   return (
-    <View style={[styles.wrapper, { width: size, height: size }]}>
+    <View style={[styles.wrapper, { width: size, height: size }]}
+    accessible
+      accessibilityRole="image"
+      accessibilityLabel={
+        hasHeading && hasBearing
+          ? `Compass. Arrow pointing at your next turn, ${Math.round(
+              distanceM || 0
+            )} metres away.`
+          : 'Compass. Waiting for a direction.'
+      }
+    >
       <View style={[styles.circle, { borderRadius: size / 2 }]}>
         {/* The whole rose rotates so N points to true north. */}
         <View

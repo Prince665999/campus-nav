@@ -4,8 +4,9 @@ import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { CompassArrow } from '@/components/CompassArrow';
+import { useAccessibility } from '@/hooks/useAccessibility';
 import { t } from '@/i18n';
-import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+import { COLORS, SPACING } from '@/constants/theme';
 import { formatDistance } from '@/utils/format';
 
 export function InstructionCard({
@@ -17,17 +18,27 @@ export function InstructionCard({
   bearing,
 }) {
   const insets = useSafeAreaInsets();
+  const { fonts } = useAccessibility();
 
   if (!step) {
     return (
       <View style={[styles.card, { paddingBottom: insets.bottom + SPACING.md }]}>
-        <Text style={styles.instruction}>{t('walking.calculating')}</Text>
+        <Text style={[styles.instruction, { fontSize: fonts.title }]}>
+          {t('walking.calculating')}
+        </Text>
       </View>
     );
   }
 
   return (
-    <View style={[styles.card, { paddingBottom: insets.bottom + SPACING.md }]}>
+    <View
+      style={[styles.card, { paddingBottom: insets.bottom + SPACING.md }]}
+      accessible
+      accessibilityRole="summary"
+      accessibilityLabel={`${step.instruction}. ${formatDistance(
+        distanceToNextStepM
+      )} to next. ${formatDistance(distanceRemainingM)} remaining.`}
+    >
       <View style={styles.progressBar}>
         <View
           style={[styles.progressFill, { width: `${Math.round(progress * 100)}%` }]}
@@ -42,15 +53,18 @@ export function InstructionCard({
         />
 
         <View style={styles.textBlock}>
-          <Text style={styles.instruction} numberOfLines={3}>
+          <Text
+            style={[styles.instruction, { fontSize: fonts.title }]}
+            numberOfLines={3}
+          >
             {step.instruction}
           </Text>
 
           <View style={styles.meta}>
-            <Text style={styles.metaItem}>
+            <Text style={[styles.metaItem, { fontSize: fonts.small + 1 }]}>
               {formatDistance(distanceToNextStepM)} {t('common.toNext')}
             </Text>
-            <Text style={styles.metaItem}>
+            <Text style={[styles.metaItem, { fontSize: fonts.small + 1 }]}>
               {formatDistance(distanceRemainingM)} {t('common.left')}
             </Text>
           </View>
@@ -67,11 +81,11 @@ const styles = StyleSheet.create({
     borderTopColor: COLORS.border,
   },
   progressBar: {
-    height: 3,
+    height: 4,
     backgroundColor: COLORS.border,
   },
   progressFill: {
-    height: 3,
+    height: 4,
     backgroundColor: COLORS.primary,
   },
   body: {
@@ -83,10 +97,9 @@ const styles = StyleSheet.create({
   },
   textBlock: { flex: 1 },
   instruction: {
-    fontSize: FONT_SIZE.title,
     fontWeight: '600',
     color: COLORS.text,
-    lineHeight: 28,
+    lineHeight: 32,
   },
   meta: {
     flexDirection: 'row',
@@ -94,7 +107,6 @@ const styles = StyleSheet.create({
     marginTop: SPACING.sm,
   },
   metaItem: {
-    fontSize: 14,
     color: COLORS.textMuted,
   },
 });

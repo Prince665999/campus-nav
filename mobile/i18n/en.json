@@ -6,6 +6,7 @@
     "cancel": "Cancel",
     "ok": "OK",
     "search": "Search",
+    "clear": "Clear search",
     "noResults": "No places found",
     "meters": "m",
     "kilometers": "km",
@@ -80,6 +81,23 @@
     "availableNamed": "Wi-Fi: {ssid}",
     "connect": "Connect"
   },
+  "explore": {
+    "title": "Explore",
+    "categoriesTitle": "Browse by category",
+    "allPlacesTitle": "All places",
+    "allPlacesCount": "{count} places"
+  },
+  "onboarding": {
+    "welcome": "Welcome",
+    "welcomeBody": "Find your way around campus with landmark-based directions, in English or Kiswahili.",
+    "searchTitle": "Search or ask",
+    "searchBody": "Type a place name, or a sentence like \"take me to the cafeteria\".",
+    "walkTitle": "Walk with confidence",
+    "walkBody": "Live directions, spoken turn-by-turn, and a compass arrow pointing the way.",
+    "getStarted": "Get started",
+    "skip": "Skip",
+    "next": "Next"
+  },
   "report": {
     "title": "Report a problem",
     "reportProblem": "Report a problem",
@@ -106,6 +124,13 @@
     "speakInstructions": "Speak instructions",
     "language": "Language",
     "languageDescription": "Interface and voice language.",
+    "accessibility": "Accessibility",
+    "largeText": "Large text",
+    "largeTextDescription": "Increase the size of all text in the app.",
+    "haptics": "Haptic feedback",
+    "hapticsDescription": "Buzz when you reach a turn.",
+    "reduceMotion": "Reduce motion",
+    "reduceMotionDescription": "Turn off animations.",
     "units": "Units",
     "unitsMetric": "Metric",
     "unitsImperial": "Imperial",

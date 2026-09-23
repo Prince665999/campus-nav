@@ -2,8 +2,10 @@
 // favorites list on Home.
 
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
 
-import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
 
 export function PlaceCard({ place, onPress, isFavorite = false }) {
   const subtitle = place.category ? prettifyCategory(place.category) : null;
@@ -14,6 +16,9 @@ export function PlaceCard({ place, onPress, isFavorite = false }) {
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={place.name}
+      accessibilityHint={
+        place.name_sw ? `Also known as ${place.name_sw}` : undefined
+      }
     >
       <View style={styles.body}>
         <Text style={styles.name} numberOfLines={1}>
@@ -31,9 +36,12 @@ export function PlaceCard({ place, onPress, isFavorite = false }) {
         ) : null}
       </View>
       {isFavorite ? (
-        <Text style={styles.star} accessibilityLabel="Favorite">
-          ★
-        </Text>
+        <MaterialIcons
+          name={ICONS.favoriteFilled}
+          size={20}
+          color={COLORS.warning}
+          accessibilityLabel="Favorite"
+        />
       ) : null}
     </TouchableOpacity>
   );
@@ -51,17 +59,18 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.background,
     paddingHorizontal: SPACING.md,
     paddingVertical: 14,
+    minHeight: TOUCH.minHeight,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.borderSubtle,
   },
   body: { flex: 1 },
   name: {
-    fontSize: 16,
+    fontSize: FONT_SIZE.body + 1,
     fontWeight: '600',
     color: COLORS.text,
   },
   nameSw: {
-    fontSize: 14,
+    fontSize: FONT_SIZE.body - 1,
     color: COLORS.textMuted,
     marginTop: 2,
   },
@@ -69,10 +78,5 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.small,
     color: COLORS.textFaint,
     marginTop: 4,
-  },
-  star: {
-    fontSize: 20,
-    color: COLORS.warning,
-    marginLeft: SPACING.sm,
   },
 });

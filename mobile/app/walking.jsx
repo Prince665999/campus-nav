@@ -9,6 +9,7 @@ import {
   View,
 } from 'react-native';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { MaterialIcons } from '@expo/vector-icons';
 
 import { RouteMap } from '@/components/MapView';
 import { InstructionCard } from '@/components/InstructionCard';
@@ -23,9 +24,11 @@ import { useSettings } from '@/context/SettingsContext';
 import { computeRoute, listMediaForPlace, recordRecent } from '@/services/api';
 import { closestApproachPhoto } from '@/utils/media';
 import * as tts from '@/services/tts';
+import * as haptics from '@/services/haptics';
 import { bearingDeg } from '@/utils/geo';
 import { t, ttsLanguageForCurrentLang } from '@/i18n';
-import { COLORS } from '@/constants/theme';
+import { COLORS, TOUCH } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
 
 const APPROACH_PHOTO_DISTANCE_M = 60;
 const ARRIVAL_DISTANCE_M = 15;
@@ -56,6 +59,7 @@ export default function WalkingScreen() {
   const { settings } = useSettings();
   const { heading } = useCompass();
 
+  // Load the route if it wasn't passed in.
   useState(() => {
     if (route) return;
     async function load() {
@@ -74,6 +78,7 @@ export default function WalkingScreen() {
     load();
   });
 
+  // Load destination photos once.
   useEffect(() => {
     let cancelled = false;
     listMediaForPlace(Number(toId))
@@ -88,6 +93,7 @@ export default function WalkingScreen() {
     };
   }, [toId]);
 
+  // Record this destination as a recent visit.
   useEffect(() => {
     recordRecent(Number(toId)).catch(() => {});
   }, [toId]);
@@ -104,13 +110,13 @@ export default function WalkingScreen() {
     resetOffRoute,
   } = useWalkingProgress(route);
 
-  // Wi-Fi proximity. Uses the same position the walk is already
-  // tracking, so no extra location cost.
+  // Wi-Fi proximity.
   const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
     position,
     enabled: settings.wifiProximityEnabled,
   });
 
+  // Speak each instruction once when it becomes current.
   useEffect(() => {
     if (!settings.voiceEnabled) return;
     if (!currentStep) return;
@@ -120,23 +126,45 @@ export default function WalkingScreen() {
     });
   }, [currentStep, settings.voiceEnabled, settings.voiceRate]);
 
+  // Haptic pulse when the current step changes. Skips the very first
+  // step so a walk doesn't buzz the moment it starts.
+  useEffect(() => {
+    if (!currentStep) return;
+    if (currentStepIndex === 0) return;
+    haptics.turnPulse();
+  }, [currentStepIndex, currentStep]);
+
+  // Warning pulse when the student goes off-route. Fires once per
+  // transition from on-route to off-route.
+  useEffect(() => {
+    if (offRoute) {
+      haptics.offRoutePulse();
+    }
+  }, [offRoute]);
+
+  // Stop speech when leaving the screen.
   useEffect(() => {
     return () => {
       tts.stop();
     };
   }, []);
 
+  // When the student arrives, go to the arrival screen. The ref
+  // ensures the navigation fires exactly once.
   useEffect(() => {
     if (arrivedRef.current) return;
     if (!route) return;
     if (distanceRemainingM > ARRIVAL_DISTANCE_M) return;
     arrivedRef.current = true;
+    haptics.arrivalPulse();
     router.replace({
       pathname: '/arrival',
       params: { toId: String(toId) },
     });
   }, [distanceRemainingM, route, toId]);
 
+  // Pick the approach photo whose bearing best matches the direction
+  // we're approaching from.
   const approachPhoto = (() => {
     if (approachPhotos.length === 0) return null;
     if (distanceRemainingM > APPROACH_PHOTO_DISTANCE_M) return null;
@@ -156,6 +184,8 @@ export default function WalkingScreen() {
     return closestApproachPhoto(approachPhotos, approachBearing);
   })();
 
+  // Bearing from the student's current position to the next step's
+  // location, or to the destination if on the last step.
   const bearing = (() => {
     if (!position || !route || !route.geometry || route.geometry.length < 2) {
       return null;
@@ -288,7 +318,11 @@ export default function WalkingScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={t('chat.titleWalk')}
               >
-                <Text style={styles.headerButtonText}>💬</Text>
+                <MaterialIcons
+                  name={ICONS.chat}
+                  size={22}
+                  color={COLORS.text}
+                />
               </TouchableOpacity>
               <TouchableOpacity
                 onPress={() => setReportOpen(true)}
@@ -296,7 +330,11 @@ export default function WalkingScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={t('report.reportProblem')}
               >
-                <Text style={styles.headerButtonText}>⚑</Text>
+                <MaterialIcons
+                  name={ICONS.report}
+                  size={22}
+                  color={COLORS.text}
+                />
               </TouchableOpacity>
             </View>
           ),
@@ -383,6 +421,11 @@ const styles = StyleSheet.create({
   map: { flex: 1 },
   cardWrapper: { backgroundColor: COLORS.background },
   headerButtons: { flexDirection: 'row' },
-  headerButton: { padding: 6 },
-  headerButtonText: { fontSize: 20, color: COLORS.text },
+  headerButton: {
+    padding: 8,
+    minWidth: TOUCH.minWidth,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 });

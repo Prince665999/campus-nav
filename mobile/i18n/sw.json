@@ -6,6 +6,7 @@
     "cancel": "Ghairi",
     "ok": "Sawa",
     "search": "Tafuta",
+    "clear": "Futa utafutaji",
     "noResults": "Hakuna mahali palipopatikana",
     "meters": "m",
     "kilometers": "km",
@@ -80,6 +81,23 @@
     "availableNamed": "Wi-Fi: {ssid}",
     "connect": "Ungana"
   },
+  "explore": {
+    "title": "Vinjari",
+    "categoriesTitle": "Vinjari kwa aina",
+    "allPlacesTitle": "Mahali pote",
+    "allPlacesCount": "Mahali {count}"
+  },
+  "onboarding": {
+    "welcome": "Karibu",
+    "welcomeBody": "Pata njia yako chuoni kwa maelekezo yanayotumia alama za eneo, kwa Kiingereza au Kiswahili.",
+    "searchTitle": "Tafuta au uliza",
+    "searchBody": "Andika jina la mahali, au sentensi kama \"nipeleke kwenye mgahawa\".",
+    "walkTitle": "Tembea kwa uhakika",
+    "walkBody": "Maelekezo ya moja kwa moja, yanayosemwa kwa sauti, na mshale wa dira unaoelekeza njia.",
+    "getStarted": "Anza",
+    "skip": "Ruka",
+    "next": "Endelea"
+  },
   "report": {
     "title": "Ripoti tatizo",
     "reportProblem": "Ripoti tatizo",
@@ -106,6 +124,13 @@
     "speakInstructions": "Soma maelekezo kwa sauti",
     "language": "Lugha",
     "languageDescription": "Lugha ya kiolesura na sauti.",
+    "accessibility": "Ufikivu",
+    "largeText": "Maandishi makubwa",
+    "largeTextDescription": "Ongeza ukubwa wa maandishi yote kwenye programu.",
+    "haptics": "Mtetemo",
+    "hapticsDescription": "Tetema unapofika kwenye kona.",
+    "reduceMotion": "Punguza mwendo",
+    "reduceMotionDescription": "Zima uhuishaji.",
     "units": "Vipimo",
     "unitsMetric": "Metric",
     "unitsImperial": "Imperial",

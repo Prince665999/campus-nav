@@ -18,6 +18,9 @@ const DEFAULT_SETTINGS = {
   units: 'metric',
   language: 'en',
   wifiProximityEnabled: true,
+  largeText: false,
+  hapticsEnabled: true,
+  reduceMotion: false,
 };
 
 const SettingsContext = createContext({

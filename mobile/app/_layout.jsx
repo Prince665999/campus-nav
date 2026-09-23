@@ -1,22 +1,30 @@
 // Root layout for Expo Router.
 
+import { useEffect } from 'react';
 import { Link, Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { Text, TouchableOpacity } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
 
 import { SettingsProvider, useSettings } from '@/context/SettingsContext';
-import { COLORS } from '@/constants/theme';
+import { COLORS, TOUCH } from '@/constants/theme';
+import * as haptics from '@/services/haptics';
 
 function SettingsButton() {
   return (
     <Link href="/settings" asChild>
       <TouchableOpacity
-        style={{ paddingHorizontal: 12, paddingVertical: 4 }}
+        style={{
+          paddingHorizontal: 12,
+          paddingVertical: 4,
+          minHeight: TOUCH.minHeight,
+          justifyContent: 'center',
+        }}
         accessibilityRole="button"
         accessibilityLabel="Settings"
       >
-        <Text style={{ fontSize: 20 }}>⚙️</Text>
+        <MaterialIcons name="settings" size={22} color={COLORS.text} />
       </TouchableOpacity>
     </Link>
   );
@@ -24,6 +32,11 @@ function SettingsButton() {
 
 function AppStack() {
   const { settings } = useSettings();
+
+  // Keep the haptics service's enabled flag in sync with settings.
+  useEffect(() => {
+    haptics.setEnabled(settings.hapticsEnabled);
+  }, [settings.hapticsEnabled]);
 
   return (
     <Stack
@@ -47,6 +60,8 @@ function AppStack() {
       <Stack.Screen name="walking" options={{ title: 'Walking' }} />
       <Stack.Screen name="arrival" options={{ title: 'Arrival' }} />
       <Stack.Screen name="chat" options={{ title: 'Chat' }} />
+      <Stack.Screen name="explore" options={{ title: 'Explore' }} />
+      <Stack.Screen name="onboarding" options={{ headerShown: false }} />
       <Stack.Screen name="settings" options={{ title: 'Settings' }} />
     </Stack>
   );
