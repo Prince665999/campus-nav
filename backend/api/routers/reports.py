@@ -4,14 +4,16 @@ reports.py
 POST /api/reports — create a student report.
 """
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
 from sqlalchemy.orm import Session
 
 from ..dependencies import db_session
 from ..errors import BadRequestError
+from ..rate_limit import limiter
 from ..schemas.report import CreateReportRequest, ReportResponse
 from ..security import hash_device_id
 from ..services import report_service
+from ..settings import RATE_LIMIT_REPORTS
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -23,7 +25,9 @@ def _require_device_id(x_device_id: str | None = Header(None)) -> str:
 
 
 @router.post("", response_model=ReportResponse, status_code=201)
+@limiter.limit(RATE_LIMIT_REPORTS)
 def create_report(
+    request: Request,
     body: CreateReportRequest,
     session: Session = Depends(db_session),
     session_hash: str = Depends(_require_device_id),

@@ -12,11 +12,12 @@ Chat endpoints:
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
 from .. import cache
 from ..dependencies import db_session
+from ..rate_limit import limiter
 from ..schemas.chat import (
     ChatRequest,
     ChatResponse,
@@ -25,23 +26,15 @@ from ..schemas.chat import (
     StartChatSessionResponse,
 )
 from ..services import cache_service, chat_service
+from ..settings import RATE_LIMIT_CHAT
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-# How many turns of memory to keep per session.
 MAX_HISTORY_TURNS = 10
-
-# Session TTL in Redis. 1 hour of inactivity and the conversation is
-# forgotten.
 SESSION_TTL_S = 60 * 60
-
-# How far around the student to include in the nearby-places context.
 NEARBY_RADIUS_M = 200
-
-# How many nearby places to include. More than this and the prompt
-# gets long and the model gets distracted.
 NEARBY_LIMIT = 15
 
 
@@ -73,13 +66,13 @@ def _save_history(session_id: str, history: list):
 # ---------------------------------------------------------------------------
 
 @router.post("/extract-destination", response_model=ExtractDestinationResponse)
+@limiter.limit(RATE_LIMIT_CHAT)
 def extract_destination(
+    request: Request,
     body: ExtractDestinationRequest,
     session: Session = Depends(db_session),
 ):
-    """
-    Turn free text into a place ID.
-    """
+    """Turn free text into a place ID."""
     place_id, confidence = chat_service.extract_destination(session, body.message)
     return ExtractDestinationResponse(
         place_id=place_id,
@@ -93,19 +86,15 @@ def extract_destination(
 # ---------------------------------------------------------------------------
 
 @router.post("/session", response_model=StartChatSessionResponse)
-def start_session():
-    """
-    Start a new chat session. Returns an ID the client uses for
-    subsequent /api/chat requests.
-    """
+@limiter.limit(RATE_LIMIT_CHAT)
+def start_session(request: Request):
+    """Start a new chat session."""
     return StartChatSessionResponse(session_id=str(uuid.uuid4()))
 
 
 @router.delete("/session/{session_id}", status_code=204)
 def end_session(session_id: str):
-    """
-    End a chat session and discard its memory.
-    """
+    """End a chat session and discard its memory."""
     cache.delete(_history_key(session_id))
     return None
 
@@ -115,17 +104,13 @@ def end_session(session_id: str):
 # ---------------------------------------------------------------------------
 
 @router.post("", response_model=ChatResponse)
+@limiter.limit(RATE_LIMIT_CHAT)
 def chat(
+    request: Request,
     body: ChatRequest,
     session: Session = Depends(db_session),
 ):
-    """
-    Answer a question about the current walk.
-
-    Uses three sources when available: the route timeline, the
-    narration the student already heard, and the places near their
-    current position.
-    """
+    """Answer a question about the current walk."""
     session_id = body.session_id
     history = _load_history(session_id) if session_id else []
 
@@ -140,9 +125,7 @@ def chat(
 
 
 def _build_answer(body: ChatRequest, session: Session) -> str:
-    """
-    Gather the three context sources and call the chat service.
-    """
+    """Gather the three context sources and call the chat service."""
     has_route_context = (
         body.from_place_id is not None
         and body.to_place_id is not None
@@ -156,7 +139,6 @@ def _build_answer(body: ChatRequest, session: Session) -> str:
             "me about what you see."
         )
 
-    # ---- Source 1: the route timeline ----
     try:
         from backend.core.campus_graph import a_star
 
@@ -188,13 +170,9 @@ def _build_answer(body: ChatRequest, session: Session) -> str:
         logger.warning("Chat timeline rebuild failed: %s", e)
         return "I couldn't reach the route right now. Try again in a moment."
 
-    # ---- Source 2: the narration the student already heard ----
     narration_text = _load_cached_narration(session, body)
-
-    # ---- Source 3: nearby places ----
     nearby = _load_nearby_places(session, body.current_lat, body.current_lon)
 
-    # ---- Compose and answer ----
     return chat_service.answer_walk_question(
         question=body.message,
         start_name=from_name,
@@ -209,13 +187,7 @@ def _build_answer(body: ChatRequest, session: Session) -> str:
 
 
 def _load_cached_narration(session: Session, body: ChatRequest) -> str | None:
-    """
-    Look up the narration that was generated for this route. If it's
-    cached (Phase 12), return the text. Otherwise return None.
-    """
     try:
-        # Rebuild the timeline hash. The narration service caches by
-        # a hash of the timeline, so we need to compute the same hash.
         from backend.core.campus_graph import a_star
 
         from ..services.graph_service import get_edge_tags, get_graph, get_nodes
@@ -226,7 +198,7 @@ def _load_cached_narration(session: Session, body: ChatRequest) -> str | None:
         nodes = get_nodes()
         edge_tags = get_edge_tags()
 
-        from_node, _ = _resolve_endpoint(
+        from_node, from_name = _resolve_endpoint(
             session, graph, nodes, place_id=body.from_place_id
         )
         to_node, to_name = _resolve_endpoint(
@@ -239,20 +211,15 @@ def _load_cached_narration(session: Session, body: ChatRequest) -> str | None:
         if not path:
             return None
 
-        _, from_name = _resolve_endpoint(
-            session, graph, nodes, place_id=body.from_place_id
-        )
         _steps, events, _dest_pos = _build_events(
             path, nodes, edge_tags, graph, distance, from_name, to_name
         )
 
-        # The narration service hashes the events to build a cache key.
         timeline_repr = "\n".join(
             f"{round(e[0])}|{e[1]}|{e[2]}" for e in events
         )
         r_hash = cache_service.route_hash(timeline_repr)
 
-        # Try both languages; prefer English.
         for lang in ("en", "sw"):
             cached = cache_service.get_cached_narration(r_hash, lang=lang)
             if cached:
@@ -268,10 +235,6 @@ def _load_nearby_places(
     lat: float | None,
     lon: float | None,
 ) -> list | None:
-    """
-    Query the places table for places within NEARBY_RADIUS_M of the
-    student. Returns a list of dicts, or None if there's no position.
-    """
     if lat is None or lon is None:
         return None
 
@@ -283,7 +246,7 @@ def _load_nearby_places(
         rows = session.query(Place).all()
         nearby = []
         for p in rows:
-            d = haversine_m(lat, lon, p.lat, p.lon)
+            d = havetersine_m(lat, lon, p.lat, p.lon)
             if d <= NEARBY_RADIUS_M:
                 nearby.append(
                     {

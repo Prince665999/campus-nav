@@ -4,15 +4,11 @@ Tests for /api/wifi/nearby.
 
 
 def _set_wifi(client, place_id, ssid, password):
-    """Helper: mark a place as having Wi-Fi. Uses the admin endpoint
-    to update the place, so the test also exercises that path."""
-    import os
-
-    headers = {"X-Admin-Key": os.environ.get("ADMIN_API_KEY", "")}
+    """Tag a place as having Wi-Fi, via the admin endpoint."""
     return client.patch(
         f"/api/admin/places/{place_id}",
         json={"has_wifi": True, "wifi_ssid": ssid, "wifi_password": password},
-        headers=headers,
+        headers={"X-Admin-Key": "test-admin-key"},
     )
 
 

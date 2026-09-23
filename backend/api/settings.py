@@ -7,9 +7,6 @@ Env-driven configuration.
 import os
 from pathlib import Path
 
-# Load .env from the backend folder if it exists. This makes the
-# env vars in that file available to os.environ, so the rest of this
-# module reads them naturally.
 from dotenv import load_dotenv
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -41,6 +38,7 @@ DATABASE_URL = os.environ.get(
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
 IS_DEV = ENVIRONMENT == "dev"
+IS_PROD = ENVIRONMENT == "prod"
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +76,43 @@ CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
 # Admin
 # ---------------------------------------------------------------------------
 
-# Shared secret that the admin site sends in the X-Admin-Key header.
-# Interim guard only — Phase 17 replaces it with real JWT login.
-#
-# If unset, admin endpoints return 503 rather than allowing open
-# access. Safer default than an empty key that matches everything.
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+# Rate limits are enforced only in production. In development every
+# endpoint is unlimited, so a screen that fires three requests on
+# mount doesn't trip a limit you'd then have to debug.
+#
+# In production the limits apply. Format is "N/period", where period
+# is one of second, minute, hour.
+RATE_LIMIT_ENABLED = os.environ.get(
+    "RATE_LIMIT_ENABLED",
+    "true" if IS_PROD else "false",
+).lower() == "true"
+
+# The limits, per IP address.
+RATE_LIMIT_NARRATE = os.environ.get("RATE_LIMIT_NARRATE", "30/minute")
+RATE_LIMIT_REPORTS = os.environ.get("RATE_LIMIT_REPORTS", "10/minute")
+RATE_LIMIT_CHAT = os.environ.get("RATE_LIMIT_CHAT", "30/minute")
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+# "json" for structured logs (production), "console" for readable
+# logs (development).
+LOG_FORMAT = os.environ.get("LOG_FORMAT", "console" if IS_DEV else "json")
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+
+# ---------------------------------------------------------------------------
+# Error tracking
+# ---------------------------------------------------------------------------
+
+# Sentry DSN. If empty, Sentry is disabled — no data sent anywhere.
+SENTRY_DSN = os.environ.get("SENTRY_DSN", "")

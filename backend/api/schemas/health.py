@@ -1,19 +1,36 @@
 """
 health.py
 
-Request and response shapes for /api/health.
+Response shapes for /api/health.
 """
 
 from pydantic import BaseModel
 
 
-class HealthResponse(BaseModel):
-    """Returned by GET /api/health."""
+class DependencyStatus(BaseModel):
+    """One dependency and whether it's healthy."""
 
-    status: str           # "ok" or "degraded"
+    name: str
+    ok: bool
+    detail: str | None = None
+
+
+class HealthResponse(BaseModel):
+    """The full health payload."""
+
+    status: str  # "ok", "degraded", "down"
+    version: str
+    environment: str
+    uptime_s: float
+
+    # Graph info
     graph_version: str
     node_count: int
     edge_count: int
+
+    # Data counts
     place_count: int
     area_count: int
-    uptime_s: float
+
+    # Dependencies
+    dependencies: list[DependencyStatus]

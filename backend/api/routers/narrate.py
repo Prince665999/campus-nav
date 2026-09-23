@@ -4,20 +4,24 @@ narrate.py
 GET /api/narrate — produce spoken narration for a route.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from ..dependencies import db_session, graph
 from ..errors import RouteNotFoundError
+from ..rate_limit import limiter
 from ..schemas.narration import NarrationResponse
 from ..services import narration_service
 from ..services.graph_service import get_edge_tags, get_nodes
+from ..settings import RATE_LIMIT_NARRATE
 
 router = APIRouter(prefix="/api/narrate", tags=["narrate"])
 
 
 @router.get("", response_model=NarrationResponse)
+@limiter.limit(RATE_LIMIT_NARRATE)
 def narrate(
+    request: Request,
     from_place_id: int = Query(..., description="Place ID to start from"),
     to_place_id: int = Query(..., description="Place ID to end at"),
     lang: str = Query("en", description="Language code: en or sw"),

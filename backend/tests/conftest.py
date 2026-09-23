@@ -58,12 +58,23 @@ def seeded_db(temp_db, tmp_path):
 
 
 @pytest.fixture
-def client(seeded_db):
+def client(seeded_db, monkeypatch):
     """
     A FastAPI TestClient wired to the seeded database. Also resets
-    the graph singleton so each test gets a freshly loaded graph.
+    the graph singleton so each test gets a freshly loaded graph,
+    and sets a known admin key so admin endpoints can be tested.
     """
+    monkeypatch.setenv("ADMIN_API_KEY", "test-admin-key")
+
     from fastapi.testclient import TestClient
+
+    # Reload settings and dependencies so the new key is picked up.
+    import importlib
+    import backend.api.settings as settings_module
+    import backend.api.dependencies as deps_module
+
+    importlib.reload(settings_module)
+    importlib.reload(deps_module)
 
     from backend.api.main import app
     from backend.api.services import graph_service
