@@ -27,7 +27,17 @@ async function request(path, options = {}) {
       let detail = `Request failed (${response.status})`;
       try {
         const body = await response.json();
-        if (body && body.detail) detail = body.detail;
+        if (body && body.detail) {
+          // FastAPI validation errors come back as an array of
+          // {loc, msg, type}. Flatten those into one readable line.
+          if (Array.isArray(body.detail)) {
+            detail = body.detail
+              .map((e) => `${e.loc?.join('.') || 'field'}: ${e.msg}`)
+              .join('; ');
+          } else {
+            detail = body.detail;
+          }
+        }
       } catch {
         // Not JSON. Keep the generic message.
       }
@@ -96,7 +106,14 @@ export async function listMediaForPlace(placeId) {
 // Route
 // ---------------------------------------------------------------
 
-export async function computeRoute({ fromPlaceId, toPlaceId, fromLat, fromLon, toLat, toLon }) {
+export async function computeRoute({
+  fromPlaceId,
+  toPlaceId,
+  fromLat,
+  fromLon,
+  toLat,
+  toLon,
+}) {
   const params = new URLSearchParams();
   if (fromPlaceId != null) params.set('from_place_id', String(fromPlaceId));
   if (fromLat != null) params.set('from_lat', String(fromLat));
@@ -111,13 +128,33 @@ export async function computeRoute({ fromPlaceId, toPlaceId, fromLat, fromLon, t
 // Narration
 // ---------------------------------------------------------------
 
-export async function narrateRoute({ fromPlaceId, toPlaceId, lang = 'en', live = false }) {
-  const params = new URLSearchParams({
-    from_place_id: String(fromPlaceId),
-    to_place_id: String(toPlaceId),
-    lang,
-    live: String(live),
-  });
+export async function narrateRoute({
+  fromPlaceId,
+  toPlaceId,
+  fromLat,
+  fromLon,
+  lang = 'en',
+  live = false,
+}) {
+  const params = new URLSearchParams();
+
+  // from_place_id and from_lat/from_lon are alternatives. Send
+  // whichever the caller provided. Never send the literal string
+  // "null" — that's what caused the 422.
+  if (fromPlaceId != null) {
+    params.set('from_place_id', String(fromPlaceId));
+  }
+  if (fromLat != null) {
+    params.set('from_lat', String(fromLat));
+  }
+  if (fromLon != null) {
+    params.set('from_lon', String(fromLon));
+  }
+
+  params.set('to_place_id', String(toPlaceId));
+  params.set('lang', lang);
+  params.set('live', String(live));
+
   return request(`/api/narrate?${params.toString()}`);
 }
 
@@ -156,7 +193,9 @@ export async function removeFavorite(placeId) {
 }
 
 export async function isFavorite(placeId) {
-  const result = await request(`/api/destinations/favorites/${placeId}/exists`);
+  const result = await request(
+    `/api/destinations/favorites/${placeId}/exists`
+  );
   return result.is_favorite;
 }
 
@@ -223,6 +262,18 @@ export async function sendChatMessage({
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+// ---------------------------------------------------------------
+// Wi-Fi
+// ---------------------------------------------------------------
+
+export async function getNearbyWifi({ lat, lon, r = 25 } = {}) {
+  const params = new URLSearchParams();
+  if (lat != null) params.set('lat', String(lat));
+  if (lon != null) params.set('lon', String(lon));
+  params.set('r', String(r));
+  return request(`/api/wifi/nearby?${params.toString()}`);
 }
 
 // ---------------------------------------------------------------

@@ -23,8 +23,6 @@ import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 export default function RoutePreviewScreen() {
   const { fromId, toId, fromLat, fromLon } = useLocalSearchParams();
 
-  // Either an ID or coordinates, depending on how the student got
-  // here. The route service accepts both.
   const fromPlaceId = fromId ? Number(fromId) : null;
   const toPlaceId = Number(toId);
   const fromLatNum = fromLat ? Number(fromLat) : null;
@@ -70,6 +68,8 @@ export default function RoutePreviewScreen() {
         const data = await narrateRoute({
           fromPlaceId,
           toPlaceId,
+          fromLat: fromLatNum,
+          fromLon: fromLonNum,
           lang: settings.language,
           live: false,
         });
@@ -82,12 +82,10 @@ export default function RoutePreviewScreen() {
     return () => {
       cancelled = true;
     };
-  }, [fromPlaceId, toPlaceId, settings.language]);
+  }, [fromPlaceId, toPlaceId, fromLatNum, fromLonNum, settings.language]);
 
   const startWalking = useCallback(() => {
     if (!route) return;
-    // Pass the route along. The walking screen uses the from/to
-    // params for recalculation and the routeJson for the geometry.
     const params = {
       toId: String(toPlaceId),
       routeJson: JSON.stringify(route),
