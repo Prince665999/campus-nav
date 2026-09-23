@@ -56,16 +56,25 @@ class TestNarrateBasics:
 
 
 class TestNarrateRequirements:
-    def test_missing_from_returns_422(self, client):
+    def test_missing_from_returns_400(self, client):
+        """
+        from_place_id is now optional (from_lat/from_lon can be used
+        instead), so the schema layer accepts the request and the
+        endpoint returns 400 with a clear message.
+        """
         a = client.get("/api/places?limit=1").json()[0]
         r = client.get(f"/api/narrate?to_place_id={a['id']}")
-        assert r.status_code == 422
+        assert r.status_code == 400
+        assert "from" in r.json()["detail"].lower()
 
     def test_missing_to_returns_422(self, client):
+        """
+        to_place_id is still required at the schema level, so FastAPI
+        rejects the request with 422.
+        """
         a = client.get("/api/places?limit=1").json()[0]
         r = client.get(f"/api/narrate?from_place_id={a['id']}")
         assert r.status_code == 422
-
 
 class TestNarrateText:
     def test_text_is_not_a_numbered_list(self, client):
