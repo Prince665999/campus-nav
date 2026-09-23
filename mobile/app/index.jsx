@@ -26,7 +26,7 @@ import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
 import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 
 export default function HomeScreen() {
-  const { settings } = useSettings();
+  const { settings, loaded } = useSettings();
 
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState(null);
@@ -39,14 +39,24 @@ export default function HomeScreen() {
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
 
-  // First launch: redirect to onboarding. Waits until settings are
-  // loaded so a returning user doesn't see onboarding before the
-  // stored flag is read.
+  // First launch: redirect to onboarding.
+  //
+  // `loaded` comes from the context (it says whether storage has been
+  // read). `hasSeenOnboarding` comes from `settings` (it's a stored
+  // preference). They live in different places, which is easy to
+  // confuse.
   useEffect(() => {
-    if (settings.loaded && !settings.hasSeenOnboarding) {
+    console.log(
+      'Home: loaded=',
+      loaded,
+      'seen=',
+      settings.hasSeenOnboarding
+    );
+    if (loaded && !settings.hasSeenOnboarding) {
+      console.log('Home: redirecting to onboarding');
       router.replace('/onboarding');
     }
-  }, [settings.loaded, settings.hasSeenOnboarding]);
+  }, [loaded, settings.hasSeenOnboarding]);
 
   // Load recents and favorites once on mount.
   useEffect(() => {
@@ -96,8 +106,6 @@ export default function HomeScreen() {
     router.push(`/place/${place.id}`);
   }, []);
 
-  // Sentence-to-destination. Fires when the student presses the
-  // keyboard's search key with a full sentence.
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
@@ -118,7 +126,7 @@ export default function HomeScreen() {
         });
       }
     } catch {
-      // Silent. The student can still tap a search result below.
+      // Silent.
     }
   }, [query]);
 
