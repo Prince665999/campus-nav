@@ -1,42 +1,45 @@
 // Server-side proxy between the admin site's browser and the FastAPI
 // backend.
 //
-// Why this exists: the admin site needs to send an ADMIN_API_KEY
-// with every backend request. If the browser sent that key directly,
-// anyone with dev tools open could read it. So instead the browser
-// calls /api/proxy/*, this file runs on the Next.js server, adds the
-// key, and forwards to the backend.
-//
-// The browser never sees the key, the backend URL, or anything else
-// server-side.
+// Two auth methods, tried in order:
+//   1. The session cookie set by the login page. Forwarded as
+//      `Authorization: Bearer <token>`.
+//   2. The ADMIN_API_KEY environment variable (Phase 14 fallback),
+//      forwarded as `X-Admin-Key`. Used only when there's no cookie,
+//      so the CLI scripts and pre-login tooling keep working.
 
 import { NextResponse } from 'next/server';
-import { getAdminKey, getBackendUrl } from '@/lib/auth';
+
+import {
+  getAdminKey,
+  getBackendUrl,
+  getSessionToken,
+} from '@/lib/auth';
 
 async function forward(request, { params }) {
   const backendUrl = getBackendUrl();
-  const adminKey = getAdminKey();
-
-  // The path segments come in as params.path — an array. Rejoin them.
   const path = '/' + (params.path || []).join('/');
-
-  // Preserve the query string.
   const url = new URL(request.url);
   const target = backendUrl + path + url.search;
 
-  // Forward the request body if there is one. For multipart uploads
-  // (photos), we forward the raw stream rather than parsing it.
+  // Body.
   let body = null;
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     body = await request.arrayBuffer();
   }
 
-  const headers = {
-    'X-Admin-Key': adminKey,
-  };
+  // Auth headers — session first, key fallback.
+  const headers = {};
+  const sessionToken = getSessionToken();
+  if (sessionToken) {
+    headers['Authorization'] = `Bearer ${sessionToken}`;
+  } else {
+    const adminKey = getAdminKey();
+    if (adminKey) {
+      headers['X-Admin-Key'] = adminKey;
+    }
+  }
 
-  // Forward the content type so the backend knows how to parse the
-  // body.
   const contentType = request.headers.get('content-type');
   if (contentType) {
     headers['Content-Type'] = contentType;
@@ -59,12 +62,10 @@ async function forward(request, { params }) {
     );
   }
 
-  // 204 No Content — pass through.
   if (response.status === 204) {
     return new NextResponse(null, { status: 204 });
   }
 
-  // Pass through the response body and status.
   const data = await response.arrayBuffer();
   return new NextResponse(data, {
     status: response.status,

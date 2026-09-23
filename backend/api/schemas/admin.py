@@ -14,8 +14,6 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 class AdminStats(BaseModel):
-    """Everything the dashboard needs at a glance."""
-
     place_count: int
     area_count: int
     edge_count: int
@@ -31,9 +29,6 @@ class AdminStats(BaseModel):
 # ---------------------------------------------------------------------------
 
 class UpdatePlaceRequest(BaseModel):
-    """Fields the admin can edit. All optional — only what's sent
-    is changed."""
-
     name: str | None = Field(None, max_length=255)
     name_sw: str | None = Field(None, max_length=255)
     alt_names: str | None = None
@@ -57,9 +52,6 @@ class UpdateReportStatusRequest(BaseModel):
 
 
 class AdminReportItem(BaseModel):
-    """A report as the admin site sees it — includes the place name
-    and the raw session hash."""
-
     id: int
     kind: str
     status: str
@@ -78,8 +70,6 @@ class AdminReportItem(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ReimportDiff(BaseModel):
-    """What would change if a re-import ran now."""
-
     places_added: int
     places_updated: int
     places_unchanged: int
@@ -93,8 +83,6 @@ class ReimportDiff(BaseModel):
 
 
 class ReimportResult(BaseModel):
-    """What a re-import actually did."""
-
     places_added: int
     places_updated: int
     places_unchanged: int
@@ -121,3 +109,29 @@ class CreateAdminUserRequest(BaseModel):
     email: str = Field(..., max_length=255)
     role: str = Field("contributor", pattern="^(owner|contributor)$")
     password: str = Field(..., min_length=8)
+
+
+class UpdateAdminUserRequest(BaseModel):
+    role: str | None = Field(None, pattern="^(owner|contributor)$")
+    password: str | None = Field(None, min_length=8)
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., max_length=255)
+    password: str = Field(..., min_length=1)
+
+
+class LoginResponse(BaseModel):
+    token: str
+    role: str
+    expires_in_s: int
+
+
+class WhoAmIResponse(BaseModel):
+    user_id: int
+    role: str
+    email: str

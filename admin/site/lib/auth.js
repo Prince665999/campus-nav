@@ -1,35 +1,38 @@
-// Client-side helpers for the interim admin auth.
+// Server-side auth helpers for the admin site's proxy.
 //
-// Phase 14 uses a shared-secret guard: the admin site's server-side
-// proxy attaches an ADMIN_API_KEY header to every backend request,
-// and the backend checks it. The browser never sees the key.
+// The browser stores the JWT in a cookie (set by the login page).
+// This module reads that cookie on the server, and forwards the
+// token to the backend as a Bearer header.
 //
-// Phase 17 replaces this with real JWT login. When that happens,
-// this file gains session-token helpers and the proxy route gains a
-// session check. The pages themselves don't change.
+// The ADMIN_API_KEY from Phase 14 is still supported as a fallback
+// while the login flow settles in.
 
-// ---------- Server-side helper ----------
+import { cookies } from 'next/headers';
+
+const SESSION_COOKIE = 'campus_admin_session';
+
+// ---------- Server-side helpers ----------
 
 /**
- * Read the admin key from the environment.
- *
- * Only callable from server-side code (Server Components, API routes,
- * Server Actions). Throws if called from the browser, because
- * NEXT_PUBLIC_* is intentionally not used here — the key must never
- * reach the client.
+ * Read the session token from the request's cookies.
+ * Returns null if there's no cookie.
  */
-export function getAdminKey() {
-  const key = process.env.ADMIN_API_KEY;
-  if (!key) {
-    throw new Error(
-      'ADMIN_API_KEY is not set. Copy .env.example to .env.local and set it.'
-    );
-  }
-  return key;
+export function getSessionToken() {
+  const store = cookies();
+  const cookie = store.get(SESSION_COOKIE);
+  return cookie ? cookie.value : null;
 }
 
 /**
- * Read the backend URL from the environment. Also server-only.
+ * Read the Phase 14 fallback key, if configured.
+ * Used only if there's no session cookie.
+ */
+export function getAdminKey() {
+  return process.env.ADMIN_API_KEY || null;
+}
+
+/**
+ * Read the backend URL.
  */
 export function getBackendUrl() {
   const url = process.env.BACKEND_URL;
@@ -38,5 +41,7 @@ export function getBackendUrl() {
       'BACKEND_URL is not set. Copy .env.example to .env.local and set it.'
     );
   }
-  return url.replace(/\/$/, ''); // strip trailing slash
+  return url.replace(/\/$/, '');
 }
+
+export const SESSION_COOKIE_NAME = SESSION_COOKIE;

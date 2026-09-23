@@ -31,6 +31,7 @@ from .routers import (
     wifi,
 )
 from .routers.admin import (
+    auth as admin_auth,
     map_health as admin_map_health,
     media as admin_media,
     places as admin_places,
@@ -47,12 +48,9 @@ request_logger = get_request_logger()
 
 @asynccontextmanager
 async def lifespan(app):
-    """Startup and shutdown hooks."""
     setup_logging()
-    logger.info("API starting", extra={"environment": "dev" if IS_DEV else "prod"})
+    logger.info("API starting")
 
-    # Optional error tracking. If SENTRY_DSN isn't set, nothing is
-    # sent anywhere.
     if SENTRY_DSN:
         try:
             import sentry_sdk
@@ -85,7 +83,6 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Rate limiter state lives on the app.
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
@@ -97,7 +94,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Request logging middleware.
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
         start = time.time()
@@ -132,7 +128,11 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(wifi.router)
 
-    # Admin routers
+    # Admin auth — NOT behind the guard, because login itself can't
+    # require a session.
+    app.include_router(admin_auth.router, prefix="/api/admin")
+
+    # Admin routers — every one is behind the guard.
     admin_prefix = "/api/admin"
     admin_deps = [Depends(require_admin)]
 

@@ -3,7 +3,7 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 
 const NAV_ITEMS = [
   { href: '/dashboard', label: 'Dashboard', icon: '📊' },
@@ -18,6 +18,17 @@ const NAV_ITEMS = [
 
 export function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+
+  async function logout() {
+    try {
+      await fetch('/api/admin/logout', { method: 'POST' });
+      router.push('/login');
+    } catch {
+      // Navigate anyway.
+      router.push('/login');
+    }
+  }
 
   return (
     <aside
@@ -47,7 +58,7 @@ export function Sidebar() {
         </div>
       </div>
 
-      <nav style={{ display: 'flex', flexDirection: 'column' }}>
+      <nav style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
         {NAV_ITEMS.map((item) => {
           const isActive = pathname === item.href || pathname.startsWith(item.href + '/');
           return (
@@ -74,6 +85,16 @@ export function Sidebar() {
           );
         })}
       </nav>
+
+      <div style={{ padding: '0 24px' }}>
+        <button
+          className="btn btn-secondary"
+          onClick={logout}
+          style={{ width: '100%', fontSize: 14 }}
+        >
+          Sign out
+        </button>
+      </div>
     </aside>
   );
 }

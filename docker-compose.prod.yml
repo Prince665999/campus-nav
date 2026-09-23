@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: campus-nav-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-campus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-campus_nav}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-campus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: campus-nav-redis
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: campus-nav-api
+    environment:
+      ENVIRONMENT: prod
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-campus}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-campus_nav}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      MEDIA_BASE_URL: ${MEDIA_BASE_URL:-http://localhost:8000}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+    volumes:
+      - api-media:/app/data/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  admin:
+    build:
+      context: ./admin/site
+      dockerfile: Dockerfile
+    container_name: campus-nav-admin
+    environment:
+      BACKEND_URL: http://api:8000
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: campus-nav-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/campus-nav.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - api
+      - admin
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  api-media:

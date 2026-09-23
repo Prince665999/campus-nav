@@ -76,25 +76,38 @@ CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
 # Admin
 # ---------------------------------------------------------------------------
 
+# Kept for backwards compatibility with Phase 14's interim guard.
+# Phase 17's JWT login replaces its use, but the setting remains so
+# any code still reading it works.
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+
+
+# ---------------------------------------------------------------------------
+# Auth (JWT)
+# ---------------------------------------------------------------------------
+
+# The secret used to sign JWTs. MUST be changed for production.
+# Generate one with:  python -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET = os.environ.get(
+    "JWT_SECRET",
+    "dev-secret-do-not-use-in-production-change-me",
+)
+
+JWT_ALGORITHM = "HS256"
+
+# How long a login session lasts. 8 hours covers a work day.
+JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", 8))
 
 
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
 
-# Rate limits are enforced only in production. In development every
-# endpoint is unlimited, so a screen that fires three requests on
-# mount doesn't trip a limit you'd then have to debug.
-#
-# In production the limits apply. Format is "N/period", where period
-# is one of second, minute, hour.
 RATE_LIMIT_ENABLED = os.environ.get(
     "RATE_LIMIT_ENABLED",
     "true" if IS_PROD else "false",
 ).lower() == "true"
 
-# The limits, per IP address.
 RATE_LIMIT_NARRATE = os.environ.get("RATE_LIMIT_NARRATE", "30/minute")
 RATE_LIMIT_REPORTS = os.environ.get("RATE_LIMIT_REPORTS", "10/minute")
 RATE_LIMIT_CHAT = os.environ.get("RATE_LIMIT_CHAT", "30/minute")
@@ -104,8 +117,6 @@ RATE_LIMIT_CHAT = os.environ.get("RATE_LIMIT_CHAT", "30/minute")
 # Logging
 # ---------------------------------------------------------------------------
 
-# "json" for structured logs (production), "console" for readable
-# logs (development).
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "console" if IS_DEV else "json")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
@@ -114,5 +125,4 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 # Error tracking
 # ---------------------------------------------------------------------------
 
-# Sentry DSN. If empty, Sentry is disabled — no data sent anywhere.
 SENTRY_DSN = os.environ.get("SENTRY_DSN", "")

@@ -246,7 +246,7 @@ def _load_nearby_places(
         rows = session.query(Place).all()
         nearby = []
         for p in rows:
-            d = havetersine_m(lat, lon, p.lat, p.lon)
+            d = haversine_m(lat, lon, p.lat, p.lon)
             if d <= NEARBY_RADIUS_M:
                 nearby.append(
                     {
