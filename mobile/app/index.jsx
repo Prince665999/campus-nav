@@ -1,8 +1,4 @@
 // Home screen.
-//
-// Two states: searching (query or category selected) shows results,
-// not searching shows recents and favorites. On first launch,
-// redirects to onboarding.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -43,7 +39,9 @@ export default function HomeScreen() {
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
 
-  // First launch: redirect to onboarding.
+  // First launch: redirect to onboarding. Waits until settings are
+  // loaded so a returning user doesn't see onboarding before the
+  // stored flag is read.
   useEffect(() => {
     if (settings.loaded && !settings.hasSeenOnboarding) {
       router.replace('/onboarding');
@@ -99,7 +97,7 @@ export default function HomeScreen() {
   }, []);
 
   // Sentence-to-destination. Fires when the student presses the
-  // keyboard's search key with more than a couple of words.
+  // keyboard's search key with a full sentence.
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;

@@ -1,6 +1,18 @@
 // Settings screen.
+//
+// Sections: Language, Voice, Accessibility, Wi-Fi, Units.
+// Contains a temporary Development section with a reset-onboarding
+// button. Remove that section before the pilot.
 
-import { StyleSheet, Switch, Text, TouchableOpacity, View } from 'react-native';
+import {
+  Alert,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 
 import { useSettings } from '@/context/SettingsContext';
 import { AVAILABLE_LANGUAGES, t } from '@/i18n';
@@ -10,7 +22,10 @@ export default function SettingsScreen() {
   const { settings, updateSetting } = useSettings();
 
   return (
-    <View style={styles.container}>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.contentContainer}
+    >
       <Section title={t('settings.language')}>
         <View style={styles.segmented}>
           {AVAILABLE_LANGUAGES.map((lang) => (
@@ -104,7 +119,7 @@ export default function SettingsScreen() {
           {t('settings.version', { version: '0.18.0' })}
         </Text>
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -149,6 +164,7 @@ function SegmentButton({ label, active, onPress }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
+  contentContainer: { paddingBottom: SPACING.xl },
   section: {
     backgroundColor: COLORS.background,
     marginTop: SPACING.md,
@@ -198,6 +214,15 @@ const styles = StyleSheet.create({
   segmentActive: { backgroundColor: COLORS.background },
   segmentText: { fontSize: FONT_SIZE.body, color: COLORS.textMuted },
   segmentTextActive: { color: COLORS.text, fontWeight: '600' },
+  devButton: {
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  devButtonText: {
+    color: COLORS.danger,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '500',
+  },
   footer: { alignItems: 'center', padding: SPACING.xl },
   footerText: { color: COLORS.textFaint, fontSize: FONT_SIZE.small },
 });

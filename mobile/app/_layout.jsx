@@ -4,11 +4,12 @@ import { useEffect } from 'react';
 import { Link, Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { Text, TouchableOpacity } from 'react-native';
+import { TouchableOpacity } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
 
 import { SettingsProvider, useSettings } from '@/context/SettingsContext';
 import { COLORS, TOUCH } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
 import * as haptics from '@/services/haptics';
 
 function SettingsButton() {
@@ -24,7 +25,7 @@ function SettingsButton() {
         accessibilityRole="button"
         accessibilityLabel="Settings"
       >
-        <MaterialIcons name="settings" size={22} color={COLORS.text} />
+        <MaterialIcons name={ICONS.settings} size={22} color={COLORS.text} />
       </TouchableOpacity>
     </Link>
   );
@@ -33,7 +34,7 @@ function SettingsButton() {
 function AppStack() {
   const { settings } = useSettings();
 
-  // Keep the haptics service's enabled flag in sync with settings.
+  // Keep the haptics service in sync with the setting.
   useEffect(() => {
     haptics.setEnabled(settings.hapticsEnabled);
   }, [settings.hapticsEnabled]);
@@ -61,7 +62,13 @@ function AppStack() {
       <Stack.Screen name="arrival" options={{ title: 'Arrival' }} />
       <Stack.Screen name="chat" options={{ title: 'Chat' }} />
       <Stack.Screen name="explore" options={{ title: 'Explore' }} />
-      <Stack.Screen name="onboarding" options={{ headerShown: false }} />
+      <Stack.Screen
+        name="onboarding"
+        options={{
+          headerShown: false,
+          animation: 'fade',
+        }}
+      />
       <Stack.Screen name="settings" options={{ title: 'Settings' }} />
     </Stack>
   );

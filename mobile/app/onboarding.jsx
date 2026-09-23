@@ -1,8 +1,8 @@
-// Onboarding. Shown once on first launch.
+// Onboarding. Shown once, on first launch.
 //
-// Three slides, each explaining one thing the app does. Skippable at
-// any point. After the last slide (or on Skip), sets
-// hasSeenOnboarding and navigates to Home.
+// Three slides. Swipe or tap Next. Skip is always available.
+// Completing or skipping sets hasSeenOnboarding and replaces the
+// navigation stack with Home.
 
 import { useRef, useState } from 'react';
 import {
@@ -20,6 +20,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSettings } from '@/context/SettingsContext';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -38,14 +39,14 @@ const SLIDES = [
   },
   {
     key: 'walk',
-    icon: 'directions-walk',
+    icon: 'walk',
     titleKey: 'onboarding.walkTitle',
     bodyKey: 'onboarding.walkBody',
   },
 ];
 
 export default function OnboardingScreen() {
-  const { updateSetting } = useSettings();
+  const { updateSetting, settings } = useSettings();
   const insets = useSafeAreaInsets();
   const listRef = useRef(null);
   const [index, setIndex] = useState(0);
@@ -58,6 +59,7 @@ export default function OnboardingScreen() {
   function next() {
     if (index < SLIDES.length - 1) {
       listRef.current?.scrollToIndex({ index: index + 1, animated: true });
+      setIndex(index + 1);
     } else {
       finish();
     }
@@ -69,9 +71,10 @@ export default function OnboardingScreen() {
     if (newIndex !== index) setIndex(newIndex);
   }
 
+  const isLast = index === SLIDES.length - 1;
+
   return (
     <View style={styles.container}>
-      {/* Skip button, top-right */}
       <View style={[styles.skipRow, { top: insets.top + SPACING.sm }]}>
         <TouchableOpacity
           onPress={finish}
@@ -91,12 +94,17 @@ export default function OnboardingScreen() {
         pagingEnabled
         showsHorizontalScrollIndicator={false}
         onMomentumScrollEnd={onScroll}
+        getItemLayout={(data, i) => ({
+          length: SCREEN_WIDTH,
+          offset: SCREEN_WIDTH * i,
+          index: i,
+        })}
         renderItem={({ item }) => (
           <View style={[styles.slide, { width: SCREEN_WIDTH }]}>
             <View style={styles.iconCircle}>
               <MaterialIcons
-                name={item.icon}
-                size={48}
+                name={ICONS[item.icon] || ICONS.place}
+                size={56}
                 color={COLORS.primaryDark}
               />
             </View>
@@ -106,7 +114,6 @@ export default function OnboardingScreen() {
         )}
       />
 
-      {/* Dots */}
       <View style={styles.dots}>
         {SLIDES.map((_, i) => (
           <View
@@ -116,27 +123,19 @@ export default function OnboardingScreen() {
         ))}
       </View>
 
-      {/* Next / Get started */}
       <View
-        style={[
-          styles.footer,
-          { paddingBottom: insets.bottom + SPACING.md },
-        ]}
+        style={[styles.footer, { paddingBottom: insets.bottom + SPACING.md }]}
       >
         <TouchableOpacity
           style={styles.nextButton}
           onPress={next}
           accessibilityRole="button"
           accessibilityLabel={
-            index === SLIDES.length - 1
-              ? t('onboarding.getStarted')
-              : t('onboarding.next')
+            isLast ? t('onboarding.getStarted') : t('onboarding.next')
           }
         >
           <Text style={styles.nextText}>
-            {index === SLIDES.length - 1
-              ? t('onboarding.getStarted')
-              : t('onboarding.next')}
+            {isLast ? t('onboarding.getStarted') : t('onboarding.next')}
           </Text>
         </TouchableOpacity>
       </View>
@@ -169,9 +168,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.xl,
   },
   iconCircle: {
-    width: 120,
-    height: 120,
-    borderRadius: 60,
+    width: 140,
+    height: 140,
+    borderRadius: 70,
     backgroundColor: COLORS.backgroundSubtle,
     alignItems: 'center',
     justifyContent: 'center',
