@@ -1,12 +1,4 @@
-// MapView.jsx — MapLibre version.
-//
-// This replaces the react-native-maps version. The public interface
-// is identical: geometry, markers, style. Nothing outside this file
-// changes.
-//
-// IMPORTANT: MapLibre requires the MapView to have flex: 1 or explicit
-// height/width. Without it, the map renders at zero size and you see
-// nothing. This is the single most common MapLibre bug on Android.
+// MapView.jsx — MapLibre version with rotation and recentering.
 
 import { useMemo, useRef, useEffect } from 'react';
 import { StyleSheet, View } from 'react-native';
@@ -18,21 +10,19 @@ import {
   MarkerView,
 } from '@maplibre/maplibre-react-native';
 
-// OpenFreeMap Liberty — free, no API key, no account.
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
-
-const DEFAULT_CENTER = [39.2000, -6.7500]; // [lon, lat] — note the order
+const DEFAULT_CENTER = [39.2000, -6.7500];
 
 export function RouteMap({
   geometry = [],
   markers = [],
   userLocation = null,
+  bearing = null,
+  followBearing = false,
   style,
 }) {
   const cameraRef = useRef(null);
 
-  // MapLibre uses GeoJSON coordinate order: [longitude, latitude].
-  // The API gives us { lat, lon }. Convert here.
   const routeCoords = useMemo(
     () => geometry.map((p) => [p.lon, p.lat]),
     [geometry]
@@ -50,30 +40,70 @@ export function RouteMap({
     };
   }, [routeCoords]);
 
-  // Fit the camera to the route when it appears.
+  // Fit the map to the route, with guards against malformed bounds.
   useEffect(() => {
     if (routeCoords.length < 2 || !cameraRef.current) return;
 
-    const lons = routeCoords.map((c) => c[0]);
-    const lats = routeCoords.map((c) => c[1]);
-    const bounds = {
-      ne: [Math.max(...lons), Math.max(...lats)],
-      sw: [Math.min(...lons), Math.min(...lats)],
-      paddingTop: 40,
-      paddingRight: 40,
-      paddingBottom: 40,
-      paddingLeft: 40,
-    };
+    const lons = routeCoords
+      .map((c) => c[0])
+      .filter((n) => Number.isFinite(n));
+    const lats = routeCoords
+      .map((c) => c[1])
+      .filter((n) => Number.isFinite(n));
+
+    if (lons.length === 0 || lats.length === 0) return;
+
+    const west = Math.min(...lons);
+    const east = Math.max(...lons);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+
+    if (
+      !Number.isFinite(west) ||
+      !Number.isFinite(east) ||
+      !Number.isFinite(south) ||
+      !Number.isFinite(north)
+    ) {
+      return;
+    }
+
+    if (east - west < 1e-6 && north - south < 1e-6) return;
+
+    const bounds = [west, south, east, north];
+    const padding = [60, 40, 60, 40];
 
     const timeout = setTimeout(() => {
-      cameraRef.current?.setCamera({
-        bounds,
-        animationDuration: 500,
-      });
+      try {
+        cameraRef.current?.fitBounds(bounds, padding, 500);
+      } catch {
+        // Silent.
+      }
     }, 200);
 
     return () => clearTimeout(timeout);
   }, [routeCoords]);
+
+  // Rotate the camera to follow the student's heading.
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    if (!followBearing || bearing == null) return;
+
+    cameraRef.current.setCamera({
+      heading: bearing,
+      animationDuration: 400,
+    });
+  }, [bearing, followBearing]);
+
+  // Recenter on the student as they move.
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    if (!userLocation) return;
+
+    cameraRef.current.setCamera({
+      centerCoordinate: [userLocation.lon, userLocation.lat],
+      animationDuration: 400,
+    });
+  }, [userLocation]);
 
   const initialCenter =
     routeCoords.length > 0 ? routeCoords[0] : DEFAULT_CENTER;
@@ -92,6 +122,7 @@ export function RouteMap({
           defaultSettings={{
             centerCoordinate: initialCenter,
             zoomLevel: 16,
+            heading: 0,
           }}
         />
 
@@ -144,14 +175,9 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   map: {
-    // flex: 1 is REQUIRED. Without it the map collapses to 0px on Android.
-    // The parent container in route-preview.jsx has height: 280, so
-    // flex: 1 fills that.
     flex: 1,
   },
   marker: {
-    // MapLibre clips marker children that extend outside these bounds
-    // on Android. A small padding prevents the pin from being cut off.
     padding: 4,
   },
   markerDot: {

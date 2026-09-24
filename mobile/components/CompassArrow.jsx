@@ -1,8 +1,11 @@
-// A circular compass with a needle that points at the next turn.
+// A compass rose with a needle pointing at the next turn.
 //
-// If the device has no magnetometer, or the heading hasn't arrived
-// yet, this renders a compass rose without an arrow — showing the
-// cardinal directions is still useful for a "head east" instruction.
+// The whole rose rotates so the N letter always points to true north
+// on screen. The arrow rotates separately to point at the target.
+//
+// This is the correct design: the letters tell you where north is
+// relative to the phone's frame, and the arrow tells you which way
+// to walk. The two rotate independently.
 
 import { StyleSheet, Text, View } from 'react-native';
 
@@ -13,26 +16,36 @@ export function CompassArrow({ heading, bearing, distanceM, size = 84 }) {
   const hasHeading = heading != null;
   const hasBearing = bearing != null;
 
-  // The compass rose rotates by -heading so that N always points to
-  // true north on screen. The arrow rotates by (bearing - heading) so
-  // it points at the target relative to the phone's orientation.
+  // The rose rotates by -heading so that "N" on the rose always
+  // points toward true north on the phone's screen.
+  //
+  // If the phone is facing north (heading = 0), N is at the top.
+  // If the phone is facing east (heading = 90), N is on the left,
+  // because north is now to the phone's left.
   const roseRotation = hasHeading ? -heading : 0;
+
+  // The arrow rotates by (bearing - heading) to point at the target
+  // relative to the phone's orientation.
+  //
+  // If the phone is facing north (0) and the target is east (90),
+  // the arrow points 90° clockwise.
+  // If the phone is facing east (90) and the target is north (0),
+  // the arrow points 90° counter-clockwise.
   const arrowRotation = hasHeading && hasBearing ? bearing - heading : 0;
 
   return (
-    <View style={[styles.wrapper, { width: size, height: size }]}
-    accessible
+    <View
+      style={[styles.wrapper, { width: size, height: size }]}
+      accessible
       accessibilityRole="image"
       accessibilityLabel={
         hasHeading && hasBearing
-          ? `Compass. Arrow pointing at your next turn, ${Math.round(
-              distanceM || 0
-            )} metres away.`
+          ? `Compass. Next turn ${Math.round(distanceM || 0)} metres away.`
           : 'Compass. Waiting for a direction.'
       }
     >
       <View style={[styles.circle, { borderRadius: size / 2 }]}>
-        {/* The whole rose rotates so N points to true north. */}
+        {/* The compass rose — letters rotate so N points to true north. */}
         <View
           style={[
             styles.rose,
@@ -45,7 +58,7 @@ export function CompassArrow({ heading, bearing, distanceM, size = 84 }) {
           <Text style={[styles.cardinal, styles.west]}>W</Text>
         </View>
 
-        {/* The arrow rotates independently to point at the target. */}
+        {/* The arrow — rotates independently to point at the target. */}
         {hasHeading && hasBearing ? (
           <View
             style={[
@@ -89,9 +102,16 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
     elevation: 4,
   },
+  rose: {
+    width: '100%',
+    height: '100%',
+    position: 'absolute',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   cardinal: {
     position: 'absolute',
-    fontSize: 10,
+    fontSize: 11,
     fontWeight: '700',
     color: COLORS.textFaint,
   },
@@ -148,12 +168,5 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
     borderRadius: 12,
     overflow: 'hidden',
-  },
-    rose: {
-    width: '100%',
-    height: '100%',
-    position: 'absolute',
-    alignItems: 'center',
-    justifyContent: 'center',
   },
 });

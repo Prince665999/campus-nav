@@ -1,74 +1,122 @@
-// Subscribes to device orientation and yields a compass heading in
-// degrees (0 = north, 90 = east).
+// Compass heading.
 //
-// The data source differs by platform:
-//   iOS:     Magnetometer gives a compass-like value directly.
-//   Android: Magnetometer + Accelerometer fused for a reliable heading.
+// Two sources, in order:
+//   1. The magnetometer — accurate when it works. Some phones have
+//      it, some don't.
+//   2. The GPS direction of travel — less accurate, only works while
+//      moving, but always available when a fix is being received.
 //
-// We use expo-sensors' Magnetometer on both, with a small amount of
-// smoothing, because it's the same API on both platforms and the
-// accuracy is sufficient for a walking app.
+// The caller gets a heading in degrees, 0 = north. The source is
+// included so the caller can decide whether to trust it.
 
 import { Magnetometer } from 'expo-sensors';
 
 let _subscription = null;
 
-// Convert a magnetometer reading to a compass heading in degrees.
-//
-// The magnetometer gives (x, y, z) in microteslas. For a phone held
-// flat, the heading is derived from x and y. The formula below is
-// the standard one, adjusted so that 0 is north.
+// Convert a magnetometer reading to a compass heading.
 function readingToHeading({ x, y }) {
   const angle = Math.atan2(y, x) * (180 / Math.PI);
   return (angle + 360) % 360;
 }
 
-// Apply exponential smoothing to reduce jitter.
-//
-// New reading weighted 0.2, previous heading weighted 0.8. This makes
-// the arrow steady without introducing noticeable lag.
+// Smooth a heading, handling the 0/360 wrap-around.
 function smooth(prev, next) {
-  if (prev === null) return next;
-  // Handle the wrap-around at 0/360 so 359 -> 1 doesn't average to 180.
+  if (prev === null || prev === undefined) return next;
   let diff = next - prev;
   if (diff > 180) diff -= 360;
   if (diff < -180) diff += 360;
   return (prev + diff * 0.2 + 360) % 360;
 }
 
-// Subscribe to heading updates.
+// Try to subscribe to the magnetometer.
+// Returns a stop function on success, or null if unavailable.
+async function tryMagnetometer(onHeading) {
+  const available = await Magnetometer.isAvailableAsync();
+  if (!available) return null;
+
+  Magnetometer.setUpdateInterval(100);
+
+  let last = null;
+  const sub = Magnetometer.addListener((reading) => {
+    const raw = readingToHeading(reading);
+    if (Number.isFinite(raw)) {
+      last = smooth(last, raw);
+      onHeading(last);
+    }
+  });
+
+  return () => sub.remove();
+}
+
+// Compute a heading from two GPS positions. Returns degrees or null
+// if the movement is too small to get a reliable direction.
+export function headingFromMovement(prev, next) {
+  if (!prev || !next) return null;
+
+  const dLat = next.lat - prev.lat;
+  const dLon = next.lon - prev.lon;
+
+  // Ignore tiny movements — GPS jitter would give random headings.
+  // 0.00001 degrees is about 1 metre.
+  if (Math.abs(dLat) < 0.00001 && Math.abs(dLon) < 0.00001) {
+    return null;
+  }
+
+  const phi1 = (prev.lat * Math.PI) / 180;
+  const phi2 = (next.lat * Math.PI) / 180;
+  const dLambda = (dLon * Math.PI) / 180;
+
+  const x = Math.sin(dLambda) * Math.cos(phi2);
+  const y =
+    Math.cos(phi1) * Math.sin(phi2) -
+    Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLambda);
+
+  return ((Math.atan2(x, y) * 180) / Math.PI + 360) % 360;
+}
+
+// Subscribe to heading updates. The callback receives a heading in
+// degrees, or null if no source is available.
 //
-// onHeading receives a smoothed compass heading in degrees.
-// Returns a function that stops the subscription.
+// Returns a stop function.
 export async function watch(onHeading, onError) {
   if (_subscription) {
     return () => stop();
   }
 
-  const available = await Magnetometer.isAvailableAsync();
-  if (!available) {
-    if (onError) onError(new Error('Magnetometer not available on this device'));
-    return () => {};
+  let magnetometerStop = null;
+  try {
+    magnetometerStop = await tryMagnetometer(onHeading);
+  } catch (e) {
+    if (onError) onError(e);
   }
 
-  // 100ms interval is 10 Hz. Enough for a smooth arrow without
-  // draining the battery.
-  Magnetometer.setUpdateInterval(100);
+  if (magnetometerStop) {
+    _subscription = { remove: magnetometerStop };
+    return () => stop();
+  }
 
-  let lastHeading = null;
-
-  _subscription = Magnetometer.addListener((reading) => {
-    const raw = readingToHeading(reading);
-    lastHeading = smooth(lastHeading, raw);
-    onHeading(lastHeading);
-  });
-
-  return () => stop();
+  // No magnetometer. The caller will need to feed GPS-derived
+  // headings in manually — see headingFromMovement above.
+  // Report null so the caller knows there's no sensor.
+  if (onHeading) onHeading(null);
+  _subscription = null;
+  return () => {};
 }
 
 export function stop() {
   if (_subscription) {
     _subscription.remove();
     _subscription = null;
+  }
+}
+
+// Whether a magnetometer is available on this device.
+// Callers use this to know whether to expect real headings or to
+// fall back to GPS-derived ones.
+export async function hasMagnetometer() {
+  try {
+    return await Magnetometer.isAvailableAsync();
+  } catch {
+    return false;
   }
 }

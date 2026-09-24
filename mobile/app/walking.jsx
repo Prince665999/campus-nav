@@ -33,10 +33,6 @@ import { ICONS } from '@/constants/icons';
 
 const APPROACH_PHOTO_DISTANCE_M = 60;
 const ARRIVAL_DISTANCE_M = 15;
-
-// How many seconds after entering Walking Mode before we recompute
-// the route from the live position. Short enough that the student
-// sees the correct route quickly, long enough for a GPS fix.
 const RECOMPUTE_AFTER_MS = 3000;
 
 export default function WalkingScreen() {
@@ -62,12 +58,9 @@ export default function WalkingScreen() {
   const [reportOpen, setReportOpen] = useState(false);
 
   const arrivedRef = useRef(false);
-  // Track whether we've already recomputed from the live position
-  // for this walk. Only do it once per entry.
   const recomputedRef = useRef(false);
 
   const { settings } = useSettings();
-  const { heading } = useCompass();
 
   // Load the route if it wasn't passed in.
   useState(() => {
@@ -123,14 +116,15 @@ export default function WalkingScreen() {
     resetOffRoute,
   } = useWalkingProgress(route);
 
+  // Compass. Called after useWalkingProgress so it can receive the
+  // position for GPS-derived heading fallback.
+  const { heading } = useCompass({ position: rawPosition });
+
   // Recompute the route from the student's live position, once,
   // shortly after the walk starts. The route passed from preview was
   // computed at whatever position the student was in when they
   // tapped Take me there. By the time they're actually walking,
   // they've moved, and the route may not align with where they are.
-  //
-  // Recomputation is cheap — the endpoint is cached — and it means
-  // the snapped position lands on the route instead of beside it.
   useEffect(() => {
     if (recomputedRef.current) return;
     if (!rawPosition) return;
@@ -239,6 +233,8 @@ export default function WalkingScreen() {
     return closestApproachPhoto(approachPhotos, approachBearing);
   })();
 
+  // Bearing from the student's current position to the next step's
+  // location, or to the destination if on the last step.
   const bearing = (() => {
     if (!position || !route || !route.geometry || route.geometry.length < 2) {
       return null;
@@ -406,6 +402,8 @@ export default function WalkingScreen() {
             geometry={route.geometry}
             markers={markers}
             userLocation={position}
+            bearing={heading}
+            followBearing={true}
             style={styles.map}
           />
         </View>

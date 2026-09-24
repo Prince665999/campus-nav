@@ -1,32 +1,46 @@
-// React hook that subscribes to the compass and exposes the current
-// heading.
+// React hook that yields a compass heading.
 //
-// Usage:
-//   const { heading, available } = useCompass();
-//   // heading is degrees 0..360, or null before the first reading
-//   // available is false if the device has no magnetometer
+// Uses the magnetometer when available. When it isn't, falls back to
+// the GPS direction of travel while the student is moving. The
+// heading is null until one of those sources produces a value.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-import { stop, watch } from '@/services/compass';
+import { hasMagnetometer, headingFromMovement, stop, watch } from '@/services/compass';
 
-export function useCompass() {
+export function useCompass({ position } = {}) {
   const [heading, setHeading] = useState(null);
+  const [source, setSource] = useState(null); // 'magnetometer' | 'gps' | null
   const [available, setAvailable] = useState(true);
 
+  // Track the previous position so GPS-derived heading can be
+  // computed from the movement between two fixes.
+  const prevPositionRef = useRef(null);
+
+  // Magnetometer subscription.
   useEffect(() => {
     let stopFn = null;
     let cancelled = false;
 
-    watch(
-      (h) => {
-        if (!cancelled) setHeading(h);
-      },
-      () => {
-        if (!cancelled) setAvailable(false);
+    hasMagnetometer().then((has) => {
+      if (cancelled || !has) {
+        setAvailable(false);
+        return;
       }
-    ).then((stopSubscription) => {
-      stopFn = stopSubscription;
+      watch(
+        (h) => {
+          if (cancelled) return;
+          if (h !== null) {
+            setHeading(h);
+            setSource('magnetometer');
+          }
+        },
+        () => {
+          if (!cancelled) setAvailable(false);
+        }
+      ).then((fn) => {
+        stopFn = fn;
+      });
     });
 
     return () => {
@@ -36,5 +50,28 @@ export function useCompass() {
     };
   }, []);
 
-  return { heading, available };
+  // GPS-derived heading, when position updates are available and no
+  // magnetometer reading has arrived.
+  useEffect(() => {
+    if (!position) return;
+
+    const prev = prevPositionRef.current;
+    prevPositionRef.current = { lat: position.lat, lon: position.lon };
+
+    if (source === 'magnetometer') return;
+    if (!prev) return;
+
+    const derived = headingFromMovement(prev, position);
+    if (derived !== null) {
+      setHeading(derived);
+      setSource('gps');
+    }
+  }, [position, source]);
+
+  return {
+    heading,
+    source,
+    available,
+    isFromMagnetometer: source === 'magnetometer',
+  };
 }
