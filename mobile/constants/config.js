@@ -4,7 +4,7 @@
 // build time, so these values are baked into the app bundle when it's
 // built. That's fine for the API URL — it's not a secret.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
+const DEFAULT_API_BASE_URL = 'http://192.168.43.204:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
