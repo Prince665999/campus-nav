@@ -6,6 +6,7 @@ from .admin_user import AdminUser
 from .area import Area
 from .base import Base, TimestampMixin
 from .favorite import Favorite
+from .knowledge_document import KnowledgeDocument
 from .media import Media
 from .path_edge import PathEdge
 from .place import Place
@@ -25,4 +26,5 @@ __all__ = [
     "Report",
     "RouteCache",
     "AdminUser",
+    "KnowledgeDocument",
 ]

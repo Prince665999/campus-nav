@@ -32,6 +32,7 @@ from .routers import (
 )
 from .routers.admin import (
     auth as admin_auth,
+    knowledge as admin_knowledge,
     map_health as admin_map_health,
     media as admin_media,
     places as admin_places,
@@ -156,6 +157,12 @@ def create_app() -> FastAPI:
     )
     app.include_router(
         admin_users.router, prefix=admin_prefix, dependencies=admin_deps
+    )
+    app.include_router(
+        admin_users.router, prefix=admin_prefix, dependencies=admin_deps
+    )
+    app.include_router(
+        admin_knowledge.router, prefix=admin_prefix, dependencies=admin_deps
     )
 
     app.mount(

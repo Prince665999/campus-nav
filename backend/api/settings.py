@@ -63,6 +63,40 @@ MEDIA_VARIANTS = [
 
 
 # ---------------------------------------------------------------------------
+# Knowledge base
+# ---------------------------------------------------------------------------
+
+# Where ChromaDB stores its data. A folder on disk, not a server.
+CHROMA_DIR = Path(os.environ.get("CHROMA_DIR", DATA_DIR / "chroma"))
+CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+
+# The collection name in Chroma. All knowledge chunks live here.
+CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "campus_knowledge")
+
+# The embedding model. all-MiniLM-L6-v2 is 80 MB, runs on CPU, and
+# produces 384-dimension vectors. Good enough for a campus knowledge
+# base and free.
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+# Where uploaded knowledge documents live before processing.
+KNOWLEDGE_UPLOAD_DIR = Path(
+    os.environ.get("KNOWLEDGE_UPLOAD_DIR", DATA_DIR / "knowledge")
+)
+KNOWLEDGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Maximum size of an uploaded document, in bytes. 25 MB.
+KNOWLEDGE_MAX_UPLOAD_BYTES = int(
+    os.environ.get("KNOWLEDGE_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
+)
+
+# Chunk size in words (not tokens — a simple approximation).
+KNOWLEDGE_CHUNK_WORDS = int(os.environ.get("KNOWLEDGE_CHUNK_WORDS", 300))
+
+# How many chunks to retrieve per query.
+KNOWLEDGE_TOP_K = int(os.environ.get("KNOWLEDGE_TOP_K", 5))
+
+
+# ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
 
@@ -76,26 +110,18 @@ CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
 # Admin
 # ---------------------------------------------------------------------------
 
-# Kept for backwards compatibility with Phase 14's interim guard.
-# Phase 17's JWT login replaces its use, but the setting remains so
-# any code still reading it works.
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
-# Auth (JWT)
+# Auth
 # ---------------------------------------------------------------------------
 
-# The secret used to sign JWTs. MUST be changed for production.
-# Generate one with:  python -c "import secrets; print(secrets.token_hex(32))"
 JWT_SECRET = os.environ.get(
     "JWT_SECRET",
     "dev-secret-do-not-use-in-production-change-me",
 )
-
 JWT_ALGORITHM = "HS256"
-
-# How long a login session lasts. 8 hours covers a work day.
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", 8))
 
 
