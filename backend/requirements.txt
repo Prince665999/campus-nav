@@ -1,6 +1,6 @@
 requests>=2.31,<3
 SQLAlchemy>=2.0,<3
-fastapi>=0.115,<1
+fastapi>=0.141.1,<1
 uvicorn[standard]>=0.30,<1
 pydantic>=2.7,<3
 Pillow>=10.0,<12
