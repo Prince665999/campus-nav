@@ -1,74 +1,37 @@
 // Determines where a route should start from.
 //
-// The logic, in order:
-//   1. If the app has a position from the last few minutes (from
-//      Walking Mode or a previous request), use it.
-//   2. Otherwise, ask for permission and try to get a fresh fix.
-//   3. If permission is denied, or the fix doesn't arrive, ask the
-//      student which place they're starting from.
-//
-// The caller gets a result that says either "we have a start" (with
-// the coordinates or a chosen place) or "we need you to pick".
+// There is no cache. Every "Take me there" gets a fresh GPS fix.
+// If the fix fails, the student is told and offered a retry, or the
+// option to pick a starting place from a list.
 
 import { useCallback, useRef, useState } from 'react';
 
 import { getPositionOnce, requestPermission } from '@/services/location';
 import { listPlaces } from '@/services/api';
 
-// How long a cached position stays valid. Five minutes is long
-// enough that a recent fix is reused, short enough that a student
-// who has walked somewhere else is asked again.
-const CACHE_TTL_MS = 5 * 60 * 1000;
-
-// Module-level cache. Shared across screens — if Walking Mode just
-// snapped a position, the Place detail screen can reuse it.
-let _cachedPosition = null;
-let _cachedAt = 0;
-
-export function updateCachedPosition(position) {
-  if (!position) return;
-  _cachedPosition = position;
-  _cachedAt = Date.now();
-}
-
-function _getCachedPosition() {
-  if (!_cachedPosition) return null;
-  if (Date.now() - _cachedAt > CACHE_TTL_MS) return null;
-  return _cachedPosition;
-}
-
-// A helper to clear the cache. Useful for testing, or if the student
-// wants to start a fresh location check.
-export function clearCachedPosition() {
-  _cachedPosition = null;
-  _cachedAt = 0;
-}
+const GPS_TIMEOUT_MS = 15000;
 
 export function useStartingPoint() {
-  // 'idle' | 'locating' | 'needPick'
   const [state, setState] = useState('idle');
   const [start, setStart] = useState(null);
   const [nearbyPlaces, setNearbyPlaces] = useState([]);
+  const [lastError, setLastError] = useState(null);
 
-  // Holds the resolver for the pending "waiting for the student to
-  // pick" promise. A ref, not a local variable, so it survives
-  // re-renders while the picker is open.
   const pendingResolverRef = useRef(null);
 
-  // Reset everything. Call when a screen unmounts, or to start over.
   const reset = useCallback(() => {
     setState('idle');
     setStart(null);
     setNearbyPlaces([]);
+    setLastError(null);
     if (pendingResolverRef.current) {
       pendingResolverRef.current(null);
       pendingResolverRef.current = null;
     }
   }, []);
 
-  // The student picked a place from the sheet. Resolve the pending
-  // promise with the chosen place.
   const choosePlace = useCallback((place) => {
+    console.log('useStartingPoint: choosePlace', place.id, place.name);
     const chosen = { placeId: place.id, placeName: place.name };
     setStart(chosen);
     setState('idle');
@@ -79,7 +42,6 @@ export function useStartingPoint() {
     }
   }, []);
 
-  // The student dismissed the picker.
   const cancelPick = useCallback(() => {
     setState('idle');
     setNearbyPlaces([]);
@@ -89,55 +51,60 @@ export function useStartingPoint() {
     }
   }, []);
 
-  // The main entry point. Returns a Promise that resolves to:
-  //   { lat, lon }             — GPS position available
-  //   { placeId, placeName }   — the student chose a place
-  //   null                     — cancelled or failed
-  //
-  // While the promise is pending, `state` reflects what's happening,
-  // so the calling screen can show a spinner or the picker.
   const resolveStart = useCallback(async ({ destinationPlaceId } = {}) => {
-    // 1. Cached position.
-    const cached = _getCachedPosition();
-    if (cached) {
-      const result = { lat: cached.lat, lon: cached.lon };
-      setStart(result);
-      return result;
-    }
+    console.log('resolveStart: called, destinationPlaceId =', destinationPlaceId);
+    setLastError(null);
 
-    // 2. Ask for permission and try a fresh fix.
+    // 1. Permission.
     setState('locating');
+    let granted = false;
     try {
-      const granted = await requestPermission();
-      if (granted) {
-        const fresh = await getPositionOnce({ timeoutMs: 8000 });
-        if (fresh) {
-          updateCachedPosition(fresh);
-          const result = { lat: fresh.lat, lon: fresh.lon };
-          setStart(result);
-          setState('idle');
-          return result;
-        }
-      }
-    } catch {
-      // Fall through to the picker.
+      granted = await requestPermission();
+      console.log('resolveStart: permission granted =', granted);
+    } catch (err) {
+      console.log('resolveStart: permission error =', err.message);
+      setLastError('permission_error');
+      setState('idle');
+      return null;
     }
 
-    // 3. No GPS. Ask the student to pick a starting place.
+    if (!granted) {
+      console.log('resolveStart: permission denied, returning null');
+      setLastError('permission_denied');
+      setState('idle');
+      return null;
+    }
+
+    // 2. Fresh GPS fix.
+    console.log('resolveStart: requesting position with timeout', GPS_TIMEOUT_MS);
+    try {
+      const fresh = await getPositionOnce({ timeoutMs: GPS_TIMEOUT_MS });
+      console.log('resolveStart: fresh fix =', fresh);
+      if (fresh) {
+        const result = { lat: fresh.lat, lon: fresh.lon };
+        setStart(result);
+        setState('idle');
+        return result;
+      }
+    } catch (err) {
+      console.log('resolveStart: getPositionOnce error =', err.message);
+    }
+
+    // 3. No fix. Offer the picker.
+    console.log('resolveStart: no fix, opening picker');
+    setLastError('no_fix');
     setState('needPick');
     try {
       const places = await listPlaces({ limit: 20 });
-      // Exclude the destination — the student isn't starting there.
       const filtered = places.filter((p) => p.id !== destinationPlaceId);
+      console.log('resolveStart: picker loaded', filtered.length, 'places');
       setNearbyPlaces(filtered);
     } catch {
       setNearbyPlaces([]);
     }
 
-    // Return a promise that resolves when the student picks or
-    // cancels. Stored in a ref so choosePlace and cancelPick can
-    // reach it.
     return new Promise((resolve) => {
+      console.log('resolveStart: awaiting picker selection');
       pendingResolverRef.current = resolve;
     });
   }, []);
@@ -146,6 +113,7 @@ export function useStartingPoint() {
     state,
     start,
     nearbyPlaces,
+    lastError,
     resolveStart,
     choosePlace,
     cancelPick,

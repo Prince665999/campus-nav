@@ -1,6 +1,6 @@
 // Home screen.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -18,6 +18,8 @@ import { FeatureCard } from '@/components/FeatureCard';
 import { RecentStrip } from '@/components/RecentStrip';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
+import { useStartingPoint } from '@/hooks/useStartingPoint';
+import { setRouteRequest } from '@/services/routeRequest';
 import {
   extractDestination,
   listPlaces,
@@ -39,6 +41,10 @@ export default function HomeScreen() {
   const [favorites, setFavorites] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+
+  const navigatingRef = useRef(false);
+
+  const { resolveStart } = useStartingPoint();
 
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
@@ -112,24 +118,60 @@ export default function HomeScreen() {
     if (!text || text.length < 5) return;
     if (text.split(/\s+/).length < 3) return;
 
+    // Guard against double-fire.
+    if (navigatingRef.current) return;
+    navigatingRef.current = true;
+
     try {
       const extracted = await extractDestination(text);
-      if (extracted.matched) {
-        const others = await listPlaces({ limit: 5 });
-        const from = others.find((p) => p.id !== extracted.place_id) || others[0];
-        if (!from) return;
-        router.push({
-          pathname: '/route-preview',
-          params: {
-            fromId: String(from.id),
-            toId: String(extracted.place_id),
-          },
-        });
+      if (!extracted.matched) {
+        navigatingRef.current = false;
+        return;
       }
+
+      const start = await resolveStart({
+        destinationPlaceId: extracted.place_id,
+      });
+
+      if (!start) {
+        navigatingRef.current = false;
+        return;
+      }
+
+      if (start.lat != null && start.lon != null) {
+        setRouteRequest({
+          fromLat: start.lat,
+          fromLon: start.lon,
+          toId: extracted.place_id,
+        });
+        console.log(
+          'index: navigate from GPS',
+          start.lat,
+          start.lon,
+          '→',
+          extracted.place_id
+        );
+      } else if (start.placeId != null) {
+        setRouteRequest({
+          fromId: start.placeId,
+          toId: extracted.place_id,
+        });
+        console.log(
+          'index: navigate from place',
+          start.placeId,
+          '→',
+          extracted.place_id
+        );
+      } else {
+        navigatingRef.current = false;
+        return;
+      }
+
+      router.push('/route-preview');
     } catch {
-      // Silent.
+      navigatingRef.current = false;
     }
-  }, [query]);
+  }, [query, resolveStart]);
 
   const showSearchResults = isSearching;
 

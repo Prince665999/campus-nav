@@ -1,7 +1,5 @@
 // A React hook that combines location tracking with progress
-// tracking. Given a route, it tracks the student's position, snaps
-// it to the route, and exposes the current step, distance remaining,
-// distance to next turn, off-route state, and progress fraction.
+// tracking.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -28,6 +26,18 @@ export function useWalkingProgress(route) {
 
   const detectorRef = useRef(createOffRouteDetector());
 
+  // The current route geometry. Kept in a ref so the location
+  // callback reads the latest without the subscription effect
+  // depending on the route object.
+  const geometryRef = useRef(null);
+
+  useEffect(() => {
+    geometryRef.current =
+      route && route.geometry && route.geometry.length > 1
+        ? route.geometry
+        : null;
+  }, [route]);
+
   // Ask for permission once, when the hook first mounts.
   useEffect(() => {
     let cancelled = false;
@@ -39,44 +49,71 @@ export function useWalkingProgress(route) {
     };
   }, []);
 
-  // Once permission is granted and the route is available, start
-  // watching the position.
-  useEffect(() => {
-    if (!permissionGranted || !route || !route.geometry) return;
+  const hasGeometry = !!(
+    route &&
+    route.geometry &&
+    route.geometry.length > 1
+  );
 
-    // Reset the detector and its warm-up counter when the route
-    // changes. A new route means a new reference frame.
+  // Subscribe to GPS updates. This effect depends only on whether
+  // a geometry exists, not on the route object itself — so a
+  // recompute doesn't tear down the subscription.
+  useEffect(() => {
+    if (!permissionGranted) return;
+    if (!hasGeometry) return;
+
     detectorRef.current.reset();
 
-    let stop = null;
     let cancelled = false;
+    let stopFn = null;
 
-    watchLocation((loc) => {
-      if (cancelled) return;
+    watchLocation(
+      (loc) => {
+        if (cancelled) return;
 
-      setRawPosition({ lat: loc.lat, lon: loc.lon });
+        setRawPosition({
+          lat: loc.lat,
+          lon: loc.lon,
+          accuracyM: loc.accuracyM,
+        });
 
-      const snapped = snapToRoute(
-        { lat: loc.lat, lon: loc.lon },
-        route.geometry
-      );
-      if (!snapped) return;
+        const geom = geometryRef.current;
+        if (!geom) return;
 
-      setSnappedPosition({ lat: snapped.lat, lon: snapped.lon });
-      setDistanceFromStart(snapped.distanceFromStartM);
+        const snapped = snapToRoute({ lat: loc.lat, lon: loc.lon }, geom);
+        if (!snapped) return;
 
-      const isOffRoute = detectorRef.current.record(snapped.offRouteM);
-      setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
-    }).then((stopFn) => {
-      stop = stopFn;
+        setSnappedPosition({ lat: snapped.lat, lon: snapped.lon });
+        setDistanceFromStart(snapped.distanceFromStartM);
+
+        const isOffRoute = detectorRef.current.record(snapped.offRouteM);
+        setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
+      },
+      () => {
+        // Ignore errors. The subscription stays alive and may
+        // deliver updates again later.
+      }
+    ).then((fn) => {
+      if (cancelled) {
+        if (fn) fn();
+      } else {
+        stopFn = fn;
+      }
     });
 
     return () => {
       cancelled = true;
-      if (stop) stop();
+      if (stopFn) stopFn();
       else stopWatching();
     };
-  }, [permissionGranted, route]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [permissionGranted, hasGeometry]);
+
+  // When the route object changes, reset the detector.
+  useEffect(() => {
+    detectorRef.current.reset();
+    setOffRoute(false);
+  }, [route]);
 
   const totalDistance = route?.distance_m || 0;
   const steps = route?.steps || [];

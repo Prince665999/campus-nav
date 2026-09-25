@@ -9,44 +9,57 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { router, Stack } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { RouteMap } from '@/components/MapView';
 import { RouteSummary } from '@/components/RouteSummary';
 import { computeRoute, narrateRoute } from '@/services/api';
+import { takeRouteRequest, setRouteRequest } from '@/services/routeRequest';
 import { useSettings } from '@/context/SettingsContext';
 import { t } from '@/i18n';
 import { estimateWalkingSeconds, formatDistance } from '@/utils/format';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 export default function RoutePreviewScreen() {
-  const { fromId, toId, fromLat, fromLon } = useLocalSearchParams();
-
-  const fromPlaceId = fromId ? Number(fromId) : null;
-  const toPlaceId = Number(toId);
-  const fromLatNum = fromLat ? Number(fromLat) : null;
-  const fromLonNum = fromLon ? Number(fromLon) : null;
-
   const insets = useSafeAreaInsets();
   const { settings } = useSettings();
+
+  // Read the request from the module store on first render.
+  // We keep it in state so a re-render doesn't lose it.
+  const [request] = useState(() => takeRouteRequest());
 
   const [route, setRoute] = useState(null);
   const [narration, setNarration] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  console.log('RoutePreview: request =', request);
+
+  const hasFrom =
+    request != null &&
+    (request.fromId != null ||
+      (request.fromLat != null && request.fromLon != null));
+
   useEffect(() => {
+    if (!hasFrom) {
+      setError(
+        'This route has no starting point. Go back and try again.'
+      );
+      setLoading(false);
+      return;
+    }
+
     let cancelled = false;
     async function load() {
       setLoading(true);
       setError(null);
       try {
         const data = await computeRoute({
-          fromPlaceId,
-          toPlaceId,
-          fromLat: fromLatNum,
-          fromLon: fromLonNum,
+          fromPlaceId: request.fromId,
+          toPlaceId: request.toId,
+          fromLat: request.fromLat,
+          fromLon: request.fromLon,
         });
         if (!cancelled) setRoute(data);
       } catch (err) {
@@ -59,17 +72,19 @@ export default function RoutePreviewScreen() {
     return () => {
       cancelled = true;
     };
-  }, [fromPlaceId, toPlaceId, fromLatNum, fromLonNum]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasFrom]);
 
   useEffect(() => {
+    if (!hasFrom) return;
     let cancelled = false;
     async function load() {
       try {
         const data = await narrateRoute({
-          fromPlaceId,
-          toPlaceId,
-          fromLat: fromLatNum,
-          fromLon: fromLonNum,
+          fromPlaceId: request.fromId,
+          toPlaceId: request.toId,
+          fromLat: request.fromLat,
+          fromLon: request.fromLon,
           lang: settings.language,
           live: false,
         });
@@ -82,25 +97,28 @@ export default function RoutePreviewScreen() {
     return () => {
       cancelled = true;
     };
-  }, [fromPlaceId, toPlaceId, fromLatNum, fromLonNum, settings.language]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasFrom, settings.language]);
 
   const startWalking = useCallback(() => {
-    if (!route) return;
-    const params = {
-      toId: String(toPlaceId),
-      routeJson: JSON.stringify(route),
-    };
-    if (fromPlaceId != null) {
-      params.fromId = String(fromPlaceId);
-    } else if (fromLatNum != null && fromLonNum != null) {
-      params.fromLat = String(fromLatNum);
-      params.fromLon = String(fromLonNum);
-    }
+    if (!route || !request) return;
+
+    // Re-publish the request so the walking screen can read it.
+    setRouteRequest({
+      fromLat: request.fromLat,
+      fromLon: request.fromLon,
+      fromId: request.fromId,
+      toId: request.toId,
+    });
+
+    // The route geometry and other details are passed as params
+    // because they're large and Expo Router handles those fine
+    // (it's the negative decimals that break).
     router.push({
       pathname: '/walking',
-      params,
+      params: { routeJson: JSON.stringify(route) },
     });
-  }, [route, fromPlaceId, toPlaceId, fromLatNum, fromLonNum]);
+  }, [route, request]);
 
   if (loading) {
     return (

@@ -1,6 +1,6 @@
 // Place detail screen.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -19,6 +19,7 @@ import {
   listMediaForPlace,
   removeFavorite,
 } from '@/services/api';
+import { setRouteRequest } from '@/services/routeRequest';
 import { PhotoCarousel } from '@/components/PhotoCarousel';
 import { ReportSheet } from '@/components/ReportSheet';
 import { StartingPointSheet } from '@/components/StartingPointSheet';
@@ -39,9 +40,12 @@ export default function PlaceDetailScreen() {
   const [reportOpen, setReportOpen] = useState(false);
   const [resolvingStart, setResolvingStart] = useState(false);
 
+  const navigatingRef = useRef(false);
+
   const {
     state: startState,
     nearbyPlaces,
+    lastError,
     resolveStart,
     choosePlace,
     cancelPick,
@@ -89,9 +93,35 @@ export default function PlaceDetailScreen() {
     }
   }, [favorited, placeId]);
 
-  // Take me there — resolve a start, then navigate.
+  const navigateToRoute = useCallback(
+    (start) => {
+      if (start.lat != null && start.lon != null) {
+        setRouteRequest({
+          fromLat: start.lat,
+          fromLon: start.lon,
+          toId: place.id,
+        });
+        console.log('navigateToRoute: from GPS', start.lat, start.lon, '→', place.id);
+      } else if (start.placeId != null) {
+        setRouteRequest({
+          fromId: start.placeId,
+          toId: place.id,
+        });
+        console.log('navigateToRoute: from place', start.placeId, '→', place.id);
+      } else {
+        setError(t('start.couldNotResolve'));
+        return;
+      }
+      router.push('/route-preview');
+    },
+    [place]
+  );
+
   const takeMeThere = useCallback(async () => {
     if (!place) return;
+    if (navigatingRef.current) return;
+    navigatingRef.current = true;
+
     setResolvingStart(true);
     setError(null);
 
@@ -99,38 +129,21 @@ export default function PlaceDetailScreen() {
       const start = await resolveStart({ destinationPlaceId: place.id });
 
       if (!start) {
-        // The student cancelled the picker.
+        if (lastError === 'permission_denied') {
+          setError(t('start.permissionDenied'));
+        }
         setResolvingStart(false);
+        navigatingRef.current = false;
         return;
       }
 
-      // Two possible shapes: { lat, lon } or { placeId, placeName }.
-      const params = {
-        toId: String(place.id),
-      };
-
-      if (start.lat != null && start.lon != null) {
-        params.fromLat = String(start.lat);
-        params.fromLon = String(start.lon);
-      } else if (start.placeId != null) {
-        params.fromId = String(start.placeId);
-      } else {
-        // Shouldn't happen, but be defensive.
-        setError(t('start.couldNotResolve'));
-        setResolvingStart(false);
-        return;
-      }
-
-      router.push({
-        pathname: '/route-preview',
-        params,
-      });
+      navigateToRoute(start);
     } catch (err) {
       setError(err.message || t('common.error'));
-    } finally {
       setResolvingStart(false);
+      navigatingRef.current = false;
     }
-  }, [place, resolveStart]);
+  }, [place, resolveStart, lastError, navigateToRoute]);
 
   if (loading) {
     return (
@@ -140,7 +153,7 @@ export default function PlaceDetailScreen() {
     );
   }
 
-  if (error || !place) {
+  if (error && !place) {
     return (
       <View style={styles.state}>
         <Text style={styles.errorText}>{error || t('common.error')}</Text>
@@ -243,6 +256,10 @@ export default function PlaceDetailScreen() {
               </Text>
             )}
           </TouchableOpacity>
+
+          {error ? (
+            <Text style={styles.errorBelowButton}>{error}</Text>
+          ) : null}
 
           <TouchableOpacity
             style={styles.reportLink}
@@ -351,6 +368,12 @@ const styles = StyleSheet.create({
   },
   buttonTextSpaced: { marginLeft: SPACING.sm },
   primaryButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
+  errorBelowButton: {
+    color: COLORS.danger,
+    fontSize: FONT_SIZE.small,
+    textAlign: 'center',
+    marginTop: SPACING.md,
+  },
   reportLink: {
     marginTop: SPACING.md,
     alignItems: 'center',

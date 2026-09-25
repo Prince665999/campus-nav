@@ -21,7 +21,7 @@ import { useWalkingProgress } from '@/hooks/useWalkingProgress';
 import { useCompass } from '@/hooks/useCompass';
 import { useNearbyWifi } from '@/hooks/useNearbyWifi';
 import { useSettings } from '@/context/SettingsContext';
-import { updateCachedPosition } from '@/hooks/useStartingPoint';
+import { takeRouteRequest } from '@/services/routeRequest';
 import { computeRoute, listMediaForPlace, recordRecent } from '@/services/api';
 import { closestApproachPhoto } from '@/utils/media';
 import * as tts from '@/services/tts';
@@ -33,11 +33,16 @@ import { ICONS } from '@/constants/icons';
 
 const APPROACH_PHOTO_DISTANCE_M = 60;
 const ARRIVAL_DISTANCE_M = 15;
-const RECOMPUTE_AFTER_MS = 3000;
+const RECOMPUTE_AFTER_MS = 2000;
+const MAX_ACCURACY_M = 50;
 
 export default function WalkingScreen() {
-  const { fromId, toId, fromLat, fromLon, routeJson } =
-    useLocalSearchParams();
+  const { routeJson } = useLocalSearchParams();
+
+  // Read the route request from the store. This gives us the real
+  // destination and, if the route was computed from a place, the
+  // from-place id.
+  const routeRequestRef = useRef(takeRouteRequest());
 
   const [route, setRoute] = useState(() => {
     if (routeJson) {
@@ -58,20 +63,29 @@ export default function WalkingScreen() {
   const [reportOpen, setReportOpen] = useState(false);
 
   const arrivedRef = useRef(false);
-  const recomputedRef = useRef(false);
+  const recomputeAttemptsRef = useRef(0);
 
   const { settings } = useSettings();
+
+  // The destination id — either from the store or from routeJson.
+  const destinationId = routeRequestRef.current?.toId ?? null;
 
   // Load the route if it wasn't passed in.
   useState(() => {
     if (route) return;
+    if (!destinationId) {
+      setError('No destination');
+      setLoading(false);
+      return;
+    }
     async function load() {
       try {
+        const req = routeRequestRef.current;
         const data = await computeRoute({
-          fromPlaceId: fromId ? Number(fromId) : null,
-          toPlaceId: Number(toId),
-          fromLat: fromLat ? Number(fromLat) : null,
-          fromLon: fromLon ? Number(fromLon) : null,
+          fromPlaceId: req?.fromId ?? null,
+          fromLat: req?.fromLat ?? null,
+          fromLon: req?.fromLon ?? null,
+          toPlaceId: destinationId,
         });
         setRoute(data);
       } catch (err) {
@@ -83,10 +97,10 @@ export default function WalkingScreen() {
     load();
   });
 
-  // Load destination photos once.
   useEffect(() => {
+    if (!destinationId) return;
     let cancelled = false;
-    listMediaForPlace(Number(toId))
+    listMediaForPlace(destinationId)
       .then((items) => {
         if (!cancelled) setApproachPhotos(items);
       })
@@ -96,12 +110,12 @@ export default function WalkingScreen() {
     return () => {
       cancelled = true;
     };
-  }, [toId]);
+  }, [destinationId]);
 
-  // Record this destination as a recent visit.
   useEffect(() => {
-    recordRecent(Number(toId)).catch(() => {});
-  }, [toId]);
+    if (!destinationId) return;
+    recordRecent(destinationId).catch(() => {});
+  }, [destinationId]);
 
   const {
     permissionGranted,
@@ -116,29 +130,24 @@ export default function WalkingScreen() {
     resetOffRoute,
   } = useWalkingProgress(route);
 
-  // Compass. Called after useWalkingProgress so it can receive the
-  // position for GPS-derived heading fallback.
   const { heading } = useCompass({ position: rawPosition });
 
-  // Recompute the route from the student's live position, once,
-  // shortly after the walk starts. The route passed from preview was
-  // computed at whatever position the student was in when they
-  // tapped Take me there. By the time they're actually walking,
-  // they've moved, and the route may not align with where they are.
   useEffect(() => {
-    if (recomputedRef.current) return;
+    if (!destinationId) return;
+    if (recomputeAttemptsRef.current >= 3) return;
     if (!rawPosition) return;
+    if (!rawPosition.accuracyM || rawPosition.accuracyM > MAX_ACCURACY_M) {
+      return;
+    }
 
     const timer = setTimeout(() => {
-      if (recomputedRef.current) return;
       if (!rawPosition) return;
-
-      recomputedRef.current = true;
+      recomputeAttemptsRef.current += 1;
 
       computeRoute({
         fromLat: rawPosition.lat,
         fromLon: rawPosition.lon,
-        toPlaceId: Number(toId),
+        toPlaceId: destinationId,
       })
         .then((data) => {
           if (data) {
@@ -146,29 +155,17 @@ export default function WalkingScreen() {
             resetOffRoute();
           }
         })
-        .catch(() => {
-          // Keep the original route if recomputation fails.
-        });
+        .catch(() => {});
     }, RECOMPUTE_AFTER_MS);
 
     return () => clearTimeout(timer);
-  }, [rawPosition, toId, resetOffRoute]);
+  }, [rawPosition, destinationId, resetOffRoute]);
 
-  // Cache the current position so other screens can use it as a
-  // starting point without asking for location again.
-  useEffect(() => {
-    if (position) {
-      updateCachedPosition({ lat: position.lat, lon: position.lon });
-    }
-  }, [position]);
-
-  // Wi-Fi proximity.
   const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
     position,
     enabled: settings.wifiProximityEnabled,
   });
 
-  // Speak each instruction once when it becomes current.
   useEffect(() => {
     if (!settings.voiceEnabled) return;
     if (!currentStep) return;
@@ -178,28 +175,24 @@ export default function WalkingScreen() {
     });
   }, [currentStep, settings.voiceEnabled, settings.voiceRate]);
 
-  // Haptic pulse when the current step changes.
   useEffect(() => {
     if (!currentStep) return;
     if (currentStepIndex === 0) return;
     haptics.turnPulse();
   }, [currentStepIndex, currentStep]);
 
-  // Warning pulse when the student goes off-route.
   useEffect(() => {
     if (offRoute) {
       haptics.offRoutePulse();
     }
   }, [offRoute]);
 
-  // Stop speech when leaving the screen.
   useEffect(() => {
     return () => {
       tts.stop();
     };
   }, []);
 
-  // When the student arrives, go to the arrival screen.
   useEffect(() => {
     if (arrivedRef.current) return;
     if (!route) return;
@@ -208,12 +201,10 @@ export default function WalkingScreen() {
     haptics.arrivalPulse();
     router.replace({
       pathname: '/arrival',
-      params: { toId: String(toId) },
+      params: { toId: String(destinationId) },
     });
-  }, [distanceRemainingM, route, toId]);
+  }, [distanceRemainingM, route, destinationId]);
 
-  // Pick the approach photo whose bearing best matches the direction
-  // we're approaching from.
   const approachPhoto = (() => {
     if (approachPhotos.length === 0) return null;
     if (distanceRemainingM > APPROACH_PHOTO_DISTANCE_M) return null;
@@ -233,8 +224,6 @@ export default function WalkingScreen() {
     return closestApproachPhoto(approachPhotos, approachBearing);
   })();
 
-  // Bearing from the student's current position to the next step's
-  // location, or to the destination if on the last step.
   const bearing = (() => {
     if (!position || !route || !route.geometry || route.geometry.length < 2) {
       return null;
@@ -266,28 +255,30 @@ export default function WalkingScreen() {
 
   const handleRecalculate = useCallback(async () => {
     if (!position) return;
+    if (!destinationId) return;
     setBannerDismissed(false);
     setPhotoDismissed(false);
     resetOffRoute();
     tts.reset();
+    recomputeAttemptsRef.current = 0;
     try {
       const data = await computeRoute({
         fromLat: position.lat,
         fromLon: position.lon,
-        toPlaceId: Number(toId),
+        toPlaceId: destinationId,
       });
       setRoute(data);
-    } catch {
-      // Silent.
-    }
-  }, [position, toId, resetOffRoute]);
+    } catch {}
+  }, [position, destinationId, resetOffRoute]);
 
   const openChat = useCallback(() => {
     router.push({
       pathname: '/chat',
       params: {
-        fromPlaceId: fromId ? String(fromId) : '',
-        toPlaceId: String(toId),
+        fromPlaceId: routeRequestRef.current?.fromId
+          ? String(routeRequestRef.current.fromId)
+          : '',
+        toPlaceId: String(destinationId || ''),
         currentStepIndex: String(currentStepIndex ?? 0),
         distanceFromStartM: String(
           (route?.distance_m || 0) - distanceRemainingM
@@ -296,14 +287,7 @@ export default function WalkingScreen() {
         currentLon: position ? String(position.lon) : '',
       },
     });
-  }, [
-    fromId,
-    toId,
-    currentStepIndex,
-    route?.distance_m,
-    distanceRemainingM,
-    position,
-  ]);
+  }, [destinationId, currentStepIndex, route?.distance_m, distanceRemainingM, position]);
 
   if (loading) {
     return (
@@ -431,7 +415,7 @@ export default function WalkingScreen() {
       <ReportSheet
         visible={reportOpen}
         onClose={() => setReportOpen(false)}
-        placeId={Number(toId)}
+        placeId={destinationId ? Number(destinationId) : null}
       />
     </>
   );
