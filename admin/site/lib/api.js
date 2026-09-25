@@ -1,12 +1,4 @@
 // The admin site's API client.
-//
-// Every function here calls the local Next.js proxy at /api/proxy/*,
-// which forwards to the real backend with the admin key attached.
-// The browser never sees the backend URL or the admin key.
-//
-// Usage:
-//   import { api } from '@/lib/api';
-//   const places = await api.listPlaces();
 
 async function request(path, options = {}) {
   const url = '/api/proxy' + path;
@@ -19,16 +11,23 @@ async function request(path, options = {}) {
     },
   });
 
-  // 204 No Content — nothing to parse.
   if (response.status === 204) return null;
 
   if (!response.ok) {
     let detail = `Request failed (${response.status})`;
     try {
       const body = await response.json();
-      if (body && body.detail) detail = body.detail;
+      if (body && body.detail) {
+        if (Array.isArray(body.detail)) {
+          detail = body.detail
+            .map((e) => `${e.loc?.join('.') || 'field'}: ${e.msg}`)
+            .join('; ');
+        } else {
+          detail = body.detail;
+        }
+      }
     } catch {
-      // Not JSON. Keep the generic message.
+      // Not JSON.
     }
     throw new Error(detail);
   }
@@ -37,7 +36,7 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  // ---------- Stats / dashboard ----------
+  // ---------- Stats ----------
   getStats: () => request('/api/admin/stats'),
 
   // ---------- Places ----------
@@ -103,4 +102,9 @@ export const api = {
     }),
   deleteUser: (id) =>
     request(`/api/admin/users/${id}`, { method: 'DELETE' }),
+
+  // ---------- Knowledge base ----------
+  listKnowledgeDocuments: () => request('/api/admin/knowledge'),
+  deleteKnowledgeDocument: (id) =>
+    request(`/api/admin/knowledge/${id}`, { method: 'DELETE' }),
 };

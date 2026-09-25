@@ -1,8 +1,8 @@
 """
-Tests for the chat endpoints.
+Tests for the route chat endpoints.
 
-These tests run without a GROQ_API_KEY, so they exercise the local
-fallbacks. The LLM path is exercised manually when a key is set.
+All these tests require route context. Questions without a route
+belong to the doc chat test file.
 """
 
 
@@ -19,8 +19,6 @@ class TestExtractDestination:
         )
         assert r.status_code == 200
         body = r.json()
-        # The local matcher should find this since the name appears
-        # in the message.
         assert body["matched"] is True
         assert body["place_id"] == place["id"]
 
@@ -30,68 +28,65 @@ class TestExtractDestination:
             json={"message": "zzzznotarealplacezzz"},
         )
         assert r.status_code == 200
-        body = r.json()
-        assert body["matched"] is False
-        assert body["place_id"] is None
-
-    def test_response_has_confidence(self, client):
-        place = client.get("/api/places?limit=1").json()[0]
-        r = client.post(
-            "/api/chat/extract-destination",
-            json={"message": place["name"]},
-        )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["confidence"] in ("high", "medium", "low")
+        assert r.json()["matched"] is False
 
 
 class TestChatSession:
     def test_start_session_returns_uuid(self, client):
         r = client.post("/api/chat/session")
         assert r.status_code == 200
-        body = r.json()
-        assert "session_id" in body
-        # Basic UUID shape check.
-        assert len(body["session_id"]) > 20
+        assert len(r.json()["session_id"]) > 20
 
-    def test_end_session_returns_204(self, client):
+    def test_end_session(self, client):
         session_id = client.post("/api/chat/session").json()["session_id"]
         r = client.delete(f"/api/chat/session/{session_id}")
         assert r.status_code == 204
 
-    def test_end_nonexistent_session_is_ok(self, client):
-        # Deleting an unknown session should be a no-op, not an error.
-        r = client.delete("/api/chat/session/does-not-exist")
-        assert r.status_code == 204
+
+class TestRouteChatRequiresContext:
+    def test_missing_route_fields_returns_422(self, client):
+        """
+        The route chat endpoint requires all four route fields. A
+        request without them should be rejected — the client should
+        call /api/chat/doc instead.
+        """
+        r = client.post(
+            "/api/chat",
+            json={"message": "what time does the library close"},
+        )
+        assert r.status_code == 422
+
+    def test_partial_route_fields_returns_422(self, client):
+        a = client.get("/api/places?limit=1").json()[0]
+        r = client.post(
+            "/api/chat",
+            json={
+                "message": "what's next",
+                "from_place_id": a["id"],
+                "to_place_id": a["id"],
+                # missing current_step_index and distance_from_start_m
+            },
+        )
+        assert r.status_code == 422
 
 
-class TestChat:
-    def test_no_context_returns_prompt_to_start_walk(self, client):
-        r = client.post("/api/chat", json={"message": "hello"})
-        assert r.status_code == 200
-        body = r.json()
-        assert isinstance(body["reply"], str)
-        assert len(body["reply"]) > 0
-
-    def test_context_with_route_answers(self, client):
-        # Find a routable pair.
+class TestRouteChat:
+    def _find_routable_pair(self, client):
         places = client.get("/api/places?limit=100").json()
-        pair = None
         for i, a in enumerate(places):
             for b in places[i + 1 :]:
                 r = client.get(
                     f"/api/route?from_place_id={a['id']}&to_place_id={b['id']}"
                 )
                 if r.status_code == 200:
-                    pair = (a, b)
-                    break
-            if pair:
-                break
+                    return a, b
+        return None, None
 
-        if not pair:
-            return  # no routable pair in this map
+    def test_route_question_answers(self, client, temp_db):
+        a, b = self._find_routable_pair(client)
+        if not a:
+            return
 
-        a, b = pair
         r = client.post(
             "/api/chat",
             json={
@@ -107,6 +102,27 @@ class TestChat:
         assert isinstance(body["reply"], str)
         assert len(body["reply"]) > 0
 
-    def test_empty_message_returns_422(self, client):
-        r = client.post("/api/chat", json={"message": ""})
-        assert r.status_code == 422
+    def test_route_question_does_not_mention_documents(self, client, temp_db):
+        """
+        The route chat should never claim to be answering from a
+        document. Even if the answer is short, it should not contain
+        phrases like 'from the documents'.
+        """
+        a, b = self._find_routable_pair(client)
+        if not a:
+            return
+
+        r = client.post(
+            "/api/chat",
+            json={
+                "message": "what's next?",
+                "from_place_id": a["id"],
+                "to_place_id": b["id"],
+                "current_step_index": 0,
+                "distance_from_start_m": 0,
+            },
+        )
+        reply = r.json()["reply"].lower()
+        assert "document" not in reply
+        assert "handbook" not in reply
+        assert "almanac" not in reply

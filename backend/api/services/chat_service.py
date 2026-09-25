@@ -1,18 +1,13 @@
 """
 chat_service.py
 
-The two chat features:
+The route chat service. Answers questions about the walk the student
+is currently on, using the route timeline, the narration they heard,
+and the places near their current position.
 
-1. Destination extraction — turning "take me to the cafeteria near
-   the library" into a real place ID.
-
-2. In-walk questions — answering "what's that building on my left?"
-   grounded in three sources: the route timeline, the narration the
-   student already heard, and the places within walking distance of
-   their current position.
-
-Both prefer the LLM when available and fall back to local logic when
-it isn't.
+This service does not touch the knowledge base. University questions
+belong to chat_doc_service.py, and the two are deliberately separate
+so neither can accidentally answer from the other's source.
 """
 
 import json
@@ -52,10 +47,6 @@ Rules:
 
 
 def _build_place_list_for_prompt(session: Session, limit: int = 200) -> str:
-    """
-    Format the place list for the LLM prompt. Includes ids, names, and
-    categories, one per line.
-    """
     places = session.query(Place).limit(limit).all()
     lines = []
     for p in places:
@@ -69,10 +60,6 @@ def _build_place_list_for_prompt(session: Session, limit: int = 200) -> str:
 
 
 def _extract_destination_via_llm(session: Session, message: str):
-    """
-    Ask the LLM to pick a place. Returns (place_id, confidence) or
-    (None, None) if unavailable or no match.
-    """
     if not llm_client.is_available():
         return None, None
 
@@ -94,8 +81,6 @@ def _extract_destination_via_llm(session: Session, message: str):
     if response is None:
         return None, None
 
-    # The model was told to return JSON only. Strip any stray fences
-    # in case it added them anyway.
     cleaned = response.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -109,7 +94,6 @@ def _extract_destination_via_llm(session: Session, message: str):
     place_id = parsed.get("place_id")
     confidence = parsed.get("confidence", "medium")
 
-    # Validate the id exists.
     if place_id is not None:
         exists = session.query(Place).filter_by(id=place_id).one_or_none()
         if exists is None:
@@ -119,11 +103,6 @@ def _extract_destination_via_llm(session: Session, message: str):
 
 
 def _extract_destination_locally(session: Session, message: str):
-    """
-    Fallback destination extraction with no LLM. Splits the message
-    into words, keeps the meaningful ones, and does a substring match
-    against place names, alt_names, and name_sw.
-    """
     stop_words = {
         "take", "me", "to", "the", "a", "an", "go", "get", "find",
         "where", "is", "at", "in", "on", "near", "by", "next", "please",
@@ -158,12 +137,7 @@ def _extract_destination_locally(session: Session, message: str):
 
 
 def extract_destination(session: Session, message: str):
-    """
-    Turn a free-text destination into a place ID.
-
-    Prefers the LLM. Falls back to local fuzzy matching. Returns
-    (place_id, confidence) where place_id may be None.
-    """
+    """Turn free text into a place ID. Returns (place_id, confidence)."""
     if not message or not message.strip():
         return None, None
 
@@ -175,31 +149,23 @@ def extract_destination(session: Session, message: str):
 
 
 # ---------------------------------------------------------------------------
-# In-walk questions
+# Route question answering
 # ---------------------------------------------------------------------------
 
-_WALK_SYSTEM_PROMPT = """You are a walking companion helping a student navigate a campus.
+_ROUTE_SYSTEM_PROMPT = """You are a walking companion on a campus. The student is walking right now and asking about the walk.
 
-You will be given three things:
+You will be given:
+- The route timeline — every turn, path, junction, area, and the destination, with distances.
+- The narration the student already heard — the guide's own words.
+- Places near the student's current position.
 
-1. The route timeline — every turn, path, junction, area, and the destination, each with a distance marker, in order.
+Answer only from those three sources. Never invent a building, a landmark, a distance, or a fact about the university that isn't in the sources.
 
-2. The narration the student already heard — the guide's own words describing this walk. This is what the student remembers hearing.
+If the answer isn't in the sources, say so plainly. "I don't know that one" is a fine answer.
 
-3. Places near the student's current position — a list of named places within walking distance, with their distance and category.
+Keep it short — one or two sentences. The student is walking.
 
-You may use all three when answering. The three sources describe the same campus from different angles:
-- The timeline is exact and ordered.
-- The narration is conversational and phrased the way a guide speaks.
-- The nearby places list covers the surroundings beyond the route.
-
-Rules:
-- Answer only using the facts in those three sources. Never invent a building, a landmark, a distance, or a place that isn't in them.
-- If the answer isn't in the context, say so plainly. "I don't know that one" is a fine answer.
-- If the student asks about a place that's in the nearby list, use the distance from that list.
-- If they ask about something they just passed, check the timeline — earlier entries are behind them.
-- Keep it short — one or two sentences. The student is walking.
-- Be warm and conversational.
+Be warm and conversational. Plain prose only. No markdown.
 """
 
 
@@ -213,15 +179,6 @@ def _format_route_context(
     narration_text: str | None = None,
     nearby_places: list | None = None,
 ) -> str:
-    """
-    Format everything the chat model needs to answer a question about
-    the current walk.
-
-    Three blocks:
-      1. Route timeline — what's on this route.
-      2. Narration — the guide's own words.
-      3. Nearby places — what's around the student right now.
-    """
     lines = [
         f"Route: {start_name} → {end_name}",
         f"Total distance: {round(distance_m)}m",
@@ -245,7 +202,6 @@ def _format_route_context(
         lines.append("")
         lines.append("PLACES NEAR THE STUDENT RIGHT NOW:")
         for item in nearby_places:
-            # item is {name, distance_m, category}
             bits = [f"{item['name']} ({round(item['distance_m'])}m)"]
             if item.get("category"):
                 bits.append(f"[{item['category']}]")
@@ -255,10 +211,7 @@ def _format_route_context(
 
 
 def _answer_locally(events: list, current_step_index: int, question: str):
-    """
-    Fallback for when the LLM isn't available. Can only answer a
-    narrow set of things from the timeline.
-    """
+    """Fallback for when there's no LLM."""
     q = question.lower()
 
     if current_step_index < 0 or current_step_index >= len(events):
@@ -266,11 +219,13 @@ def _answer_locally(events: list, current_step_index: int, question: str):
 
     current = events[current_step_index]
 
-    if any(phrase in q for phrase in ["what's next", "whats next", "what now", "next step"]):
+    if any(
+        phrase in q
+        for phrase in ["what's next", "whats next", "what now", "next step"]
+    ):
         next_index = current_step_index + 1
         if next_index < len(events):
-            next_event = events[next_index]
-            return f"Next: {next_event[2]}"
+            return f"Next: {events[next_index][2]}"
         return "You're on the last step — keep going and you'll arrive."
 
     if any(phrase in q for phrase in ["where am i", "current step"]):
@@ -288,40 +243,32 @@ def _answer_locally(events: list, current_step_index: int, question: str):
     )
 
 
-def answer_walk_question(
-    question: str,
-    start_name: str,
-    end_name: str,
-    distance_m: float,
-    events: list,
-    current_step_index: int,
-    distance_from_start_m: float,
-    narration_text: str | None = None,
-    nearby_places: list | None = None,
-) -> str:
+def answer_route_question(question: str, route_context: dict) -> str:
     """
     Answer a question about the current walk.
 
-    Prefers the LLM, falls back to a small local responder. Always
-    returns a string — never raises.
+    route_context must have:
+        start_name, end_name, distance_m, events,
+        current_step_index, distance_from_start_m,
+        and optionally narration_text, nearby_places
     """
     if not question or not question.strip():
-        return "Ask me anything about this walk."
+        return "Ask me anything about the walk."
 
     if llm_client.is_available():
         context = _format_route_context(
-            start_name,
-            end_name,
-            distance_m,
-            events,
-            current_step_index,
-            distance_from_start_m,
-            narration_text=narration_text,
-            nearby_places=nearby_places,
+            start_name=route_context["start_name"],
+            end_name=route_context["end_name"],
+            distance_m=route_context["distance_m"],
+            events=route_context["events"],
+            current_step_index=route_context["current_step_index"],
+            distance_from_start_m=route_context["distance_from_start_m"],
+            narration_text=route_context.get("narration_text"),
+            nearby_places=route_context.get("nearby_places"),
         )
         response = llm_client.chat(
             [
-                {"role": "system", "content": _WALK_SYSTEM_PROMPT},
+                {"role": "system", "content": _ROUTE_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": f"{context}\n\nStudent asked: {question}",
@@ -333,4 +280,8 @@ def answer_walk_question(
         if response:
             return response.strip()
 
-    return _answer_locally(events, current_step_index, question)
+    return _answer_locally(
+        route_context["events"],
+        route_context["current_step_index"],
+        question,
+    )

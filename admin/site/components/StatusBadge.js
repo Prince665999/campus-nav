@@ -7,6 +7,10 @@ const VARIANTS = {
   ok: { bg: 'var(--success-bg)', color: 'var(--success)' },
   warning: { bg: 'var(--warning-bg)', color: 'var(--warning)' },
   error: { bg: 'var(--danger-bg)', color: 'var(--danger)' },
+  // Knowledge document statuses:
+  processing: { bg: 'var(--info-bg)', color: 'var(--primary)' },
+  ready: { bg: 'var(--success-bg)', color: 'var(--success)' },
+  failed: { bg: 'var(--danger-bg)', color: 'var(--danger)' },
 };
 
 export function StatusBadge({ status, children }) {

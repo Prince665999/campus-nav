@@ -1,12 +1,16 @@
 """
 chat.py
 
-Chat endpoints:
+Route chat endpoints:
 
   POST /api/chat/extract-destination
   POST /api/chat/session
   DELETE /api/chat/session/{id}
   POST /api/chat
+
+The route chat requires route context. It answers from the walk's
+timeline, narration, and nearby places only. University questions
+belong to /api/chat/doc.
 """
 
 import logging
@@ -39,7 +43,7 @@ NEARBY_LIMIT = 15
 
 
 def _history_key(session_id: str) -> str:
-    return f"chat:{session_id}"
+    return f"chat:route:{session_id}"
 
 
 def _load_history(session_id: str) -> list:
@@ -72,7 +76,6 @@ def extract_destination(
     body: ExtractDestinationRequest,
     session: Session = Depends(db_session),
 ):
-    """Turn free text into a place ID."""
     place_id, confidence = chat_service.extract_destination(session, body.message)
     return ExtractDestinationResponse(
         place_id=place_id,
@@ -88,19 +91,17 @@ def extract_destination(
 @router.post("/session", response_model=StartChatSessionResponse)
 @limiter.limit(RATE_LIMIT_CHAT)
 def start_session(request: Request):
-    """Start a new chat session."""
     return StartChatSessionResponse(session_id=str(uuid.uuid4()))
 
 
 @router.delete("/session/{session_id}", status_code=204)
 def end_session(session_id: str):
-    """End a chat session and discard its memory."""
     cache.delete(_history_key(session_id))
     return None
 
 
 # ---------------------------------------------------------------------------
-# In-walk chat
+# Route chat
 # ---------------------------------------------------------------------------
 
 @router.post("", response_model=ChatResponse)
@@ -110,11 +111,26 @@ def chat(
     body: ChatRequest,
     session: Session = Depends(db_session),
 ):
-    """Answer a question about the current walk."""
+    """
+    Answer a question about the current walk.
+    """
     session_id = body.session_id
     history = _load_history(session_id) if session_id else []
 
-    reply = _build_answer(body, session)
+    route_context = _build_route_context(body, session)
+    if route_context is None:
+        return ChatResponse(
+            reply=(
+                "I can't find that route anymore. Try starting the walk "
+                "again, or ask a general question in the Chat tab."
+            ),
+            session_id=session_id,
+        )
+
+    reply = chat_service.answer_route_question(
+        question=body.message,
+        route_context=route_context,
+    )
 
     if session_id:
         history.append({"role": "user", "content": body.message})
@@ -124,21 +140,7 @@ def chat(
     return ChatResponse(reply=reply, session_id=session_id)
 
 
-def _build_answer(body: ChatRequest, session: Session) -> str:
-    """Gather the three context sources and call the chat service."""
-    has_route_context = (
-        body.from_place_id is not None
-        and body.to_place_id is not None
-        and body.current_step_index is not None
-        and body.distance_from_start_m is not None
-    )
-
-    if not has_route_context:
-        return (
-            "I can help once you're on a route. Start a walk and ask "
-            "me about what you see."
-        )
-
+def _build_route_context(body: ChatRequest, session: Session) -> dict | None:
     try:
         from backend.core.campus_graph import a_star
 
@@ -157,33 +159,32 @@ def _build_answer(body: ChatRequest, session: Session) -> str:
             session, graph, nodes, place_id=body.to_place_id
         )
         if from_node is None or to_node is None:
-            return "I can't find that route anymore."
+            return None
 
         path, distance = a_star(graph, nodes, from_node, to_node)
         if not path:
-            return "That route isn't available right now."
+            return None
 
         _steps, events, _dest_pos = _build_events(
             path, nodes, edge_tags, graph, distance, from_name, to_name
         )
+
+        narration_text = _load_cached_narration(session, body)
+        nearby = _load_nearby_places(session, body.current_lat, body.current_lon)
+
+        return {
+            "start_name": from_name,
+            "end_name": to_name,
+            "distance_m": distance,
+            "events": events,
+            "current_step_index": body.current_step_index,
+            "distance_from_start_m": body.distance_from_start_m,
+            "narration_text": narration_text,
+            "nearby_places": nearby,
+        }
     except Exception as e:
-        logger.warning("Chat timeline rebuild failed: %s", e)
-        return "I couldn't reach the route right now. Try again in a moment."
-
-    narration_text = _load_cached_narration(session, body)
-    nearby = _load_nearby_places(session, body.current_lat, body.current_lon)
-
-    return chat_service.answer_walk_question(
-        question=body.message,
-        start_name=from_name,
-        end_name=to_name,
-        distance_m=distance,
-        events=events,
-        current_step_index=body.current_step_index,
-        distance_from_start_m=body.distance_from_start_m,
-        narration_text=narration_text,
-        nearby_places=nearby,
-    )
+        logger.warning("Route context rebuild failed: %s", e)
+        return None
 
 
 def _load_cached_narration(session: Session, body: ChatRequest) -> str | None:
@@ -248,13 +249,11 @@ def _load_nearby_places(
         for p in rows:
             d = haversine_m(lat, lon, p.lat, p.lon)
             if d <= NEARBY_RADIUS_M:
-                nearby.append(
-                    {
-                        "name": p.name,
-                        "distance_m": d,
-                        "category": p.category,
-                    }
-                )
+                nearby.append({
+                    "name": p.name,
+                    "distance_m": d,
+                    "category": p.category,
+                })
 
         nearby.sort(key=lambda x: x["distance_m"])
         return nearby[:NEARBY_LIMIT] or None

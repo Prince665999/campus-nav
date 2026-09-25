@@ -11,13 +11,12 @@ const NAV_ITEMS = [
   { href: '/report-queue', label: 'Reports', icon: 'flag' },
   { href: '/photo-manager', label: 'Photos', icon: 'camera' },
   { href: '/place-editor', label: 'Places', icon: 'pin' },
+  { href: '/knowledge', label: 'Knowledge', icon: 'book' },
   { href: '/route-tester', label: 'Route Tester', icon: 'compass' },
   { href: '/reimport-view', label: 'Re-import', icon: 'refresh' },
   { href: '/roles', label: 'Roles', icon: 'people' },
 ];
 
-// Minimal inline SVGs, one per icon. Sized 16, stroke-based, using
-// `currentColor` so they inherit the sidebar's text colour.
 function Icon({ name }) {
   const common = {
     width: 16,
@@ -65,6 +64,13 @@ function Icon({ name }) {
         <svg {...common}>
           <path d="M12 22s7-6 7-12a7 7 0 10-14 0c0 6 7 12 7 12z" />
           <circle cx="12" cy="10" r="2.5" />
+        </svg>
+      );
+    case 'book':
+      return (
+        <svg {...common}>
+          <path d="M4 4h8a4 4 0 014 4v12H8a4 4 0 00-4-4z" />
+          <path d="M20 4h-8a4 4 0 00-4 4v12h8a4 4 0 014-4z" />
         </svg>
       );
     case 'compass':
@@ -127,13 +133,7 @@ export function Sidebar() {
     >
       <div style={{ padding: '0 24px', marginBottom: 32 }}>
         <div style={{ fontSize: 18, fontWeight: 700 }}>Campus Nav</div>
-        <div
-          style={{
-            fontSize: 13,
-            color: 'var(--text-muted)',
-            marginTop: 2,
-          }}
-        >
+        <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 2 }}>
           Admin
         </div>
       </div>

@@ -21,6 +21,7 @@ from .rate_limit import limiter, rate_limit_exceeded_handler
 from .routers import (
     areas,
     chat,
+    chat_doc,
     favorites,
     health,
     media,
@@ -128,6 +129,7 @@ def create_app() -> FastAPI:
     app.include_router(reports.router)
     app.include_router(chat.router)
     app.include_router(wifi.router)
+    app.include_router(chat_doc.router)
 
     # Admin auth — NOT behind the guard, because login itself can't
     # require a session.

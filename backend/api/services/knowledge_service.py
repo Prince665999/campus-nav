@@ -29,6 +29,9 @@ import re
 import uuid
 from pathlib import Path
 
+import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
 import chromadb
 import pdfplumber
 
