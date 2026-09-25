@@ -19,9 +19,14 @@
     "searchPlaceholder": "Search a place or ask a question…",
     "recentTitle": "Recent",
     "favoritesTitle": "Favorites",
+    "frequentTitle": "Frequent",
     "categoriesTitle": "Browse",
     "nearbyTitle": "Near me",
-    "emptyHint": "Search for a place or browse categories below."
+    "emptyHint": "Search for a place or browse categories below.",
+    "exploreTitle": "Explore",
+    "exploreDescription": "Browse buildings, food, and services",
+    "chatTitle": "Campus Chat",
+    "chatDescription": "Ask about rules, history, and hours"
   },
   "start": {
     "title": "Where are you starting from?",
@@ -76,9 +81,13 @@
   "chat": {
     "title": "Chat",
     "titleWalk": "Ask about this walk",
+    "titleDoc": "Campus Chat",
     "greetingGeneral": "Hi! Ask me where you want to go — try \"take me to the library\".",
     "greetingWalk": "Ask me anything about this walk. I can tell you what's around and what's coming up.",
+    "greetingDoc": "Hi! Ask me about the university — its rules, history, opening hours, or anything else.",
     "placeholder": "Ask something…",
+    "placeholderWalk": "Ask about this walk…",
+    "placeholderDoc": "Ask about the university…",
     "send": "Send",
     "error": "Sorry, I couldn't reach the assistant. Try again in a moment.",
     "foundDestination": "Found it. Opening the route to {name}."

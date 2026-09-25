@@ -1,14 +1,13 @@
 // Chat screen.
 //
-// Two modes, decided by what the screen is opened with:
+// Two modes, decided by URL params:
 //
-//   - No route params: a general chat. The student can ask for a
-//     destination in free text ("take me to the cafeteria"), which
-//     navigates to the route preview.
+//   - No route params → document chat. Calls /api/chat/doc.
+//     The student is asking about the university.
 //
-//   - With route params (fromPlaceId, toPlaceId, currentStep, etc.):
-//     an in-walk chat. Questions are answered using the route
-//     timeline, the narration, and nearby places.
+//   - Route params present (fromPlaceId, toPlaceId, etc.) →
+//     route chat. Calls /api/chat. The student is walking and
+//     asking about the walk.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -27,18 +26,31 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ChatBubble } from '@/components/ChatBubble';
 import {
-  extractDestination,
-  sendChatMessage,
-  startChatSession,
-  endChatSession,
+  // Route chat
+  sendRouteChatMessage,
+  startRouteChatSession,
+  endRouteChatSession,
+  // Doc chat
+  sendDocChatMessage,
+  startDocChatSession,
+  endDocChatSession,
 } from '@/services/api';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 
+// Quick-prompt chips for the doc chat. Tapping one fills the input
+// with that question and sends it.
+const DOC_QUICK_PROMPTS = [
+  'When does the semester end?',
+  'What are the library hours?',
+  'How do I contact the dean?',
+  'What are the exam rules?',
+];
+
 export default function ChatScreen() {
   const params = useLocalSearchParams();
 
-  // The route context, if this chat was opened from a walk.
+  // Route context is present when opened from Walking Mode.
   const hasRouteContext = params.fromPlaceId && params.toPlaceId;
   const fromPlaceId = params.fromPlaceId ? Number(params.fromPlaceId) : null;
   const toPlaceId = params.toPlaceId ? Number(params.toPlaceId) : null;
@@ -58,12 +70,15 @@ export default function ChatScreen() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(null);
 
-  // Start a chat session on mount, end it on unmount.
+  // Start the right kind of session on mount.
   useEffect(() => {
     let cancelled = false;
     let startedSessionId = null;
 
-    startChatSession()
+    const start = hasRouteContext ? startRouteChatSession : startDocChatSession;
+    const end = hasRouteContext ? endRouteChatSession : endDocChatSession;
+
+    start()
       .then((data) => {
         if (!cancelled) {
           startedSessionId = data.session_id;
@@ -71,99 +86,79 @@ export default function ChatScreen() {
         }
       })
       .catch(() => {
-        // Session-less chat still works; memory just doesn't persist.
+        // Session-less chat still works, memory just doesn't persist.
       });
 
     return () => {
       cancelled = true;
       if (startedSessionId) {
-        endChatSession(startedSessionId).catch(() => {});
+        end(startedSessionId).catch(() => {});
       }
     };
-  }, []);
+  }, [hasRouteContext]);
 
   // Greeting, tailored to the mode.
   useEffect(() => {
     const greeting = hasRouteContext
       ? t('chat.greetingWalk')
-      : t('chat.greetingGeneral');
+      : t('chat.greetingDoc');
     setMessages([{ role: 'assistant', content: greeting }]);
   }, [hasRouteContext]);
 
-  const send = useCallback(async () => {
-    const message = input.trim();
-    if (!message || sending) return;
+  const send = useCallback(
+    async (messageOverride) => {
+      const message = (messageOverride ?? input).trim();
+      if (!message || sending) return;
 
-    setInput('');
-    setError(null);
-    setMessages((prev) => [...prev, { role: 'user', content: message }]);
-    setSending(true);
+      setInput('');
+      setError(null);
+      setMessages((prev) => [...prev, { role: 'user', content: message }]);
+      setSending(true);
 
-    try {
-      // Without a route context, try to interpret the message as a
-      // destination request first.
-      if (!hasRouteContext) {
-        const extracted = await extractDestination(message);
-        if (extracted.matched) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: 'assistant',
-              content: t('chat.foundDestination', {
-                name: `#${extracted.place_id}`,
-              }),
-            },
-          ]);
-          // Navigate to route preview.
-          router.push({
-            pathname: '/route-preview',
-            params: {
-              fromId: String(extracted.place_id === 1 ? 2 : 1), // temp "from"
-              toId: String(extracted.place_id),
-            },
+      try {
+        let response;
+        if (hasRouteContext) {
+          response = await sendRouteChatMessage({
+            message,
+            sessionId,
+            fromPlaceId,
+            toPlaceId,
+            currentStepIndex,
+            distanceFromStartM,
+            currentLat,
+            currentLon,
           });
-          setSending(false);
-          return;
+        } else {
+          response = await sendDocChatMessage({ message, sessionId });
         }
+
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: response.reply },
+        ]);
+      } catch (err) {
+        setError(err.message || t('common.error'));
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: t('chat.error') },
+        ]);
+      } finally {
+        setSending(false);
       }
-
-      // Otherwise, treat it as a chat question.
-      const response = await sendChatMessage({
-        message,
-        sessionId,
-        fromPlaceId,
-        toPlaceId,
-        currentStepIndex,
-        distanceFromStartM,
-        currentLat,
-        currentLon,
-      });
-
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: response.reply },
-      ]);
-    } catch (err) {
-      setError(err.message || t('common.error'));
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: t('chat.error') },
-      ]);
-    } finally {
-      setSending(false);
-    }
-  }, [
-    input,
-    sending,
-    sessionId,
-    hasRouteContext,
-    fromPlaceId,
-    toPlaceId,
-    currentStepIndex,
-    distanceFromStartM,
-    currentLat,
-    currentLon,
-  ]);
+    },
+    [
+      input,
+      sending,
+      sessionId,
+      hasRouteContext,
+      fromPlaceId,
+      toPlaceId,
+      currentStepIndex,
+      distanceFromStartM,
+      currentLat,
+      currentLon,
+    ]
+  );
 
   // Auto-scroll to the bottom when a new message arrives.
   useEffect(() => {
@@ -173,11 +168,13 @@ export default function ChatScreen() {
     return () => clearTimeout(timeout);
   }, [messages]);
 
+  const showQuickPrompts = !hasRouteContext && messages.length <= 1;
+
   return (
     <>
       <Stack.Screen
         options={{
-          title: hasRouteContext ? t('chat.titleWalk') : t('chat.title'),
+          title: hasRouteContext ? t('chat.titleWalk') : t('chat.titleDoc'),
         }}
       />
       <KeyboardAvoidingView
@@ -200,6 +197,30 @@ export default function ChatScreen() {
           ) : null}
         </ScrollView>
 
+        {/* Quick prompts for the doc chat, shown until the student
+            has asked something. */}
+        {showQuickPrompts ? (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.promptsRow}
+            style={styles.promptsScroll}
+          >
+            {DOC_QUICK_PROMPTS.map((prompt) => (
+              <TouchableOpacity
+                key={prompt}
+                style={styles.promptChip}
+                onPress={() => send(prompt)}
+                disabled={sending}
+                accessibilityRole="button"
+                accessibilityLabel={prompt}
+              >
+                <Text style={styles.promptText}>{prompt}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        ) : null}
+
         {error ? <Text style={styles.error}>{error}</Text> : null}
 
         <View
@@ -212,18 +233,23 @@ export default function ChatScreen() {
             style={styles.input}
             value={input}
             onChangeText={setInput}
-            placeholder={t('chat.placeholder')}
+            placeholder={
+              hasRouteContext ? t('chat.placeholderWalk') : t('chat.placeholderDoc')
+            }
             placeholderTextColor={COLORS.textFaint}
             multiline
             maxLength={500}
             editable={!sending}
             returnKeyType="send"
-            onSubmitEditing={send}
+            onSubmitEditing={() => send()}
             blurOnSubmit={false}
           />
           <TouchableOpacity
-            style={[styles.sendButton, (!input.trim() || sending) && styles.sendDisabled]}
-            onPress={send}
+            style={[
+              styles.sendButton,
+              (!input.trim() || sending) && styles.sendDisabled,
+            ]}
+            onPress={() => send()}
             disabled={!input.trim() || sending}
             accessibilityRole="button"
             accessibilityLabel={t('chat.send')}
@@ -250,6 +276,29 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.md,
     paddingVertical: SPACING.sm,
     alignItems: 'flex-start',
+  },
+  promptsScroll: {
+    flexGrow: 0,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.borderSubtle,
+  },
+  promptsRow: {
+    paddingHorizontal: SPACING.md,
+    paddingVertical: SPACING.sm,
+    gap: SPACING.sm,
+  },
+  promptChip: {
+    backgroundColor: COLORS.backgroundSubtle,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.pill,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    marginRight: SPACING.sm,
+  },
+  promptText: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.text,
   },
   error: {
     color: COLORS.danger,

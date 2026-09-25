@@ -28,8 +28,6 @@ async function request(path, options = {}) {
       try {
         const body = await response.json();
         if (body && body.detail) {
-          // FastAPI validation errors come back as an array of
-          // {loc, msg, type}. Flatten those into one readable line.
           if (Array.isArray(body.detail)) {
             detail = body.detail
               .map((e) => `${e.loc?.join('.') || 'field'}: ${e.msg}`)
@@ -39,7 +37,7 @@ async function request(path, options = {}) {
           }
         }
       } catch {
-        // Not JSON. Keep the generic message.
+        // Not JSON.
       }
       throw new Error(detail);
     }
@@ -78,20 +76,6 @@ export async function listPlaces({ q, category, lat, lon, radius_m, limit } = {}
 
 export async function getPlace(id) {
   return request(`/api/places/${id}`);
-}
-
-// ---------------------------------------------------------------
-// Areas
-// ---------------------------------------------------------------
-
-export async function listAreas({ q, category, landmark_only, limit } = {}) {
-  const params = new URLSearchParams();
-  if (q) params.set('q', q);
-  if (category) params.set('category', category);
-  if (landmark_only) params.set('landmark_only', 'true');
-  if (limit != null) params.set('limit', String(limit));
-  const qs = params.toString();
-  return request(`/api/areas${qs ? '?' + qs : ''}`);
 }
 
 // ---------------------------------------------------------------
@@ -137,24 +121,12 @@ export async function narrateRoute({
   live = false,
 }) {
   const params = new URLSearchParams();
-
-  // from_place_id and from_lat/from_lon are alternatives. Send
-  // whichever the caller provided. Never send the literal string
-  // "null" — that's what caused the 422.
-  if (fromPlaceId != null) {
-    params.set('from_place_id', String(fromPlaceId));
-  }
-  if (fromLat != null) {
-    params.set('from_lat', String(fromLat));
-  }
-  if (fromLon != null) {
-    params.set('from_lon', String(fromLon));
-  }
-
+  if (fromPlaceId != null) params.set('from_place_id', String(fromPlaceId));
+  if (fromLat != null) params.set('from_lat', String(fromLat));
+  if (fromLon != null) params.set('from_lon', String(fromLon));
   params.set('to_place_id', String(toPlaceId));
   params.set('lang', lang);
   params.set('live', String(live));
-
   return request(`/api/narrate?${params.toString()}`);
 }
 
@@ -218,7 +190,7 @@ export async function createReport({ kind, body, placeId, edgeId, photoUrl }) {
 }
 
 // ---------------------------------------------------------------
-// Chat
+// Route chat (in-walk questions)
 // ---------------------------------------------------------------
 
 export async function extractDestination(message) {
@@ -229,15 +201,15 @@ export async function extractDestination(message) {
   });
 }
 
-export async function startChatSession() {
+export async function startRouteChatSession() {
   return request('/api/chat/session', { method: 'POST' });
 }
 
-export async function endChatSession(sessionId) {
+export async function endRouteChatSession(sessionId) {
   return request(`/api/chat/session/${sessionId}`, { method: 'DELETE' });
 }
 
-export async function sendChatMessage({
+export async function sendRouteChatMessage({
   message,
   sessionId,
   fromPlaceId,
@@ -250,10 +222,10 @@ export async function sendChatMessage({
   const body = {
     message,
     session_id: sessionId || null,
-    from_place_id: fromPlaceId ?? null,
-    to_place_id: toPlaceId ?? null,
-    current_step_index: currentStepIndex ?? null,
-    distance_from_start_m: distanceFromStartM ?? null,
+    from_place_id: fromPlaceId,
+    to_place_id: toPlaceId,
+    current_step_index: currentStepIndex,
+    distance_from_start_m: distanceFromStartM,
     current_lat: currentLat ?? null,
     current_lon: currentLon ?? null,
   };
@@ -262,6 +234,35 @@ export async function sendChatMessage({
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+// ---------------------------------------------------------------
+// Doc chat (university questions)
+// ---------------------------------------------------------------
+
+export async function startDocChatSession() {
+  return request('/api/chat/doc/session', { method: 'POST' });
+}
+
+export async function endDocChatSession(sessionId) {
+  return request(`/api/chat/doc/session/${sessionId}`, { method: 'DELETE' });
+}
+
+export async function sendDocChatMessage({ message, sessionId }) {
+  const body = {
+    message,
+    session_id: sessionId || null,
+  };
+  return request('/api/chat/doc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function searchKnowledge(q, { topK = 5 } = {}) {
+  const params = new URLSearchParams({ q, top_k: String(topK) });
+  return request(`/api/chat/doc/search?${params.toString()}`);
 }
 
 // ---------------------------------------------------------------

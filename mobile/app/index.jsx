@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -13,10 +14,10 @@ import { router } from 'expo-router';
 import { SearchBar } from '@/components/SearchBar';
 import { PlaceCard } from '@/components/PlaceCard';
 import { CategoryChips } from '@/components/CategoryChips';
-import { StartingPointSheet } from '@/components/StartingPointSheet';
+import { FeatureCard } from '@/components/FeatureCard';
+import { RecentStrip } from '@/components/RecentStrip';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
-import { useStartingPoint } from '@/hooks/useStartingPoint';
 import {
   extractDestination,
   listPlaces,
@@ -26,6 +27,7 @@ import {
 import { t } from '@/i18n';
 import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
 import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
 
 export default function HomeScreen() {
   const { settings, loaded } = useSettings();
@@ -37,18 +39,9 @@ export default function HomeScreen() {
   const [favorites, setFavorites] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [resolvingStart, setResolvingStart] = useState(false);
 
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
-
-  const {
-    state: startState,
-    nearbyPlaces,
-    resolveStart,
-    choosePlace,
-    cancelPick,
-  } = useStartingPoint();
 
   // First launch: redirect to onboarding.
   useEffect(() => {
@@ -57,11 +50,11 @@ export default function HomeScreen() {
     }
   }, [loaded, settings.hasSeenOnboarding]);
 
-  // Load recents and favorites once on mount.
+  // Load recents and favorites on mount.
   useEffect(() => {
     let cancelled = false;
     Promise.all([
-      listRecents({ limit: 5 }).catch(() => []),
+      listRecents({ limit: 10 }).catch(() => []),
       listFavorites().catch(() => []),
     ]).then(([r, f]) => {
       if (!cancelled) {
@@ -105,54 +98,38 @@ export default function HomeScreen() {
     router.push(`/place/${place.id}`);
   }, []);
 
-  // Sentence-to-destination. Resolves a start, then navigates.
+  const openChat = useCallback(() => {
+    // No route context — this is the document chat.
+    router.push('/chat');
+  }, []);
+
+  const openExplore = useCallback(() => {
+    router.push('/explore');
+  }, []);
+
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
     if (text.split(/\s+/).length < 3) return;
 
-    setResolvingStart(true);
-
     try {
       const extracted = await extractDestination(text);
-      if (!extracted.matched) {
-        setResolvingStart(false);
-        return;
+      if (extracted.matched) {
+        const others = await listPlaces({ limit: 5 });
+        const from = others.find((p) => p.id !== extracted.place_id) || others[0];
+        if (!from) return;
+        router.push({
+          pathname: '/route-preview',
+          params: {
+            fromId: String(from.id),
+            toId: String(extracted.place_id),
+          },
+        });
       }
-
-      const start = await resolveStart({
-        destinationPlaceId: extracted.place_id,
-      });
-
-      if (!start) {
-        setResolvingStart(false);
-        return;
-      }
-
-      const params = {
-        toId: String(extracted.place_id),
-      };
-
-      if (start.lat != null && start.lon != null) {
-        params.fromLat = String(start.lat);
-        params.fromLon = String(start.lon);
-      } else if (start.placeId != null) {
-        params.fromId = String(start.placeId);
-      } else {
-        setResolvingStart(false);
-        return;
-      }
-
-      router.push({
-        pathname: '/route-preview',
-        params,
-      });
     } catch {
       // Silent.
-    } finally {
-      setResolvingStart(false);
     }
-  }, [query, resolveStart]);
+  }, [query]);
 
   const showSearchResults = isSearching;
 
@@ -166,103 +143,73 @@ export default function HomeScreen() {
         loading={loading && !error && isSearching}
       />
 
-      <CategoryChips selected={category} onSelect={setCategory} />
-
-      {error ? (
-        <View style={styles.state}>
-          <Text style={styles.errorText}>{error}</Text>
-        </View>
-      ) : showSearchResults ? (
-        results.length === 0 && !loading ? (
-          <View style={styles.state}>
-            <Text style={styles.emptyText}>{t('common.noResults')}</Text>
-          </View>
-        ) : (
-          <FlatList
-            data={results}
-            keyExtractor={(item) => String(item.id)}
-            renderItem={({ item }) => (
-              <PlaceCard place={item} onPress={() => openPlace(item)} />
-            )}
-            keyboardShouldPersistTaps="handled"
-            contentContainerStyle={styles.listContent}
-          />
-        )
-      ) : (
-        <FlatList
-          data={[{ key: 'sections' }]}
-          keyExtractor={(item) => item.key}
-          renderItem={() => (
-            <>
-              {recents.length > 0 ? (
-                <Section title={t('home.recentTitle')}>
-                  {recents.map((place) => (
-                    <PlaceCard
-                      key={`recent-${place.place_id}`}
-                      place={{
-                        id: place.place_id,
-                        name: place.name,
-                        name_sw: place.name_sw,
-                        category: place.category,
-                        location: place.location,
-                      }}
-                      onPress={() => openPlace({ id: place.place_id })}
-                    />
-                  ))}
-                </Section>
-              ) : null}
-
-              {favorites.length > 0 ? (
-                <Section title={t('home.favoritesTitle')}>
-                  {favorites.map((place) => (
-                    <PlaceCard
-                      key={`fav-${place.place_id}`}
-                      place={{
-                        id: place.place_id,
-                        name: place.name,
-                        name_sw: place.name_sw,
-                        category: place.category,
-                        location: place.location,
-                      }}
-                      onPress={() => openPlace({ id: place.place_id })}
-                      isFavorite
-                    />
-                  ))}
-                </Section>
-              ) : null}
-
-              {recents.length === 0 && favorites.length === 0 ? (
-                <View style={styles.state}>
-                  <Text style={styles.emptyText}>{t('home.emptyHint')}</Text>
-                </View>
-              ) : null}
-            </>
+      {showSearchResults ? (
+        // Search results replace the Home content.
+        <>
+          <CategoryChips selected={category} onSelect={setCategory} />
+          {error ? (
+            <View style={styles.state}>
+              <Text style={styles.errorText}>{error}</Text>
+            </View>
+          ) : results.length === 0 && !loading ? (
+            <View style={styles.state}>
+              <Text style={styles.emptyText}>{t('common.noResults')}</Text>
+            </View>
+          ) : (
+            <FlatList
+              data={results}
+              keyExtractor={(item) => String(item.id)}
+              renderItem={({ item }) => (
+                <PlaceCard place={item} onPress={() => openPlace(item)} />
+              )}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={styles.listContent}
+            />
           )}
-          contentContainerStyle={styles.listContent}
-        />
+          {loading && results.length === 0 ? (
+            <View style={styles.state}>
+              <ActivityIndicator color={COLORS.textMuted} />
+            </View>
+          ) : null}
+        </>
+      ) : (
+        // Default Home content.
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.scrollContent}
+        >
+          {/* Two feature cards */}
+          <View style={styles.featureRow}>
+            <FeatureCard
+              icon={ICONS.compass}
+              iconColor="#0d9488"
+              title={t('home.exploreTitle')}
+              description={t('home.exploreDescription')}
+              onPress={openExplore}
+            />
+            <FeatureCard
+              icon={ICONS.chat}
+              iconColor="#6366f1"
+              title={t('home.chatTitle')}
+              description={t('home.chatDescription')}
+              onPress={openChat}
+            />
+          </View>
+
+          {/* Recent and favorite places */}
+          <RecentStrip
+            recents={recents}
+            favorites={favorites}
+            onPress={openPlace}
+          />
+
+          {/* Category chips */}
+          <View style={styles.chipsWrapper}>
+            <Text style={styles.sectionTitle}>{t('home.categoriesTitle')}</Text>
+            <CategoryChips selected={null} onSelect={setCategory} />
+          </View>
+        </ScrollView>
       )}
-
-      {loading && results.length === 0 && isSearching ? (
-        <View style={styles.state}>
-          <ActivityIndicator color={COLORS.textMuted} />
-        </View>
-      ) : null}
-
-      <StartingPointSheet
-        visible={startState === 'needPick'}
-        places={nearbyPlaces}
-        onChoose={choosePlace}
-        onCancel={cancelPick}
-      />
-    </View>
-  );
-}
-
-function Section({ title, children }) {
-  return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{title}</Text>
-      {children}
     </View>
   );
 }
@@ -271,6 +218,30 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.backgroundSubtle,
+  },
+  scroll: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingBottom: SPACING.xl,
+  },
+  featureRow: {
+    flexDirection: 'row',
+    gap: SPACING.md,
+    paddingHorizontal: SPACING.md,
+    marginTop: SPACING.md,
+  },
+  chipsWrapper: {
+    marginTop: SPACING.md,
+  },
+  sectionTitle: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    paddingHorizontal: SPACING.md,
+    marginBottom: SPACING.sm,
   },
   state: {
     paddingVertical: 40,
@@ -288,18 +259,4 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   listContent: { paddingBottom: 32 },
-  section: {
-    marginTop: SPACING.md,
-    backgroundColor: COLORS.background,
-  },
-  sectionTitle: {
-    fontSize: FONT_SIZE.small,
-    color: COLORS.textMuted,
-    fontWeight: '600',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    paddingHorizontal: SPACING.md,
-    paddingTop: SPACING.md,
-    paddingBottom: SPACING.sm,
-  },
 });
