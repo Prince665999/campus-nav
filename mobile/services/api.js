@@ -25,6 +25,7 @@ async function request(path, options = {}) {
 
     if (!response.ok) {
       let detail = `Request failed (${response.status})`;
+      let code = null;
       try {
         const body = await response.json();
         if (body && body.detail) {
@@ -36,10 +37,13 @@ async function request(path, options = {}) {
             detail = body.detail;
           }
         }
+        if (body && body.code) code = body.code;
       } catch {
         // Not JSON.
       }
-      throw new Error(detail);
+      const err = new Error(detail);
+      err.code = code;
+      throw err;
     }
 
     return await response.json();
@@ -95,6 +99,7 @@ export async function computeRoute({
   toPlaceId,
   fromLat,
   fromLon,
+  fromAccuracyM,
   toLat,
   toLon,
 }) {
@@ -102,6 +107,9 @@ export async function computeRoute({
   if (fromPlaceId != null) params.set('from_place_id', String(fromPlaceId));
   if (fromLat != null) params.set('from_lat', String(fromLat));
   if (fromLon != null) params.set('from_lon', String(fromLon));
+  if (fromAccuracyM != null) {
+    params.set('from_accuracy_m', String(fromAccuracyM));
+  }
   if (toPlaceId != null) params.set('to_place_id', String(toPlaceId));
   if (toLat != null) params.set('to_lat', String(toLat));
   if (toLon != null) params.set('to_lon', String(toLon));

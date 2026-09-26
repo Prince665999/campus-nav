@@ -2,12 +2,6 @@
 errors.py
 
 Consistent error responses and exception handlers.
-
-Every error the API returns has the same JSON shape:
-    {"detail": "...", "code": "..."}
-
-That makes the mobile app's error handling one function instead of
-one per endpoint.
 """
 
 from fastapi import HTTPException, Request, status
@@ -25,14 +19,32 @@ class BadRequestError(HTTPException):
 
 
 class RouteNotFoundError(HTTPException):
-    """Used when A* returns no path between two points."""
-
     def __init__(self, detail: str = "No route found between those points"):
         super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
 
 
+class LocationTooFarError(HTTPException):
+    """
+    Used when a live GPS fix can't be confidently matched to a node on
+    the path network. This is a distinct error from RouteNotFoundError
+    because the cause is different: the fix is unreliable, not that no
+    path exists.
+    """
+
+    def __init__(
+        self,
+        detail: str = (
+            "Couldn't confidently place your location on the map. "
+            "Move to an open area and try again."
+        ),
+    ):
+        super().__init__(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=detail,
+        )
+
+
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Wrap FastAPI's HTTPException in our consistent shape."""
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail, "code": exc.__class__.__name__},
@@ -40,7 +52,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """Catch anything that isn't already an HTTPException."""
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error", "code": "InternalError"},

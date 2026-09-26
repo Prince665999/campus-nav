@@ -25,16 +25,12 @@ export default function RoutePreviewScreen() {
   const insets = useSafeAreaInsets();
   const { settings } = useSettings();
 
-  // Read the request from the module store on first render.
-  // We keep it in state so a re-render doesn't lose it.
   const [request] = useState(() => takeRouteRequest());
 
   const [route, setRoute] = useState(null);
   const [narration, setNarration] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  console.log('RoutePreview: request =', request);
 
   const hasFrom =
     request != null &&
@@ -60,10 +56,20 @@ export default function RoutePreviewScreen() {
           toPlaceId: request.toId,
           fromLat: request.fromLat,
           fromLon: request.fromLon,
+          fromAccuracyM: request.fromAccuracyM,
         });
         if (!cancelled) setRoute(data);
       } catch (err) {
-        if (!cancelled) setError(err.message || t('common.error'));
+        if (!cancelled) {
+          if (err.code === 'LocationTooFarError') {
+            setError(
+              "We couldn't confidently place your location. Move to an " +
+                'open area and try again, or pick a starting place.'
+            );
+          } else {
+            setError(err.message || t('common.error'));
+          }
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -103,17 +109,14 @@ export default function RoutePreviewScreen() {
   const startWalking = useCallback(() => {
     if (!route || !request) return;
 
-    // Re-publish the request so the walking screen can read it.
     setRouteRequest({
       fromLat: request.fromLat,
       fromLon: request.fromLon,
       fromId: request.fromId,
+      fromAccuracyM: request.fromAccuracyM,
       toId: request.toId,
     });
 
-    // The route geometry and other details are passed as params
-    // because they're large and Expo Router handles those fine
-    // (it's the negative decimals that break).
     router.push({
       pathname: '/walking',
       params: { routeJson: JSON.stringify(route) },

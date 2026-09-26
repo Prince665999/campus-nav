@@ -93,21 +93,20 @@ export default function PlaceDetailScreen() {
     }
   }, [favorited, placeId]);
 
-  const navigateToRoute = useCallback(
+    const navigateToRoute = useCallback(
     (start) => {
       if (start.lat != null && start.lon != null) {
         setRouteRequest({
           fromLat: start.lat,
           fromLon: start.lon,
+          fromAccuracyM: start.accuracyM,
           toId: place.id,
         });
-        console.log('navigateToRoute: from GPS', start.lat, start.lon, '→', place.id);
       } else if (start.placeId != null) {
         setRouteRequest({
           fromId: start.placeId,
           toId: place.id,
         });
-        console.log('navigateToRoute: from place', start.placeId, '→', place.id);
       } else {
         setError(t('start.couldNotResolve'));
         return;
