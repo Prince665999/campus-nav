@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # is either genuinely off-network or is a bad estimate (network-based
 # location, indoors, under cover). In both cases, the honest answer
 # is "we can't confidently place you," not "route from across campus."
-SNAP_MAX_DISTANCE_M = 60
+SNAP_MAX_DISTANCE_M = 40
 
 
 class UnreliableLocationError(Exception):
