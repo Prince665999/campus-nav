@@ -9910,12 +9910,6 @@ def require_admin(
 errors.py
 
 Consistent error responses and exception handlers.
-
-Every error the API returns has the same JSON shape:
-    {"detail": "...", "code": "..."}
-
-That makes the mobile app's error handling one function instead of
-one per endpoint.
 """
 
 from fastapi import HTTPException, Request, status
@@ -9933,14 +9927,32 @@ class BadRequestError(HTTPException):
 
 
 class RouteNotFoundError(HTTPException):
-    """Used when A* returns no path between two points."""
-
     def __init__(self, detail: str = "No route found between those points"):
         super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
 
 
+class LocationTooFarError(HTTPException):
+    """
+    Used when a live GPS fix can't be confidently matched to a node on
+    the path network. This is a distinct error from RouteNotFoundError
+    because the cause is different: the fix is unreliable, not that no
+    path exists.
+    """
+
+    def __init__(
+        self,
+        detail: str = (
+            "Couldn't confidently place your location on the map. "
+            "Move to an open area and try again."
+        ),
+    ):
+        super().__init__(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=detail,
+        )
+
+
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Wrap FastAPI's HTTPException in our consistent shape."""
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail, "code": exc.__class__.__name__},
@@ -9948,7 +9960,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """Catch anything that isn't already an HTTPException."""
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error", "code": "InternalError"},
@@ -12614,7 +12625,11 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from ..dependencies import db_session, graph
-from ..errors import BadRequestError, RouteNotFoundError
+from ..errors import (
+    BadRequestError,
+    LocationTooFarError,
+    RouteNotFoundError,
+)
 from ..schemas.route import RouteResponse
 from ..services import routing_service
 from ..services.graph_service import get_edge_tags, get_nodes
@@ -12624,10 +12639,11 @@ router = APIRouter(prefix="/api/route", tags=["route"])
 
 @router.get("", response_model=RouteResponse)
 def compute(
-    from_place_id: int | None = Query(None, description="Place ID to start from"),
+    from_place_id: int | None = Query(None),
     from_lat: float | None = Query(None, ge=-90, le=90),
     from_lon: float | None = Query(None, ge=-180, le=180),
-    to_place_id: int | None = Query(None, description="Place ID to end at"),
+    from_accuracy_m: float | None = Query(None, ge=0),
+    to_place_id: int | None = Query(None),
     to_lat: float | None = Query(None, ge=-90, le=90),
     to_lon: float | None = Query(None, ge=-180, le=180),
     session: Session = Depends(db_session),
@@ -12636,23 +12652,39 @@ def compute(
     """
     Compute a walking route.
 
-    Each endpoint is either a place_id OR a lat/lon pair. If neither
-    is given for an endpoint, a 400 is returned.
+    Each endpoint is either a place_id OR a lat/lon pair. The from
+    side may also include from_accuracy_m, the GPS fix's reported
+    accuracy in metres. When given, the backend uses it to decide
+    whether the fix is trustworthy enough to route from.
     """
-    from_ok = from_place_id is not None or (from_lat is not None and from_lon is not None)
-    to_ok = to_place_id is not None or (to_lat is not None and to_lon is not None)
-    if not from_ok:
-        raise BadRequestError("Either from_place_id or from_lat/from_lon is required")
-    if not to_ok:
-        raise BadRequestError("Either to_place_id or to_lat/to_lon is required")
-
-    result = routing_service.compute_route(
-        session, g, get_nodes(), get_edge_tags(),
-        from_place_id=from_place_id,
-        from_lat=from_lat, from_lon=from_lon,
-        to_place_id=to_place_id,
-        to_lat=to_lat, to_lon=to_lon,
+    from_ok = from_place_id is not None or (
+        from_lat is not None and from_lon is not None
     )
+    to_ok = to_place_id is not None or (
+        to_lat is not None and to_lon is not None
+    )
+    if not from_ok:
+        raise BadRequestError(
+            "Either from_place_id or from_lat/from_lon is required"
+        )
+    if not to_ok:
+        raise BadRequestError(
+            "Either to_place_id or to_lat/to_lon is required"
+        )
+
+    try:
+        result = routing_service.compute_route(
+            session, g, get_nodes(), get_edge_tags(),
+            from_place_id=from_place_id,
+            from_lat=from_lat,
+            from_lon=from_lon,
+            from_accuracy_m=from_accuracy_m,
+            to_place_id=to_place_id,
+            to_lat=to_lat,
+            to_lon=to_lon,
+        )
+    except routing_service.UnreliableLocationError:
+        raise LocationTooFarError()
 
     if result is None:
         raise RouteNotFoundError()
@@ -16060,17 +16092,11 @@ def update_status(session: Session, report_id: int, status: str) -> bool:
 routing_service.py
 
 Wraps campus_graph.a_star and generate_turn_by_turn for the /api/route
-endpoint. Checks the cache first, then computes if needed, then writes
-the result back.
-
-Cache layers, in order:
-  1. Redis, if available. Fastest.
-  2. The route_cache table, if the route is popular and was written
-     by a previous request.
-  3. Live computation via A*, if neither hit.
+endpoint. Checks the cache first, then computes.
 """
 
 import json
+import logging
 import math
 
 from sqlalchemy.orm import Session
@@ -16087,8 +16113,34 @@ from ..schemas.common import LatLon
 from ..schemas.route import RouteResponse, TurnStep
 from . import cache_service
 
+logger = logging.getLogger(__name__)
 
-def _find_nearest_node(graph, nodes, lat, lon):
+
+# The maximum distance, in metres, a live GPS fix is allowed to be
+# from the nearest path node before we refuse to route from it.
+#
+# A campus footpath network is dense — a student standing anywhere on
+# or beside a path is within 20-30 m of a node. Beyond 60 m, the fix
+# is either genuinely off-network or is a bad estimate (network-based
+# location, indoors, under cover). In both cases, the honest answer
+# is "we can't confidently place you," not "route from across campus."
+SNAP_MAX_DISTANCE_M = 40
+
+
+class UnreliableLocationError(Exception):
+    """
+    Raised when a live GPS fix is too far from any path node to trust.
+    The route endpoint catches this and returns a distinct error code
+    so the client can show a specific message.
+    """
+    pass
+
+
+def _find_nearest_node(graph, nodes, lat, lon, max_distance_m=None):
+    """
+    Return the node_id closest to (lat, lon). If max_distance_m is
+    given and the nearest node is further than that, return None.
+    """
     best_id = None
     best_dist = math.inf
     for node_id in graph:
@@ -16097,33 +16149,90 @@ def _find_nearest_node(graph, nodes, lat, lon):
         if d < best_dist:
             best_dist = d
             best_id = node_id
+
+    if max_distance_m is not None and best_dist > max_distance_m:
+        return None
     return best_id
 
 
-def _resolve_endpoint(session, graph, nodes, place_id=None, lat=None, lon=None):
+def _resolve_endpoint(
+    session,
+    graph,
+    nodes,
+    place_id=None,
+    lat=None,
+    lon=None,
+    accuracy_m=None,
+    is_live_fix=False,
+):
+    """
+    Return (node_id, display_name) for one endpoint.
+
+    When place_id is given, the coordinates come from the database —
+    an admin placed them deliberately, so no snap-distance limit is
+    applied.
+
+    When lat/lon are given and is_live_fix is True, this is a live
+    GPS position. A snap-distance limit is applied, and a fix that
+    can't be confidently placed raises UnreliableLocationError.
+    """
     if place_id is not None:
         place = session.query(Place).filter_by(id=place_id).one_or_none()
         if place is None:
             return None, None
         node_id = _find_nearest_node(graph, nodes, place.lat, place.lon)
         return node_id, place.name
+
     if lat is not None and lon is not None:
-        node_id = _find_nearest_node(graph, nodes, lat, lon)
+        if is_live_fix:
+            if accuracy_m is not None:
+                logger.info(
+                    "Routing from live fix at (%.5f, %.5f) accuracy %.1fm",
+                    lat, lon, accuracy_m,
+                )
+            node_id = _find_nearest_node(
+                graph, nodes, lat, lon, max_distance_m=SNAP_MAX_DISTANCE_M
+            )
+            if node_id is None:
+                raise UnreliableLocationError()
+        else:
+            node_id = _find_nearest_node(graph, nodes, lat, lon)
         return node_id, "your current location"
+
     return None, None
 
 
 def _compute_route_uncached(
-    session, graph, nodes, edge_tags,
-    from_place_id, from_lat, from_lon,
-    to_place_id, to_lat, to_lon,
-) -> RouteResponse | None:
-    """Compute a route without touching the cache."""
+    session,
+    graph,
+    nodes,
+    edge_tags,
+    from_place_id,
+    from_lat,
+    from_lon,
+    from_accuracy_m,
+    to_place_id,
+    to_lat,
+    to_lon,
+):
     from_node, from_name = _resolve_endpoint(
-        session, graph, nodes, from_place_id, from_lat, from_lon
+        session,
+        graph,
+        nodes,
+        place_id=from_place_id,
+        lat=from_lat,
+        lon=from_lon,
+        accuracy_m=from_accuracy_m,
+        is_live_fix=(from_place_id is None and from_lat is not None),
     )
     to_node, to_name = _resolve_endpoint(
-        session, graph, nodes, to_place_id, to_lat, to_lon
+        session,
+        graph,
+        nodes,
+        place_id=to_place_id,
+        lat=to_lat,
+        lon=to_lon,
+        is_live_fix=False,
     )
 
     if from_node is None or to_node is None:
@@ -16136,7 +16245,9 @@ def _compute_route_uncached(
         return None
 
     steps = generate_turn_by_turn(path, nodes)
-    geometry = [LatLon(lat=nodes[nid]["lat"], lon=nodes[nid]["lon"]) for nid in path]
+    geometry = [
+        LatLon(lat=nodes[nid]["lat"], lon=nodes[nid]["lon"]) for nid in path
+    ]
 
     return RouteResponse(
         distance_m=distance,
@@ -16155,35 +16266,32 @@ def _compute_route_uncached(
     )
 
 
-def _route_to_dict(route: RouteResponse) -> dict:
-    """Serialise a RouteResponse to the dict shape the cache stores."""
+def _route_to_dict(route):
     return route.model_dump(mode="json")
 
 
-def _dict_to_route(data: dict) -> RouteResponse:
-    """Deserialise the cached dict back into a RouteResponse."""
+def _dict_to_route(data):
     return RouteResponse.model_validate(data)
 
 
 def compute_route(
-    session: Session,
+    session,
     graph,
     nodes,
     edge_tags,
     from_place_id=None,
     from_lat=None,
     from_lon=None,
+    from_accuracy_m=None,
     to_place_id=None,
     to_lat=None,
     to_lon=None,
-) -> RouteResponse | None:
+):
     """
-    Compute a route, checking the cache first.
+    Compute a route. Shortest distance.
 
-    Only routes between two place IDs are cached. Coordinate-based
-    routes (used for recalculation) fall straight through to
-    computation, because the coordinate varies and caching per
-    coordinate would create too many keys.
+    Live GPS fixes are checked against SNAP_MAX_DISTANCE_M — a fix
+    too far from any path node raises UnreliableLocationError.
     """
     cacheable = (
         from_place_id is not None
@@ -16197,22 +16305,18 @@ def compute_route(
     if not cacheable:
         return _compute_route_uncached(
             session, graph, nodes, edge_tags,
-            from_place_id, from_lat, from_lon,
+            from_place_id, from_lat, from_lon, from_accuracy_m,
             to_place_id, to_lat, to_lon,
         )
 
-    # ---- Redis cache check ----
     key = cache_service.route_key(from_place_id, to_place_id)
     cached = cache_service.get_cached_route(key)
     if cached is not None:
         try:
             return _dict_to_route(cached)
         except Exception:
-            # Cached data doesn't match the current schema. Ignore
-            # it and recompute.
             pass
 
-    # ---- Durable cache check ----
     row = (
         session.query(RouteCache)
         .filter_by(
@@ -16225,24 +16329,19 @@ def compute_route(
     if row is not None:
         try:
             route = _dict_to_route(json.loads(row.path_json))
-            # Refresh the Redis copy so the next request hits the
-            # fast layer.
             cache_service.set_cached_route(key, _route_to_dict(route))
             return route
         except Exception:
-            # Corrupt or stale row. Fall through to computation.
             pass
 
-    # ---- Compute ----
     route = _compute_route_uncached(
         session, graph, nodes, edge_tags,
-        from_place_id, from_lat, from_lon,
+        from_place_id, from_lat, from_lon, from_accuracy_m,
         to_place_id, to_lat, to_lon,
     )
     if route is None:
         return None
 
-    # ---- Write back ----
     route_dict = _route_to_dict(route)
     cache_service.set_cached_route(key, route_dict)
     _upsert_durable_cache(session, from_place_id, to_place_id, route_dict)
@@ -16251,15 +16350,11 @@ def compute_route(
 
 
 def _upsert_durable_cache(
-    session: Session,
-    from_place_id: int,
-    to_place_id: int,
-    route_dict: dict,
+    session,
+    from_place_id,
+    to_place_id,
+    route_dict,
 ):
-    """
-    Write a row to route_cache, or increment its hit_count if the
-    row exists.
-    """
     existing = (
         session.query(RouteCache)
         .filter_by(
@@ -24255,21 +24350,20 @@ export default function PlaceDetailScreen() {
     }
   }, [favorited, placeId]);
 
-  const navigateToRoute = useCallback(
+    const navigateToRoute = useCallback(
     (start) => {
       if (start.lat != null && start.lon != null) {
         setRouteRequest({
           fromLat: start.lat,
           fromLon: start.lon,
+          fromAccuracyM: start.accuracyM,
           toId: place.id,
         });
-        console.log('navigateToRoute: from GPS', start.lat, start.lon, '→', place.id);
       } else if (start.placeId != null) {
         setRouteRequest({
           fromId: start.placeId,
           toId: place.id,
         });
-        console.log('navigateToRoute: from place', start.placeId, '→', place.id);
       } else {
         setError(t('start.couldNotResolve'));
         return;
@@ -24577,16 +24671,12 @@ export default function RoutePreviewScreen() {
   const insets = useSafeAreaInsets();
   const { settings } = useSettings();
 
-  // Read the request from the module store on first render.
-  // We keep it in state so a re-render doesn't lose it.
   const [request] = useState(() => takeRouteRequest());
 
   const [route, setRoute] = useState(null);
   const [narration, setNarration] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  console.log('RoutePreview: request =', request);
 
   const hasFrom =
     request != null &&
@@ -24612,10 +24702,20 @@ export default function RoutePreviewScreen() {
           toPlaceId: request.toId,
           fromLat: request.fromLat,
           fromLon: request.fromLon,
+          fromAccuracyM: request.fromAccuracyM,
         });
         if (!cancelled) setRoute(data);
       } catch (err) {
-        if (!cancelled) setError(err.message || t('common.error'));
+        if (!cancelled) {
+          if (err.code === 'LocationTooFarError') {
+            setError(
+              "We couldn't confidently place your location. Move to an " +
+                'open area and try again, or pick a starting place.'
+            );
+          } else {
+            setError(err.message || t('common.error'));
+          }
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -24655,17 +24755,14 @@ export default function RoutePreviewScreen() {
   const startWalking = useCallback(() => {
     if (!route || !request) return;
 
-    // Re-publish the request so the walking screen can read it.
     setRouteRequest({
       fromLat: request.fromLat,
       fromLon: request.fromLon,
       fromId: request.fromId,
+      fromAccuracyM: request.fromAccuracyM,
       toId: request.toId,
     });
 
-    // The route geometry and other details are passed as params
-    // because they're large and Expo Router handles those fine
-    // (it's the negative decimals that break).
     router.push({
       pathname: '/walking',
       params: { routeJson: JSON.stringify(route) },
@@ -28270,8 +28367,8 @@ export function useNearbyWifi({ position, enabled }) {
 // Determines where a route should start from.
 //
 // There is no cache. Every "Take me there" gets a fresh GPS fix.
-// If the fix fails, the student is told and offered a retry, or the
-// option to pick a starting place from a list.
+// The fix's accuracy is carried through so the backend can decide
+// whether it's trustworthy enough to route from.
 
 import { useCallback, useRef, useState } from 'react';
 
@@ -28300,7 +28397,6 @@ export function useStartingPoint() {
   }, []);
 
   const choosePlace = useCallback((place) => {
-    console.log('useStartingPoint: choosePlace', place.id, place.name);
     const chosen = { placeId: place.id, placeName: place.name };
     setStart(chosen);
     setState('idle');
@@ -28321,59 +28417,51 @@ export function useStartingPoint() {
   }, []);
 
   const resolveStart = useCallback(async ({ destinationPlaceId } = {}) => {
-    console.log('resolveStart: called, destinationPlaceId =', destinationPlaceId);
     setLastError(null);
 
-    // 1. Permission.
     setState('locating');
     let granted = false;
     try {
       granted = await requestPermission();
-      console.log('resolveStart: permission granted =', granted);
-    } catch (err) {
-      console.log('resolveStart: permission error =', err.message);
+    } catch {
       setLastError('permission_error');
       setState('idle');
       return null;
     }
 
     if (!granted) {
-      console.log('resolveStart: permission denied, returning null');
       setLastError('permission_denied');
       setState('idle');
       return null;
     }
 
-    // 2. Fresh GPS fix.
-    console.log('resolveStart: requesting position with timeout', GPS_TIMEOUT_MS);
     try {
       const fresh = await getPositionOnce({ timeoutMs: GPS_TIMEOUT_MS });
-      console.log('resolveStart: fresh fix =', fresh);
       if (fresh) {
-        const result = { lat: fresh.lat, lon: fresh.lon };
+        const result = {
+          lat: fresh.lat,
+          lon: fresh.lon,
+          accuracyM: fresh.accuracyM,
+        };
         setStart(result);
         setState('idle');
         return result;
       }
-    } catch (err) {
-      console.log('resolveStart: getPositionOnce error =', err.message);
+    } catch {
+      // Fall through to the picker.
     }
 
-    // 3. No fix. Offer the picker.
-    console.log('resolveStart: no fix, opening picker');
     setLastError('no_fix');
     setState('needPick');
     try {
       const places = await listPlaces({ limit: 20 });
       const filtered = places.filter((p) => p.id !== destinationPlaceId);
-      console.log('resolveStart: picker loaded', filtered.length, 'places');
       setNearbyPlaces(filtered);
     } catch {
       setNearbyPlaces([]);
     }
 
     return new Promise((resolve) => {
-      console.log('resolveStart: awaiting picker selection');
       pendingResolverRef.current = resolve;
     });
   }, []);
@@ -28411,6 +28499,18 @@ import {
   progressFraction,
 } from '@/utils/progress';
 
+// GPS fixes above this accuracy are ignored for display purposes —
+// they're usually network-based estimates, not real GPS, and they
+// would jump the dot to a wrong spot. 40 m is generous enough to
+// accept every real GPS fix while rejecting the 80–100+ m network
+// fallbacks.
+const MAX_DISPLAY_ACCURACY_M = 40;
+
+// If no good fix has arrived in this many milliseconds, accept the
+// best available fix even if it's above the accuracy threshold.
+// Without this, walking under cover would freeze the dot entirely.
+const STALE_FIX_MS = 8000;
+
 export function useWalkingProgress(route) {
   const [permissionGranted, setPermissionGranted] = useState(null);
   const [rawPosition, setRawPosition] = useState(null);
@@ -28420,8 +28520,12 @@ export function useWalkingProgress(route) {
 
   const detectorRef = useRef(createOffRouteDetector());
 
-  // The current route geometry. Kept in a ref so the location
-  // callback reads the latest without the subscription effect
+  // Track the last time a good fix was accepted. Used by the stale
+  // fallback above.
+  const lastGoodFixAtRef = useRef(0);
+
+  // The current route geometry, kept in a ref so the location
+  // callback always reads the latest without the subscription effect
   // depending on the route object.
   const geometryRef = useRef(null);
 
@@ -28449,14 +28553,14 @@ export function useWalkingProgress(route) {
     route.geometry.length > 1
   );
 
-  // Subscribe to GPS updates. This effect depends only on whether
-  // a geometry exists, not on the route object itself — so a
-  // recompute doesn't tear down the subscription.
+  // Subscribe to GPS updates. Depends only on whether a geometry
+  // exists, not on the route object itself.
   useEffect(() => {
     if (!permissionGranted) return;
     if (!hasGeometry) return;
 
     detectorRef.current.reset();
+    lastGoodFixAtRef.current = Date.now();
 
     let cancelled = false;
     let stopFn = null;
@@ -28464,6 +28568,18 @@ export function useWalkingProgress(route) {
     watchLocation(
       (loc) => {
         if (cancelled) return;
+
+        // Quality gate: skip fixes whose accuracy is worse than the
+        // threshold, unless nothing good has arrived for a while.
+        const now = Date.now();
+        const isGoodFix =
+          loc.accuracyM != null && loc.accuracyM <= MAX_DISPLAY_ACCURACY_M;
+        const isStale = now - lastGoodFixAtRef.current > STALE_FIX_MS;
+
+        if (!isGoodFix && !isStale) {
+          return;
+        }
+        lastGoodFixAtRef.current = now;
 
         setRawPosition({
           lat: loc.lat,
@@ -28484,8 +28600,7 @@ export function useWalkingProgress(route) {
         setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
       },
       () => {
-        // Ignore errors. The subscription stays alive and may
-        // deliver updates again later.
+        // Location error. Subscription stays alive.
       }
     ).then((fn) => {
       if (cancelled) {
@@ -28503,7 +28618,7 @@ export function useWalkingProgress(route) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionGranted, hasGeometry]);
 
-  // When the route object changes, reset the detector.
+  // Reset the detector when the route object changes.
   useEffect(() => {
     detectorRef.current.reset();
     setOffRoute(false);
@@ -45337,6 +45452,7 @@ async function request(path, options = {}) {
 
     if (!response.ok) {
       let detail = `Request failed (${response.status})`;
+      let code = null;
       try {
         const body = await response.json();
         if (body && body.detail) {
@@ -45348,10 +45464,13 @@ async function request(path, options = {}) {
             detail = body.detail;
           }
         }
+        if (body && body.code) code = body.code;
       } catch {
         // Not JSON.
       }
-      throw new Error(detail);
+      const err = new Error(detail);
+      err.code = code;
+      throw err;
     }
 
     return await response.json();
@@ -45407,6 +45526,7 @@ export async function computeRoute({
   toPlaceId,
   fromLat,
   fromLon,
+  fromAccuracyM,
   toLat,
   toLon,
 }) {
@@ -45414,6 +45534,9 @@ export async function computeRoute({
   if (fromPlaceId != null) params.set('from_place_id', String(fromPlaceId));
   if (fromLat != null) params.set('from_lat', String(fromLat));
   if (fromLon != null) params.set('from_lon', String(fromLon));
+  if (fromAccuracyM != null) {
+    params.set('from_accuracy_m', String(fromAccuracyM));
+  }
   if (toPlaceId != null) params.set('to_place_id', String(toPlaceId));
   if (toLat != null) params.set('to_lat', String(toLat));
   if (toLon != null) params.set('to_lon', String(toLon));
@@ -45937,28 +46060,30 @@ export function stopWatching() {
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\routeRequest.js ---
 
-// A tiny module-level store for the "from" coordinates between
-// screens.
+// A module-level store for the "from" coordinates between screens.
 //
 // Why not URL params: Expo Router's param serialization can lose or
 // mangle negative decimals like "-8.9403215" (a latitude). Passing
 // them through a module variable is deterministic and doesn't depend
 // on how the router encodes strings.
-//
-// A request older than 30 seconds is treated as stale — that covers
-// the case where the user navigates away and back before the route
-// preview mounts.
 
 let _pending = null;
 
 const STALE_MS = 30000;
 
-export function setRouteRequest({ fromLat, fromLon, fromId, toId }) {
+export function setRouteRequest({
+  fromLat,
+  fromLon,
+  fromId,
+  toId,
+  fromAccuracyM,
+}) {
   _pending = {
     fromLat: fromLat != null ? Number(fromLat) : null,
     fromLon: fromLon != null ? Number(fromLon) : null,
     fromId: fromId != null ? Number(fromId) : null,
     toId: toId != null ? Number(toId) : null,
+    fromAccuracyM: fromAccuracyM != null ? Number(fromAccuracyM) : null,
     timestamp: Date.now(),
   };
 }

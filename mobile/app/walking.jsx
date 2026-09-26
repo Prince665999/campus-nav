@@ -30,18 +30,17 @@ import { bearingDeg } from '@/utils/geo';
 import { t, ttsLanguageForCurrentLang } from '@/i18n';
 import { COLORS, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
+import {
+  RECOMPUTE_AFTER_MS,
+  RECOMPUTE_MAX_ACCURACY_M,
+} from '@/constants/config';
 
 const APPROACH_PHOTO_DISTANCE_M = 60;
 const ARRIVAL_DISTANCE_M = 15;
-const RECOMPUTE_AFTER_MS = 2000;
-const MAX_ACCURACY_M = 50;
 
 export default function WalkingScreen() {
   const { routeJson } = useLocalSearchParams();
 
-  // Read the route request from the store. This gives us the real
-  // destination and, if the route was computed from a place, the
-  // from-place id.
   const routeRequestRef = useRef(takeRouteRequest());
 
   const [route, setRoute] = useState(() => {
@@ -67,7 +66,6 @@ export default function WalkingScreen() {
 
   const { settings } = useSettings();
 
-  // The destination id — either from the store or from routeJson.
   const destinationId = routeRequestRef.current?.toId ?? null;
 
   // Load the route if it wasn't passed in.
@@ -85,6 +83,7 @@ export default function WalkingScreen() {
           fromPlaceId: req?.fromId ?? null,
           fromLat: req?.fromLat ?? null,
           fromLon: req?.fromLon ?? null,
+          fromAccuracyM: req?.fromAccuracyM ?? null,
           toPlaceId: destinationId,
         });
         setRoute(data);
@@ -136,7 +135,10 @@ export default function WalkingScreen() {
     if (!destinationId) return;
     if (recomputeAttemptsRef.current >= 3) return;
     if (!rawPosition) return;
-    if (!rawPosition.accuracyM || rawPosition.accuracyM > MAX_ACCURACY_M) {
+    if (
+      !rawPosition.accuracyM ||
+      rawPosition.accuracyM > RECOMPUTE_MAX_ACCURACY_M
+    ) {
       return;
     }
 
@@ -147,6 +149,7 @@ export default function WalkingScreen() {
       computeRoute({
         fromLat: rawPosition.lat,
         fromLon: rawPosition.lon,
+        fromAccuracyM: rawPosition.accuracyM,
         toPlaceId: destinationId,
       })
         .then((data) => {
@@ -265,11 +268,12 @@ export default function WalkingScreen() {
       const data = await computeRoute({
         fromLat: position.lat,
         fromLon: position.lon,
+        fromAccuracyM: rawPosition?.accuracyM ?? null,
         toPlaceId: destinationId,
       });
       setRoute(data);
     } catch {}
-  }, [position, destinationId, resetOffRoute]);
+  }, [position, rawPosition, destinationId, resetOffRoute]);
 
   const openChat = useCallback(() => {
     router.push({

@@ -3,17 +3,20 @@ narrate.py
 
 GET /api/narrate — produce spoken narration for a route.
 
-Accepts either a place ID or coordinates for the from endpoint, so a
-route that started from the student's GPS position can still be
-narrated. The route endpoint already accepted both; this brings
-narration to the same shape.
+Accepts either a place ID or coordinates for the from endpoint. When
+coordinates are given, the same snap-distance limit that /api/route
+applies is applied here too.
 """
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from ..dependencies import db_session, graph
-from ..errors import BadRequestError, RouteNotFoundError
+from ..errors import (
+    BadRequestError,
+    LocationTooFarError,
+    RouteNotFoundError,
+)
 from ..rate_limit import limiter
 from ..schemas.narration import NarrationResponse
 from ..services import narration_service
@@ -30,6 +33,7 @@ def narrate(
     from_place_id: int | None = Query(None, description="Place ID to start from"),
     from_lat: float | None = Query(None, ge=-90, le=90),
     from_lon: float | None = Query(None, ge=-180, le=180),
+    from_accuracy_m: float | None = Query(None, ge=0),
     to_place_id: int = Query(..., description="Place ID to end at"),
     lang: str = Query("en", description="Language code: en or sw"),
     live: bool = Query(
@@ -46,8 +50,7 @@ def narrate(
     Produce narration for the route between two points.
 
     The from endpoint is either a place ID or a lat/lon pair. The to
-    endpoint is always a place ID — you narrate to a destination, not
-    to a coordinate.
+    endpoint is always a place ID.
     """
     from_ok = from_place_id is not None or (
         from_lat is not None and from_lon is not None
@@ -57,15 +60,19 @@ def narrate(
             "Either from_place_id or from_lat/from_lon is required"
         )
 
-    result = narration_service.narrate_route(
-        session, g, get_nodes(), get_edge_tags(),
-        from_place_id=from_place_id,
-        from_lat=from_lat,
-        from_lon=from_lon,
-        to_place_id=to_place_id,
-        lang=lang,
-        live=live,
-    )
+    try:
+        result = narration_service.narrate_route(
+            session, g, get_nodes(), get_edge_tags(),
+            from_place_id=from_place_id,
+            from_lat=from_lat,
+            from_lon=from_lon,
+            from_accuracy_m=from_accuracy_m,
+            to_place_id=to_place_id,
+            lang=lang,
+            live=live,
+        )
+    except narration_service.UnreliableLocationError:
+        raise LocationTooFarError()
 
     if result is None:
         raise RouteNotFoundError(
