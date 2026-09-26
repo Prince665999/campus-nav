@@ -37,6 +37,7 @@
   "private": true,
   "devDependencies": {
     "@eslint/js": "^9.39.5",
+    "@expo/ngrok": "^4.1.0",
     "@testing-library/react-native": "^14.0.1",
     "eslint": "^9.39.5",
     "eslint-config-expo": "^57.0.2",

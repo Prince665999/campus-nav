@@ -1,10 +1,10 @@
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://localhost:8000';
+const DEFAULT_API_BASE_URL = 'https://susan-electro-tough-arrested.trycloudflare.com';
 
 export const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
+process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
 
 export const API_TIMEOUT_MS = 15000;
 
