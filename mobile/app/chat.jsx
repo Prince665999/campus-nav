@@ -5,9 +5,9 @@
 //   - No route params → document chat. Calls /api/chat/doc.
 //     The student is asking about the university.
 //
-//   - Route params present (fromPlaceId, toPlaceId, etc.) →
-//     route chat. Calls /api/chat. The student is walking and
-//     asking about the walk.
+//   - Route params present (a from-place OR from-coordinates, plus a
+//     destination and step index) → route chat. Calls /api/chat. The
+//     student is walking and asking about the walk.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -50,16 +50,46 @@ const DOC_QUICK_PROMPTS = [
 export default function ChatScreen() {
   const params = useLocalSearchParams();
 
-  // Route context is present when opened from Walking Mode.
-  const hasRouteContext = params.fromPlaceId && params.toPlaceId;
-  const fromPlaceId = params.fromPlaceId ? Number(params.fromPlaceId) : null;
-  const toPlaceId = params.toPlaceId ? Number(params.toPlaceId) : null;
+  // Route context: a from-place OR from-coordinates, plus a
+  // destination. A place-started walk sends fromPlaceId; a
+  // GPS-started walk sends fromLat/fromLon. Both are valid.
+  const fromPlaceId =
+    params.fromPlaceId && params.fromPlaceId !== ''
+      ? Number(params.fromPlaceId)
+      : null;
+  const fromLat =
+    params.fromLat && params.fromLat !== '' ? Number(params.fromLat) : null;
+  const fromLon =
+    params.fromLon && params.fromLon !== '' ? Number(params.fromLon) : null;
+  const toPlaceId =
+    params.toPlaceId && params.toPlaceId !== ''
+      ? Number(params.toPlaceId)
+      : null;
   const currentStepIndex =
-    params.currentStepIndex != null ? Number(params.currentStepIndex) : null;
+    params.currentStepIndex != null && params.currentStepIndex !== ''
+      ? Number(params.currentStepIndex)
+      : 0;
   const distanceFromStartM =
-    params.distanceFromStartM != null ? Number(params.distanceFromStartM) : null;
-  const currentLat = params.currentLat != null ? Number(params.currentLat) : null;
-  const currentLon = params.currentLon != null ? Number(params.currentLon) : null;
+    params.distanceFromStartM != null && params.distanceFromStartM !== ''
+      ? Number(params.distanceFromStartM)
+      : 0;
+  const currentLat =
+    params.currentLat && params.currentLat !== ''
+      ? Number(params.currentLat)
+      : null;
+  const currentLon =
+    params.currentLon && params.currentLon !== ''
+      ? Number(params.currentLon)
+      : null;
+
+  // Route chat is active when we have a destination AND some form of
+  // starting point. That covers both a place-started walk and a
+  // GPS-started walk — the case that used to silently fall through
+  // to doc chat.
+  const hasRouteContext = !!(
+    toPlaceId &&
+    (fromPlaceId != null || (fromLat != null && fromLon != null))
+  );
 
   const insets = useSafeAreaInsets();
   const scrollRef = useRef(null);
@@ -122,6 +152,8 @@ export default function ChatScreen() {
             message,
             sessionId,
             fromPlaceId,
+            fromLat,
+            fromLon,
             toPlaceId,
             currentStepIndex,
             distanceFromStartM,
@@ -137,10 +169,17 @@ export default function ChatScreen() {
           { role: 'assistant', content: response.reply },
         ]);
       } catch (err) {
-        setError(err.message || t('common.error'));
+        // Show the actual failure reason, not just a generic message.
+        // The API client already extracts `detail` from the response
+        // body, so `err.message` is the useful text.
+        const detail = err?.message || t('common.error');
+        setError(detail);
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: t('chat.error') },
+          {
+            role: 'assistant',
+            content: `${t('chat.error')} (${detail})`,
+          },
         ]);
       } finally {
         setSending(false);
@@ -152,6 +191,8 @@ export default function ChatScreen() {
       sessionId,
       hasRouteContext,
       fromPlaceId,
+      fromLat,
+      fromLon,
       toPlaceId,
       currentStepIndex,
       distanceFromStartM,

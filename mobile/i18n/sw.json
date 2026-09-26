@@ -59,14 +59,15 @@
     "noRoute": "Hakuna njia kati ya mahali hapo."
   },
   "walking": {
-    "title": "Kutembea",
-    "offRouteTitle": "Unaonekana uko nje ya njia",
-    "offRouteSubtitle": "Umepitia njia nyingine?",
-    "recalculate": "Hesabu tena",
-    "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
-    "approaching": "Unakaribia {name}",
-    "calculating": "Inahesabu njia…"
-  },
+  "title": "Kutembea",
+  "offRouteTitle": "Unaonekana uko nje ya njia",
+  "offRouteSubtitle": "Umepitia njia nyingine?",
+  "recalculate": "Hesabu tena",
+  "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
+  "approaching": "Unakaribia {name}",
+  "calculating": "Inahesabu njia…",
+  "searchingGps": "Inatafuta GPS…"
+},
   "arrival": {
     "title": "Kufika",
     "arrived": "Umefika",

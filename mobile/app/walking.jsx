@@ -127,12 +127,14 @@ export default function WalkingScreen() {
     offRoute,
     progress,
     resetOffRoute,
+    gpsStale,
   } = useWalkingProgress(route);
 
   const { heading } = useCompass({ position: rawPosition });
 
   useEffect(() => {
     if (!destinationId) return;
+    if (!offRoute) return;                 // only recompute when genuinely off-route
     if (recomputeAttemptsRef.current >= 3) return;
     if (!rawPosition) return;
     if (
@@ -162,7 +164,7 @@ export default function WalkingScreen() {
     }, RECOMPUTE_AFTER_MS);
 
     return () => clearTimeout(timer);
-  }, [rawPosition, destinationId, resetOffRoute]);
+  }, [offRoute, rawPosition, destinationId, resetOffRoute]);
 
   const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
     position,
@@ -257,7 +259,12 @@ export default function WalkingScreen() {
   })();
 
   const handleRecalculate = useCallback(async () => {
-    if (!position) return;
+    // Prefer the freshest live GPS fix. `position` is snapped to the
+    // route and can be stuck on a stale segment; `rawPosition` is the
+    // real raw fix from the OS. Fall back to `position` only if no
+    // raw fix has arrived yet.
+    const from = rawPosition || position;
+    if (!from) return;
     if (!destinationId) return;
     setBannerDismissed(false);
     setPhotoDismissed(false);
@@ -266,8 +273,8 @@ export default function WalkingScreen() {
     recomputeAttemptsRef.current = 0;
     try {
       const data = await computeRoute({
-        fromLat: position.lat,
-        fromLon: position.lon,
+        fromLat: from.lat,
+        fromLon: from.lon,
         fromAccuracyM: rawPosition?.accuracyM ?? null,
         toPlaceId: destinationId,
       });
@@ -276,17 +283,23 @@ export default function WalkingScreen() {
   }, [position, rawPosition, destinationId, resetOffRoute]);
 
   const openChat = useCallback(() => {
+    const req = routeRequestRef.current;
     router.push({
       pathname: '/chat',
       params: {
-        fromPlaceId: routeRequestRef.current?.fromId
-          ? String(routeRequestRef.current.fromId)
-          : '',
+        // Place-based start, if there was one.
+        fromPlaceId: req?.fromId != null ? String(req.fromId) : '',
+        // GPS-based start, if that's how the walk began. The chat
+        // screen needs one or the other to rebuild the route.
+        fromLat: req?.fromLat != null ? String(req.fromLat) : '',
+        fromLon: req?.fromLon != null ? String(req.fromLon) : '',
+        // The destination and where the student is on the walk.
         toPlaceId: String(destinationId || ''),
         currentStepIndex: String(currentStepIndex ?? 0),
         distanceFromStartM: String(
           (route?.distance_m || 0) - distanceRemainingM
         ),
+        // Live position, used for nearby-places context only.
         currentLat: position ? String(position.lat) : '',
         currentLon: position ? String(position.lon) : '',
       },
@@ -350,6 +363,18 @@ export default function WalkingScreen() {
           headerRight: () => (
             <View style={styles.headerButtons}>
               <TouchableOpacity
+                onPress={handleRecalculate}
+                style={styles.headerButton}
+                accessibilityRole="button"
+                accessibilityLabel="Recalculate route"
+              >
+                <MaterialIcons
+                  name="my-location"
+                  size={22}
+                  color={COLORS.text}
+                />
+              </TouchableOpacity>
+              <TouchableOpacity
                 onPress={openChat}
                 style={styles.headerButton}
                 accessibilityRole="button"
@@ -412,6 +437,7 @@ export default function WalkingScreen() {
             progress={progress}
             heading={heading}
             bearing={bearing}
+            gpsStale={gpsStale}
           />
         </View>
       </View>

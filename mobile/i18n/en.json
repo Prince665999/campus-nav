@@ -59,14 +59,15 @@
     "noRoute": "No route found between those places."
   },
   "walking": {
-    "title": "Walking",
-    "offRouteTitle": "You seem off route",
-    "offRouteSubtitle": "Are you on a different path?",
-    "recalculate": "Recalculate",
-    "permissionNeeded": "Location permission is needed to guide you.",
-    "approaching": "You're approaching {name}",
-    "calculating": "Calculating route…"
-  },
+  "title": "Walking",
+  "offRouteTitle": "You seem off route",
+  "offRouteSubtitle": "Are you on a different path?",
+  "recalculate": "Recalculate",
+  "permissionNeeded": "Location permission is needed to guide you.",
+  "approaching": "You're approaching {name}",
+  "calculating": "Calculating route…",
+  "searchingGps": "Searching for GPS…"
+},
   "arrival": {
     "title": "Arrival",
     "arrived": "You've arrived",

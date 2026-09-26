@@ -121,8 +121,10 @@ def chat(
     if route_context is None:
         return ChatResponse(
             reply=(
-                "I can't find that route anymore. Try starting the walk "
-                "again, or ask a general question in the Chat tab."
+                "I can't rebuild the walk context right now — try "
+                "starting the walk again if you need route-specific "
+                "answers. In the meantime, ask a general question in "
+                "the Chat tab."
             ),
             session_id=session_id,
         )
@@ -152,9 +154,25 @@ def _build_route_context(body: ChatRequest, session: Session) -> dict | None:
         nodes = get_nodes()
         edge_tags = get_edge_tags()
 
+        # Resolve the from-endpoint. A place id when the walk started
+        # from the picker; coordinates when it started from live GPS.
+        # When neither is present, we can't rebuild the route.
+        if body.from_place_id is None and (
+            body.from_lat is None or body.from_lon is None
+        ):
+            return None
+
         from_node, from_name = _resolve_endpoint(
-            session, graph, nodes, place_id=body.from_place_id
+            session,
+            graph,
+            nodes,
+            place_id=body.from_place_id,
+            lat=body.from_lat,
+            lon=body.from_lon,
+            is_live_fix=(body.from_place_id is None),
         )
+        if body.to_place_id is None:
+            return None
         to_node, to_name = _resolve_endpoint(
             session, graph, nodes, place_id=body.to_place_id
         )
@@ -199,8 +217,22 @@ def _load_cached_narration(session: Session, body: ChatRequest) -> str | None:
         nodes = get_nodes()
         edge_tags = get_edge_tags()
 
+        # Same resolution rules as _build_route_context.
+        if body.from_place_id is None and (
+            body.from_lat is None or body.from_lon is None
+        ):
+            return None
+        if body.to_place_id is None:
+            return None
+
         from_node, from_name = _resolve_endpoint(
-            session, graph, nodes, place_id=body.from_place_id
+            session,
+            graph,
+            nodes,
+            place_id=body.from_place_id,
+            lat=body.from_lat,
+            lon=body.from_lon,
+            is_live_fix=(body.from_place_id is None),
         )
         to_node, to_name = _resolve_endpoint(
             session, graph, nodes, place_id=body.to_place_id

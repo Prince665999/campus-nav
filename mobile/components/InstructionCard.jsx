@@ -16,6 +16,7 @@ export function InstructionCard({
   progress,
   heading,
   bearing,
+  gpsStale = false,
 }) {
   const insets = useSafeAreaInsets();
   const { fonts } = useAccessibility();
@@ -44,6 +45,12 @@ export function InstructionCard({
           style={[styles.progressFill, { width: `${Math.round(progress * 100)}%` }]}
         />
       </View>
+
+      {gpsStale ? (
+        <View style={styles.gpsStrip}>
+          <Text style={styles.gpsText}>{t('walking.searchingGps')}</Text>
+        </View>
+      ) : null}
 
       <View style={styles.body}>
         <CompassArrow
@@ -87,6 +94,18 @@ const styles = StyleSheet.create({
   progressFill: {
     height: 4,
     backgroundColor: COLORS.primary,
+  },
+  gpsStrip: {
+    paddingHorizontal: SPACING.lg,
+    paddingVertical: 6,
+    backgroundColor: COLORS.warningBg,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.warningBorder,
+  },
+  gpsText: {
+    fontSize: 12,
+    color: COLORS.warningText,
+    fontWeight: '500',
   },
   body: {
     paddingHorizontal: SPACING.lg,

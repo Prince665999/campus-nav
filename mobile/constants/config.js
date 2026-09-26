@@ -4,7 +4,7 @@
 const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
 
 export const API_BASE_URL =
-process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
+  process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
 
 export const API_TIMEOUT_MS = 15000;
 
@@ -14,7 +14,7 @@ export const SEARCH_RESULT_LIMIT = 20;
 // ---------------------------------------------------------------------------
 // GPS accuracy thresholds
 //
-// These three constants work together. Changing one without the others
+// These constants work together. Changing one without the others
 // can leave the app in a state where the dot freezes, routes silently
 // fail, or bad fixes produce wrong routes.
 // ---------------------------------------------------------------------------
@@ -33,6 +33,13 @@ export const DISPLAY_MAX_ACCURACY_M = 40;
 // Used in: hooks/useWalkingProgress.js
 export const DISPLAY_STALE_FIX_MS = 8000;
 
+// How long without a good fix before the walking screen shows a
+// "searching for GPS" indicator. Shorter than DISPLAY_STALE_FIX_MS
+// so the student knows the dot is about to start accepting bad fixes.
+//
+// Used in: components/InstructionCard.jsx, via useWalkingProgress.
+export const DISPLAY_STALE_INDICATOR_S = 4;
+
 // The maximum reported accuracy (in metres) a fix is allowed to have
 // before the walking screen's route recompute runs. Recomputes are
 // expensive; a bad fix would produce a wrong route. This threshold is
@@ -48,3 +55,13 @@ export const RECOMPUTE_MAX_ACCURACY_M = 50;
 //
 // Used in: app/walking.jsx
 export const RECOMPUTE_AFTER_MS = 2000;
+
+// The maximum reported accuracy (in metres) a fix is allowed to have
+// to be counted as evidence of being off-route. Deliberately looser
+// than DISPLAY_MAX_ACCURACY_M: a fix too rough to move the dot is
+// still real evidence you've drifted off the mapped path. Above this
+// is almost always cell-tower noise, which we don't want triggering
+// a false "you seem off route" banner.
+//
+// Used in: hooks/useWalkingProgress.js
+export const OFF_ROUTE_MAX_ACCURACY_M = 80;

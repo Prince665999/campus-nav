@@ -1669,6 +1669,7 @@ export default function PlaceEditorPage() {
       name_sw: place.name_sw || '',
       alt_names: place.alt_names || '',
       description: place.description || '',
+      description_ai: place.description_ai || '',
       category: place.category || '',
       ref: place.ref || '',
       wheelchair: place.wheelchair || '',
@@ -1816,12 +1817,23 @@ export default function PlaceEditorPage() {
                   onChange={(v) => setForm({ ...form, alt_names: v })}
                   hint="Semicolon-separated. What students actually call it."
                 />
+
                 <FormField
-                  label="Description"
+                  label="Description (shown to students)"
                   value={form.description}
                   onChange={(v) => setForm({ ...form, description: v })}
                   textarea
+                  hint="Formal text. This is what students see on the place detail screen in the app."
                 />
+
+                <FormField
+                  label="AI description (internal, never shown)"
+                  value={form.description_ai}
+                  onChange={(v) => setForm({ ...form, description_ai: v })}
+                  textarea
+                  hint="Informal text fed to the narration system. Use landmarks, local nicknames, walking hints. Never appears in the app."
+                />
+
                 <FormField
                   label="Category"
                   value={form.category}
@@ -9754,6 +9766,49 @@ if __name__ == "__main__":
 
 
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\migrations\versions\0004_split_description.py ---
+
+"""Split description into public + AI, on places, areas, and path_edges.
+
+Revision ID: 0004
+Revises: 0003
+
+What this does:
+  1. Renames the existing `description` column to `description_ai`
+     on all three tables. Every value is preserved.
+  2. Adds a new `description` column (public, empty) on all three.
+
+The AI keeps reading the same text it read before — it just now lives
+under `description_ai` instead of `description`.
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0004"
+down_revision = "0003"
+branch_labels = None
+depends_on = None
+
+
+_TABLES = ("places", "areas", "path_edges")
+
+
+def upgrade():
+    for table in _TABLES:
+        # Rename the existing column. Its data stays put.
+        op.alter_column(table, "description", new_column_name="description_ai")
+        # Add the new public column, empty by default.
+        op.add_column(table, sa.Column("description", sa.Text(), nullable=True))
+
+
+def downgrade():
+    for table in _TABLES:
+        # Drop the public column.
+        op.drop_column(table, "description")
+        # Rename the AI column back to `description`.
+        op.alter_column(table, "description_ai", new_column_name="description")
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\session.py ---
 
 """
@@ -10302,7 +10357,15 @@ class Area(Base, TimestampMixin):
     name_sw: Mapped[str | None] = mapped_column(String(255), nullable=True)
     alt_names: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Public description — shown to students in the app. Formal text
+    # written by an admin. Not fed to the AI.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # AI description — fed to the narration system. Informal text
+    # that mentions landmarks, local nicknames, "the big mango tree".
+    # Never shown in the app front end.
+    description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # WKT "POLYGON((lon lat, ...))" — Phase 13 changes this column to a
@@ -10577,7 +10640,14 @@ class PathEdge(Base, TimestampMixin):
     incline: Mapped[str | None] = mapped_column(String(32), nullable=True)
     wheelchair: Mapped[str | None] = mapped_column(String(16), nullable=True)
     access: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Public description — shown to students in the app. Not fed to
+    # the AI.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # AI description — fed to the narration system. Never shown in
+    # the app front end.
+    description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         Index("ix_path_edges_pair", "node_a_osm", "node_b_osm", unique=True),
@@ -10618,8 +10688,14 @@ class Place(Base, TimestampMixin):
     name_sw: Mapped[str | None] = mapped_column(String(255), nullable=True)
     alt_names: Mapped[str | None] = mapped_column(Text, nullable=True)  # semicolon-separated
 
-    # Description — OSM-sourced initially, editable by hand later
+    # Public description — shown to students in the app. Formal text
+    # written by an admin. Not fed to the AI.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # AI description — fed to the narration system. Informal text
+    # that mentions landmarks, local nicknames, "the big mango tree".
+    # Never shown in the app front end.
+    description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Coordinates. Kept as separate lat/lon columns for ease of read;
     # Phase 13 adds a proper geometry column alongside these.
@@ -11321,12 +11397,13 @@ Admin endpoints for editing places.
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from ... import cache
 from ...dependencies import db_session
 from ...errors import NotFoundError
 from ...models.place import Place
 from ...schemas.admin import UpdatePlaceRequest
 from ...schemas.place import PlaceDetail
-from ...services import place_service
+from ...services import cache_service, graph_service, place_service
 
 router = APIRouter(prefix="/places", tags=["admin:places"])
 
@@ -11340,6 +11417,11 @@ def update_place(
     """
     Update a place's editable fields. Only the fields present in the
     request are changed; others keep their current value.
+
+    If the AI description changes, the in-memory graph is reloaded and
+    narration caches are invalidated — because narration reads the
+    description from the graph, and cached narrations may have been
+    produced from the old text.
     """
     place = session.query(Place).filter_by(id=place_id).one_or_none()
     if place is None:
@@ -11347,10 +11429,21 @@ def update_place(
 
     # Only apply fields that were explicitly sent.
     updates = body.model_dump(exclude_unset=True)
+
+    ai_description_changed = "description_ai" in updates
+
     for key, value in updates.items():
         setattr(place, key, value)
 
     session.flush()
+
+    # If the AI description changed, the loaded graph and any cached
+    # narrations are stale. Reload and invalidate.
+    if ai_description_changed:
+        graph_service.reset()
+        if cache.is_available():
+            cache_service.invalidate_narrations()
+
     return place_service.get_place(session, place_id)
 
 
@@ -12803,7 +12896,13 @@ class UpdatePlaceRequest(BaseModel):
     name: str | None = Field(None, max_length=255)
     name_sw: str | None = Field(None, max_length=255)
     alt_names: str | None = None
+
+    # Public description — shown to students in the app.
     description: str | None = None
+
+    # AI description — fed to narration. Never shown to students.
+    description_ai: str | None = None
+
     category: str | None = Field(None, max_length=64)
     ref: str | None = Field(None, max_length=64)
     wheelchair: str | None = Field(None, max_length=16)
@@ -12938,7 +13037,12 @@ class AreaSummary(BaseModel):
 
 
 class AreaDetail(BaseModel):
-    """Full detail for the admin editor."""
+    """Full detail for the admin editor.
+
+    Note: the `description` here is the public one, read from the
+    database's `description` column. The AI-facing description lives
+    under `description_ai` and is never returned in a public response.
+    """
 
     id: int
     name: str
@@ -13301,7 +13405,12 @@ class PlaceSummary(BaseModel):
 
 class PlaceDetail(BaseModel):
     """The shape returned by /api/places/{id}. Adds fields the summary
-    doesn't need."""
+    doesn't need.
+
+    Note: the `description` here is the public one, read from the
+    database's `description` column. The AI-facing description lives
+    under `description_ai` and is never returned in a public response.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -13583,6 +13692,8 @@ def _to_detail(area: Area) -> AreaDetail:
         name=summary.name,
         name_sw=summary.name_sw,
         alt_names=area.alt_names,
+        # Public description only. The AI description
+        # (`area.description_ai`) is never returned here.
         description=area.description,
         category=summary.category,
         boundary=summary.boundary,
@@ -14450,6 +14561,19 @@ this, every /api/route request would re-parse map.osm and rebuild the
 graph, which is wasteful and slow.
 
 Callers use get_graph() — never parse_osm directly.
+
+Description bridge
+------------------
+The frozen core (campus_graph.py, ai_navigator.py) reads descriptions
+from the OSM tags. That means an admin edit to a place's description
+in the database wouldn't affect narration — a real disconnect we fix
+here.
+
+After loading areas and edges from map.osm, we look up each one's
+`description_ai` in the database and override the in-memory text. The
+frozen files see the same dict keys they always have ("description"
+on the area dict, "description" in the edge tags dict), so nothing in
+backend/core/ needs to change.
 """
 
 import threading
@@ -14483,11 +14607,66 @@ def _load():
         from backend.core.campus_graph import named_areas
         areas = named_areas(nodes, ways)
 
+        # Bridge: replace the OSM-sourced description with the DB's
+        # `description_ai`, so admin edits are actually reflected in
+        # narration. If a row has no DB value, the OSM text is kept.
+        _apply_ai_descriptions(areas, edge_tags)
+
         _nodes = nodes
         _graph = graph
         _edges = footpath_edges
         _edge_tags = edge_tags
         _areas = areas
+
+
+def _apply_ai_descriptions(areas, edge_tags):
+    """
+    Override in-memory descriptions with the DB's `description_ai`.
+
+    Areas are matched by `osm_id`. Edges are matched by (node_a, node_b)
+    pair. Only values that exist in the DB are applied — a missing row
+    or a NULL value leaves the OSM text in place.
+    """
+    # Imported here to avoid a circular import at module load time.
+    from backend.api.db.session import session_scope
+    from backend.api.models.area import Area
+    from backend.api.models.path_edge import PathEdge
+
+    try:
+        with session_scope() as session:
+            area_descriptions = {
+                row.osm_id: row.description_ai
+                for row in session.query(Area).all()
+                if row.description_ai
+            }
+            edge_descriptions = {}
+            for row in session.query(PathEdge).all():
+                if not row.description_ai:
+                    continue
+                # Match either direction — the tag dict is keyed by
+                # a frozenset, but this table stores a canonical pair.
+                a, b = sorted((row.node_a_osm, row.node_b_osm))
+                edge_descriptions[(a, b)] = row.description_ai
+    except Exception:
+        # If the DB isn't ready yet (e.g. first ever boot before the
+        # migration has run), skip the bridge silently. The OSM text
+        # stays, and narration works as it did before.
+        return
+
+    # Areas: `area["id"]` is the OSM way id.
+    for area in areas:
+        ai_text = area_descriptions.get(str(area["id"]))
+        if ai_text:
+            area["description"] = ai_text
+
+    # Edges: the tag dict is keyed by frozenset({a, b}). We only
+    # override the "description" key inside the existing tag dict,
+    # which is exactly what ai_navigator.path_notes_along_route reads.
+    for pair_key, tags in edge_tags.items():
+        a, b = sorted(pair_key)
+        ai_text = edge_descriptions.get((a, b))
+        if ai_text:
+            tags["description"] = ai_text
 
 
 def get_graph():
@@ -14510,13 +14689,16 @@ def get_areas():
     _load()
     return _areas
 
+
 def get_edges():
     _load()
     return _edges
 
 
 def reset():
-    """Force the next get_graph() to reload. Used by tests only."""
+    """Force the next get_graph() to reload. Used by tests and by the
+    admin places endpoint after an AI description is edited, so the
+    change takes effect without restarting the API."""
     global _graph, _nodes, _edges, _edge_tags, _areas
     with _lock:
         _graph = None
@@ -15767,6 +15949,8 @@ def _to_detail(place: Place) -> PlaceDetail:
         name=place.name,
         name_sw=place.name_sw,
         alt_names=place.alt_names,
+        # Public description only. The AI description
+        # (`place.description_ai`) is never returned here.
         description=place.description,
         category=place.category,
         ref=place.ref,
@@ -15884,7 +16068,7 @@ def _osm_only_place_fields(node, tags):
     for osm_key, db_key in (
         ("name:sw", "name_sw"),
         ("alt_name", "alt_names"),
-        ("description", "description"),
+        ("description", "description_ai"),
         ("ref", "ref"),
         ("wheelchair", "wheelchair"),
         ("opening_hours", "opening_hours"),
@@ -19845,7 +20029,7 @@ def ingest_places(nodes, session):
         if tags.get("alt_name"):
             existing.alt_names = tags["alt_name"]
         if tags.get("description"):
-            existing.description = tags["description"]
+            existing.description_ai = tags["description"]
 
         # Everything below is set-once from OSM. Hand edits to these
         # are rare; if you need them, use edit_place.py which will set
@@ -19892,7 +20076,7 @@ def ingest_areas(nodes, ways, session):
         if tags.get("alt_name"):
             existing.alt_names = tags["alt_name"]
         if tags.get("description"):
-            existing.description = tags["description"]
+            existing.description_ai = tags["description"]
         existing.category = _category_from_tags(tags) or existing.category
 
         # landmark=yes means "worth mentioning in narration". Default is
@@ -19944,7 +20128,7 @@ def ingest_path_edges(nodes, ways, session):
         existing.incline = tags.get("incline", existing.incline)
         existing.wheelchair = tags.get("wheelchair", existing.wheelchair)
         existing.access = tags.get("access", existing.access)
-        existing.description = tags.get("description", existing.description)
+        existing.description_ai = tags.get("description", existing.description_ai)
 
         written += 1
     return written
@@ -20199,7 +20383,7 @@ def _osm_only_place_fields(node, tags):
     for osm_key, db_key in (
         ("name:sw", "name_sw"),
         ("alt_name", "alt_names"),
-        ("description", "description"),
+        ("description", "description_ai"),
         ("ref", "ref"),
         ("wheelchair", "wheelchair"),
         ("opening_hours", "opening_hours"),
@@ -20278,7 +20462,7 @@ def run_reimport(osm_path=None):
             for osm_key, db_key in (
                 ("name:sw", "name_sw"),
                 ("alt_name", "alt_names"),
-                ("description", "description"),
+                ("description", "description_ai"),
             ):
                 if tags.get(osm_key):
                     fields[db_key] = tags[osm_key]
@@ -20323,7 +20507,7 @@ def run_reimport(osm_path=None):
                 "incline": tags.get("incline"),
                 "wheelchair": tags.get("wheelchair"),
                 "access": tags.get("access"),
-                "description": tags.get("description"),
+                "description_ai": tags.get("description"),
             }
             if row is None:
                 row = PathEdge(node_a_osm=a, node_b_osm=b)
@@ -22746,6 +22930,11 @@ Tests for the merge-safe re-import.
 
 The critical property: re-import must never overwrite a field that was
 set by hand in the database and is not present as an OSM tag.
+
+After the description split:
+  - Public `description` is admin-only. Re-import never writes to it.
+  - AI `description_ai` is OSM-sourced, but a hand edit survives unless
+    the OSM tag is present.
 """
 
 import pytest
@@ -22757,7 +22946,9 @@ from backend.core.tests.fixtures.synthetic_maps import (
 
 
 class TestReimportPreservesManualEdits:
-    def test_manual_description_survives(self, temp_db, tmp_path):
+    def test_manual_public_description_survives(self, temp_db, tmp_path):
+        """The public description is admin-only. Re-import must never
+        touch it, even if a description tag is present in OSM."""
         from backend.api.db.session import session_scope
         from backend.api.models.place import Place
         from backend.pipeline.ingest import run_ingest
@@ -22768,21 +22959,23 @@ class TestReimportPreservesManualEdits:
         # First ingest — clean database.
         run_ingest(osm_path=osm_path, replace=True)
 
-        # Simulate a manual edit: someone set a description in the admin app.
+        # Simulate a manual edit: someone wrote the public description
+        # in the admin app.
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
-            row.description = "Hand-written description that must survive"
+            row.description = "A formal public description for students"
             session.add(row)
 
-        # Now re-import. The OSM file has no description tag, so the
-        # manual value must survive.
+        # Now re-import. Public description is never written by re-import,
+        # so the manual value must survive untouched.
         run_reimport(osm_path=osm_path)
 
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
-            assert row.description == "Hand-written description that must survive"
+            assert row.description == "A formal public description for students"
 
-    def test_osm_description_overwrites(self, temp_db, tmp_path):
+    def test_osm_description_overwrites_ai_description(self, temp_db, tmp_path):
+        """When the OSM tag is present, it wins for the AI description."""
         from backend.api.db.session import session_scope
         from backend.api.models.place import Place
         from backend.pipeline.ingest import run_ingest
@@ -22810,15 +23003,54 @@ class TestReimportPreservesManualEdits:
 
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
-            row.description = "Manually set"
+            row.description_ai = "Manually set"
             session.add(row)
 
         run_reimport(osm_path=osm_path)
 
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
-            # The OSM tag is present, so it wins.
-            assert row.description == "From OSM"
+            # The OSM tag is present, so it wins for the AI description.
+            assert row.description_ai == "From OSM"
+
+    def test_manual_ai_description_survives_when_no_osm_tag(self, temp_db, tmp_path):
+        """When there's no OSM description tag, a hand edit to the AI
+        description must survive a re-import."""
+        from backend.api.db.session import session_scope
+        from backend.api.models.place import Place
+        from backend.pipeline.ingest import run_ingest
+        from backend.pipeline.reimport import run_reimport
+
+        # Synthetic map with NO description tag on Start Point.
+        osm_content = """<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+  <node id="1" lat="-6.7500" lon="39.2000">
+    <tag k="name" v="Start Point"/>
+  </node>
+  <node id="2" lat="-6.7490" lon="39.2000">
+    <tag k="name" v="End Point"/>
+  </node>
+  <way id="100">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <tag k="highway" v="footway"/>
+  </way>
+</osm>
+"""
+        osm_path = write_temp_map(osm_content, tmp_path)
+        run_ingest(osm_path=osm_path, replace=True)
+
+        with session_scope() as session:
+            row = session.query(Place).filter_by(name="Start Point").one()
+            row.description_ai = "The big mango tree is on the left"
+            session.add(row)
+
+        run_reimport(osm_path=osm_path)
+
+        with session_scope() as session:
+            row = session.query(Place).filter_by(name="Start Point").one()
+            # No OSM tag, so the manual AI description survives.
+            assert row.description_ai == "The big mango tree is on the left"
 
 
 class TestReimportNeverDeletes:
@@ -27836,10 +28068,10 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://localhost:8000';
+const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
 
 export const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
+process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
 
 export const API_TIMEOUT_MS = 15000;
 
@@ -29247,6 +29479,7 @@ global.fetch = jest.fn(() =>
       },
       "devDependencies": {
         "@eslint/js": "^9.39.5",
+        "@expo/ngrok": "^4.1.0",
         "@testing-library/react-native": "^14.0.1",
         "eslint": "^9.39.5",
         "eslint-config-expo": "^57.0.2",
@@ -31248,6 +31481,208 @@ global.fetch = jest.fn(() =>
         "node": "^20.19.4 || ^22.13.0 || ^24.3.0 || >= 25.0.0"
       }
     },
+    "node_modules/@expo/ngrok": {
+      "version": "4.1.0",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok/-/ngrok-4.1.0.tgz",
+      "integrity": "sha512-PrtWxBt/SnOF1jZkf7oWznhEPFrmYKKeJPLVRKnEBd/y4eUYfoiNIXOzflIzhdrMubjWVI+pFuPJ6nkjVL95/Q==",
+      "dev": true,
+      "license": "BSD-2-Clause",
+      "dependencies": {
+        "@expo/ngrok-bin": "2.3.40",
+        "got": "^11.5.1",
+        "uuid": "^3.3.2",
+        "yaml": "^1.10.0"
+      },
+      "engines": {
+        "node": ">=10.19.0"
+      }
+    },
+    "node_modules/@expo/ngrok-bin": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin/-/ngrok-bin-2.3.40.tgz",
+      "integrity": "sha512-40GK1CY1QLPDHSQS7Fd36CJeZgMwtbeezkgp4tzfExVRVtWw30jOBCsM7TBB9IqEmmX7C/XwG47scMQHCnMw8A==",
+      "dev": true,
+      "bin": {
+        "ngrok": "bin/ngrok.js"
+      },
+      "optionalDependencies": {
+        "@expo/ngrok-bin-darwin-arm64": "2.3.40",
+        "@expo/ngrok-bin-darwin-x64": "2.3.40",
+        "@expo/ngrok-bin-freebsd-ia32": "2.3.40",
+        "@expo/ngrok-bin-freebsd-x64": "2.3.40",
+        "@expo/ngrok-bin-linux-arm": "2.3.40",
+        "@expo/ngrok-bin-linux-arm64": "2.3.40",
+        "@expo/ngrok-bin-linux-ia32": "2.3.40",
+        "@expo/ngrok-bin-linux-x64": "2.3.40",
+        "@expo/ngrok-bin-sunos-x64": "2.3.40",
+        "@expo/ngrok-bin-win32-ia32": "2.3.40",
+        "@expo/ngrok-bin-win32-x64": "2.3.40"
+      }
+    },
+    "node_modules/@expo/ngrok-bin-darwin-arm64": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-darwin-arm64/-/ngrok-bin-darwin-arm64-2.3.40.tgz",
+      "integrity": "sha512-Zij81v/bIsVBvgXgYS71xbi/3lqKfVEfr7rId8BsHO3Ec1nQcp/I+729W3KX9PUHzWlXCLxOKZ3uF4jL/TcNbg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "darwin"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-darwin-x64": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-darwin-x64/-/ngrok-bin-darwin-x64-2.3.40.tgz",
+      "integrity": "sha512-nqGLfxIjZBoT79VDk5mqaHQKCWkunSi486zGLeB8Ye8Qar1yo4STFwks+DqTbnGD5ItArQz2LzKRVE4YXuJFuw==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "darwin"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-freebsd-ia32": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-freebsd-ia32/-/ngrok-bin-freebsd-ia32-2.3.40.tgz",
+      "integrity": "sha512-Ji3jZaOuIZO+ege23kZZAAEPUYkF+6mCpghb16b28Is1QHOSl2L4foDnAcWyzSEiBihMicxWltaQyaaxA0fdgw==",
+      "cpu": [
+        "ia32"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "freebsd"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-freebsd-x64": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-freebsd-x64/-/ngrok-bin-freebsd-x64-2.3.40.tgz",
+      "integrity": "sha512-mVnzKGQmOyXimZx6udoiyo3ZTYLZnPShlTySaDP0tqQ0vYz4ZscgvaYpMmDSPrsP/YG2owmKgzmOE2V+ycD8qA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "freebsd"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-linux-arm": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-linux-arm/-/ngrok-bin-linux-arm-2.3.40.tgz",
+      "integrity": "sha512-Je1QBd7x0hbZa4T3gZbVgD0cSzstpJ7Mu0+dM2lOB+vm3bd603yHtD0RlLdqARJFhPTE1M2zLd68gCEeZ5fRgQ==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "linux"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-linux-arm64": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-linux-arm64/-/ngrok-bin-linux-arm64-2.3.40.tgz",
+      "integrity": "sha512-S6kbnRqsVXHo/bWNxc0jfq33aQQRsGWjb6e7SvZ2DgXsPFLn27cfK0eHD96uCssARDVhzPsc+VU/B3d8C1DT5A==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "linux"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-linux-ia32": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-linux-ia32/-/ngrok-bin-linux-ia32-2.3.40.tgz",
+      "integrity": "sha512-gPY5zv5Fu+TkCm5iZolXQbu7e5hc7fTllIKn/zJQxxZs/WCvSxyB5ip6vQcHiavu/kjr0HtNciPX/guXvWENkg==",
+      "cpu": [
+        "ia32"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "linux"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-linux-x64": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-linux-x64/-/ngrok-bin-linux-x64-2.3.40.tgz",
+      "integrity": "sha512-yOuwpOmMe6RGnk9ninlM7Zg1EiF81ptFOcFmT61PDOA4gK8/ttZKTMkDQiq0DZdcXUyE0HCr83EglJZTnHIzPA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "linux"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-sunos-x64": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-sunos-x64/-/ngrok-bin-sunos-x64-2.3.40.tgz",
+      "integrity": "sha512-0itEIQ7KsxRbF9nJk6tt0Ey+9TDC5H7krOsy3t7DPx01EvtaiEdMyhmE1XWjBtwr8+BaY9CpEhUWkx4iCcE4cw==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "sunos"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-win32-ia32": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-win32-ia32/-/ngrok-bin-win32-ia32-2.3.40.tgz",
+      "integrity": "sha512-RAunwOAskfU0R5mYlxxB+bihLJ4nLRx5/x+q5nIq1muYmaqLvGtkQQHZKzgHJANJ7ZIbzfJY57IN2UICpibgIQ==",
+      "cpu": [
+        "ia32"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "win32"
+      ]
+    },
+    "node_modules/@expo/ngrok-bin-win32-x64": {
+      "version": "2.3.40",
+      "resolved": "https://registry.npmjs.org/@expo/ngrok-bin-win32-x64/-/ngrok-bin-win32-x64-2.3.40.tgz",
+      "integrity": "sha512-a8xtUxX/Ftp2ho+/+VR5GCg0ttP9MNzYj58TVjfiKMkl4mVrbFVIzEinRzmy7PhiOWxqGQSCOdzEfa6C2G4nEA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "optional": true,
+      "os": [
+        "win32"
+      ]
+    },
+    "node_modules/@expo/ngrok/node_modules/uuid": {
+      "version": "3.4.0",
+      "resolved": "https://registry.npmjs.org/uuid/-/uuid-3.4.0.tgz",
+      "integrity": "sha512-HjSDRw6gZE5JMggctHBcjVak08+KEVhSIiDzFnT9S9aegmp85S/bReBVTb4QTFaRNptJ9kuYaNhnbNEOkbKb/A==",
+      "deprecated": "uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).",
+      "dev": true,
+      "license": "MIT",
+      "bin": {
+        "uuid": "bin/uuid"
+      }
+    },
+    "node_modules/@expo/ngrok/node_modules/yaml": {
+      "version": "1.10.3",
+      "resolved": "https://registry.npmjs.org/yaml/-/yaml-1.10.3.tgz",
+      "integrity": "sha512-vIYeF1u3CjlhAFekPPAk2h/Kv4T3mAkMox5OymRiJQB0spDP10LHvt+K7G9Ny6NuuMAb25/6n1qyUjAcGNf/AA==",
+      "dev": true,
+      "license": "ISC",
+      "engines": {
+        "node": ">= 6"
+      }
+    },
     "node_modules/@expo/osascript": {
       "version": "2.7.1",
       "resolved": "https://registry.npmjs.org/@expo/osascript/-/osascript-2.7.1.tgz",
@@ -32979,6 +33414,19 @@ global.fetch = jest.fn(() =>
       "integrity": "sha512-hhyNJ+nbR6ZR7pToHvllEFun9TL0sbL+tk/ON75lo+Xas054uez98qRbsuNt7MBCyZKK4+8Yli/OAGZhmfBZ/g==",
       "license": "MIT"
     },
+    "node_modules/@sindresorhus/is": {
+      "version": "4.6.0",
+      "resolved": "https://registry.npmjs.org/@sindresorhus/is/-/is-4.6.0.tgz",
+      "integrity": "sha512-t09vSN3MdfsyCHoFcTRCH/iUtG7OJ0CsjzB8cjAmKc/va/kIgeDI/TxsigdncE/4be734m0cvIYwNaV4i2XqAw==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=10"
+      },
+      "funding": {
+        "url": "https://github.com/sindresorhus/is?sponsor=1"
+      }
+    },
     "node_modules/@sinonjs/commons": {
       "version": "3.0.1",
       "resolved": "https://registry.npmjs.org/@sinonjs/commons/-/commons-3.0.1.tgz",
@@ -32997,6 +33445,19 @@ global.fetch = jest.fn(() =>
       "license": "BSD-3-Clause",
       "dependencies": {
         "@sinonjs/commons": "^3.0.0"
+      }
+    },
+    "node_modules/@szmarczak/http-timer": {
+      "version": "4.0.6",
+      "resolved": "https://registry.npmjs.org/@szmarczak/http-timer/-/http-timer-4.0.6.tgz",
+      "integrity": "sha512-4BAffykYOgO+5nzBWYwE3W90sBgLJoUPRWWcL8wlyiM8IB8ipJz3UMJ9KXQd1RKQXpKp8Tutn80HZtWsu2u76w==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "defer-to-connect": "^2.0.0"
+      },
+      "engines": {
+        "node": ">=10"
       }
     },
     "node_modules/@testing-library/react-native": {
@@ -33181,6 +33642,19 @@ global.fetch = jest.fn(() =>
         "@babel/types": "^7.28.2"
       }
     },
+    "node_modules/@types/cacheable-request": {
+      "version": "6.0.3",
+      "resolved": "https://registry.npmjs.org/@types/cacheable-request/-/cacheable-request-6.0.3.tgz",
+      "integrity": "sha512-IQ3EbTzGxIigb1I3qPZc1rWJnH0BmSKv5QYTalEwweFvyBDLSAe24zP0le/hyi7ecGfZVlIVAg4BZqb8WBwKqw==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@types/http-cache-semantics": "*",
+        "@types/keyv": "^3.1.4",
+        "@types/node": "*",
+        "@types/responselike": "^1.0.0"
+      }
+    },
     "node_modules/@types/estree": {
       "version": "1.0.9",
       "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz",
@@ -33203,6 +33677,13 @@ global.fetch = jest.fn(() =>
       "dependencies": {
         "@types/node": "*"
       }
+    },
+    "node_modules/@types/http-cache-semantics": {
+      "version": "4.2.0",
+      "resolved": "https://registry.npmjs.org/@types/http-cache-semantics/-/http-cache-semantics-4.2.0.tgz",
+      "integrity": "sha512-L3LgimLHXtGkWikKnsPg0/VFx9OGZaC+eN1u4r+OB1XRqH3meBIAVC2zr1WdMH+RHmnRkqliQAOHNJ/E0j/e0Q==",
+      "dev": true,
+      "license": "MIT"
     },
     "node_modules/@types/istanbul-lib-coverage": {
       "version": "2.0.6",
@@ -33254,6 +33735,16 @@ global.fetch = jest.fn(() =>
       "dev": true,
       "license": "MIT"
     },
+    "node_modules/@types/keyv": {
+      "version": "3.1.4",
+      "resolved": "https://registry.npmjs.org/@types/keyv/-/keyv-3.1.4.tgz",
+      "integrity": "sha512-BQ5aZNSCpj7D6K2ksrRCTmKRLEpnPvWDiLPfoGyhZ++8YtiK9d/3DBKPJgry359X/P1PfruyYwvnvwFjuEiEIg==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@types/node": "*"
+      }
+    },
     "node_modules/@types/node": {
       "version": "26.6.2",
       "resolved": "https://registry.npmjs.org/@types/node/-/node-26.6.2.tgz",
@@ -33292,6 +33783,16 @@ global.fetch = jest.fn(() =>
       "peer": true,
       "dependencies": {
         "@types/react": "*"
+      }
+    },
+    "node_modules/@types/responselike": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/@types/responselike/-/responselike-1.0.3.tgz",
+      "integrity": "sha512-H/+L+UkTV33uf49PH5pCAUBVPNj2nDBXTN+qS1dOwyyg24l3CcicicCA7ca+HMvJBZcFgl5r8e+RR6elsb4Lyw==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@types/node": "*"
       }
     },
     "node_modules/@types/stack-utils": {
@@ -34759,6 +35260,51 @@ global.fetch = jest.fn(() =>
         "node": ">= 0.8"
       }
     },
+    "node_modules/cacheable-lookup": {
+      "version": "5.0.4",
+      "resolved": "https://registry.npmjs.org/cacheable-lookup/-/cacheable-lookup-5.0.4.tgz",
+      "integrity": "sha512-2/kNscPhpcxrOigMZzbiWF7dz8ilhb/nIHU3EyZiXWXpeq/au8qJ8VhdftMkty3n7Gj6HIGalQG8oiBNB3AJgA==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=10.6.0"
+      }
+    },
+    "node_modules/cacheable-request": {
+      "version": "7.0.4",
+      "resolved": "https://registry.npmjs.org/cacheable-request/-/cacheable-request-7.0.4.tgz",
+      "integrity": "sha512-v+p6ongsrp0yTGbJXjgxPow2+DL93DASP4kXCDKb8/bwRtt9OEF3whggkkDkGNzgcWy2XaF4a8nZglC7uElscg==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "clone-response": "^1.0.2",
+        "get-stream": "^5.1.0",
+        "http-cache-semantics": "^4.0.0",
+        "keyv": "^4.0.0",
+        "lowercase-keys": "^2.0.0",
+        "normalize-url": "^6.0.1",
+        "responselike": "^2.0.0"
+      },
+      "engines": {
+        "node": ">=8"
+      }
+    },
+    "node_modules/cacheable-request/node_modules/get-stream": {
+      "version": "5.2.0",
+      "resolved": "https://registry.npmjs.org/get-stream/-/get-stream-5.2.0.tgz",
+      "integrity": "sha512-nBF+F1rAZVCu/p7rjzgA+Yb4lfYXrpl7a6VmJrU8wF9I1CKvP/QwPNZHnOlwbTkY6dvtFIzFMSyQXbLoTQPRpA==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "pump": "^3.0.0"
+      },
+      "engines": {
+        "node": ">=8"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
+    },
     "node_modules/call-bind": {
       "version": "1.0.9",
       "resolved": "https://registry.npmjs.org/call-bind/-/call-bind-1.0.9.tgz",
@@ -34980,6 +35526,19 @@ global.fetch = jest.fn(() =>
       "license": "MIT",
       "engines": {
         "node": ">=0.8"
+      }
+    },
+    "node_modules/clone-response": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/clone-response/-/clone-response-1.0.3.tgz",
+      "integrity": "sha512-ROoL94jJH2dUVML2Y/5PEDNaSHgeOdSDicUyS7izcF63G6sTc/FTjLub4b8Il9S8S0beOfYt0TaA5qvFK+w0wA==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "mimic-response": "^1.0.0"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
       }
     },
     "node_modules/co": {
@@ -35380,6 +35939,35 @@ global.fetch = jest.fn(() =>
         "node": ">=0.10"
       }
     },
+    "node_modules/decompress-response": {
+      "version": "6.0.0",
+      "resolved": "https://registry.npmjs.org/decompress-response/-/decompress-response-6.0.0.tgz",
+      "integrity": "sha512-aW35yZM6Bb/4oJlZncMH2LCoZtJXTRxES17vE3hoRiowU2kWHaJKFkSBDnDR+cm9J+9QhXmREyIfv0pji9ejCQ==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "mimic-response": "^3.1.0"
+      },
+      "engines": {
+        "node": ">=10"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
+    },
+    "node_modules/decompress-response/node_modules/mimic-response": {
+      "version": "3.1.0",
+      "resolved": "https://registry.npmjs.org/mimic-response/-/mimic-response-3.1.0.tgz",
+      "integrity": "sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=10"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
+    },
     "node_modules/dedent": {
       "version": "1.7.2",
       "resolved": "https://registry.npmjs.org/dedent/-/dedent-1.7.2.tgz",
@@ -35422,6 +36010,16 @@ global.fetch = jest.fn(() =>
       },
       "funding": {
         "url": "https://github.com/sponsors/sindresorhus"
+      }
+    },
+    "node_modules/defer-to-connect": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/defer-to-connect/-/defer-to-connect-2.0.1.tgz",
+      "integrity": "sha512-4tvttepXG1VaYGrRibk5EwJd1t4udunSOVMdLSAL6mId1ix438oPwPZMALY41FCijukO1L0twNcGsdzS7dHgDg==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=10"
       }
     },
     "node_modules/define-data-property": {
@@ -35611,6 +36209,16 @@ global.fetch = jest.fn(() =>
       "license": "MIT",
       "engines": {
         "node": ">= 0.8"
+      }
+    },
+    "node_modules/end-of-stream": {
+      "version": "1.4.5",
+      "resolved": "https://registry.npmjs.org/end-of-stream/-/end-of-stream-1.4.5.tgz",
+      "integrity": "sha512-ooEGc6HP26xXq/N+GCGOT0JKCLDGrq2bQUZrQ7gyrJiZANJ/8YDTxTpQBXGMn+WbIQXNVpyWymm7KYVICQnyOg==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "once": "^1.4.0"
       }
     },
     "node_modules/entities": {
@@ -37816,6 +38424,32 @@ global.fetch = jest.fn(() =>
         "url": "https://github.com/sponsors/ljharb"
       }
     },
+    "node_modules/got": {
+      "version": "11.8.6",
+      "resolved": "https://registry.npmjs.org/got/-/got-11.8.6.tgz",
+      "integrity": "sha512-6tfZ91bOr7bOXnK7PRDCGBLa1H4U080YHNaAQ2KsMGlLEzRbk44nsZF2E1IeRc3vtJHPVbKCYgdFbaGO2ljd8g==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@sindresorhus/is": "^4.0.0",
+        "@szmarczak/http-timer": "^4.0.5",
+        "@types/cacheable-request": "^6.0.1",
+        "@types/responselike": "^1.0.0",
+        "cacheable-lookup": "^5.0.3",
+        "cacheable-request": "^7.0.2",
+        "decompress-response": "^6.0.0",
+        "http2-wrapper": "^1.0.0-beta.5.2",
+        "lowercase-keys": "^2.0.0",
+        "p-cancelable": "^2.0.0",
+        "responselike": "^2.0.0"
+      },
+      "engines": {
+        "node": ">=10.19.0"
+      },
+      "funding": {
+        "url": "https://github.com/sindresorhus/got?sponsor=1"
+      }
+    },
     "node_modules/graceful-fs": {
       "version": "4.2.11",
       "resolved": "https://registry.npmjs.org/graceful-fs/-/graceful-fs-4.2.11.tgz",
@@ -37974,6 +38608,13 @@ global.fetch = jest.fn(() =>
       "license": "MIT",
       "peer": true
     },
+    "node_modules/http-cache-semantics": {
+      "version": "4.2.0",
+      "resolved": "https://registry.npmjs.org/http-cache-semantics/-/http-cache-semantics-4.2.0.tgz",
+      "integrity": "sha512-dTxcvPXqPvXBQpq5dUr6mEMJX4oIEFv6bwom3FDwKRDsuIjjJGANqhBuoAn9c1RQJIdAKav33ED65E2ys+87QQ==",
+      "dev": true,
+      "license": "BSD-2-Clause"
+    },
     "node_modules/http-errors": {
       "version": "2.0.1",
       "resolved": "https://registry.npmjs.org/http-errors/-/http-errors-2.0.1.tgz",
@@ -38016,6 +38657,20 @@ global.fetch = jest.fn(() =>
       },
       "engines": {
         "node": ">= 6"
+      }
+    },
+    "node_modules/http2-wrapper": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/http2-wrapper/-/http2-wrapper-1.0.3.tgz",
+      "integrity": "sha512-V+23sDMr12Wnz7iTcDeJr3O6AIxlnvT/bmaAAAP/Xda35C90p9599p0F1eHR/N1KILWSoWVAiOMFjBBXaXSMxg==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "quick-lru": "^5.1.1",
+        "resolve-alpn": "^1.0.0"
+      },
+      "engines": {
+        "node": ">=10.19.0"
       }
     },
     "node_modules/https-proxy-agent": {
@@ -40666,6 +41321,16 @@ global.fetch = jest.fn(() =>
         "loose-envify": "cli.js"
       }
     },
+    "node_modules/lowercase-keys": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/lowercase-keys/-/lowercase-keys-2.0.0.tgz",
+      "integrity": "sha512-tqNXrS78oMOE73NMxK4EMLQsQowWf8jKooH9g7xPavRT706R6bkQJ6DY2Te7QukaZsulxa30wQ7bk0pm4XiHmA==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=8"
+      }
+    },
     "node_modules/lru-cache": {
       "version": "5.1.1",
       "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-5.1.1.tgz",
@@ -41599,6 +42264,16 @@ global.fetch = jest.fn(() =>
         "node": ">=6"
       }
     },
+    "node_modules/mimic-response": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/mimic-response/-/mimic-response-1.0.1.tgz",
+      "integrity": "sha512-j5EctnkH7amfV/q5Hgmoal1g2QHFJRraOtmx0JpIqkxhBhI/lJSl1nMpQ45hVarwNETOoWEimndZ4QK0RHxuxQ==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=4"
+      }
+    },
     "node_modules/min-indent": {
       "version": "1.0.1",
       "resolved": "https://registry.npmjs.org/min-indent/-/min-indent-1.0.1.tgz",
@@ -41775,6 +42450,19 @@ global.fetch = jest.fn(() =>
       "license": "MIT",
       "engines": {
         "node": ">=0.10.0"
+      }
+    },
+    "node_modules/normalize-url": {
+      "version": "6.1.0",
+      "resolved": "https://registry.npmjs.org/normalize-url/-/normalize-url-6.1.0.tgz",
+      "integrity": "sha512-DlL+XwOy3NxAQ8xuC0okPgK46iuVNAK01YN7RueYBqqFeGsBjV9XmCAzAdgt+667bCl5kPh9EqKKDwnaPG1I7A==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=10"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
       }
     },
     "node_modules/npm-package-arg": {
@@ -42174,6 +42862,16 @@ global.fetch = jest.fn(() =>
       },
       "funding": {
         "url": "https://github.com/sponsors/ljharb"
+      }
+    },
+    "node_modules/p-cancelable": {
+      "version": "2.1.1",
+      "resolved": "https://registry.npmjs.org/p-cancelable/-/p-cancelable-2.1.1.tgz",
+      "integrity": "sha512-BZOr3nRQHOntUjTrH8+Lh54smKHoHyur8We1V8DSMVrl5A2malOOwuJRnKRDjSnkoeBh4at6BwEnb5I7Jl31wg==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=8"
       }
     },
     "node_modules/p-limit": {
@@ -42617,6 +43315,17 @@ global.fetch = jest.fn(() =>
         "url": "https://github.com/sponsors/lupomontero"
       }
     },
+    "node_modules/pump": {
+      "version": "3.0.4",
+      "resolved": "https://registry.npmjs.org/pump/-/pump-3.0.4.tgz",
+      "integrity": "sha512-VS7sjc6KR7e1ukRFhQSY5LM2uBWAUPiOPa/A3mkKmiMwSmRFUITt0xuj+/lesgnCv+dPIEYlkzrcyXgquIHMcA==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "end-of-stream": "^1.1.0",
+        "once": "^1.3.1"
+      }
+    },
     "node_modules/punycode": {
       "version": "2.3.1",
       "resolved": "https://registry.npmjs.org/punycode/-/punycode-2.3.1.tgz",
@@ -42669,6 +43378,19 @@ global.fetch = jest.fn(() =>
       "integrity": "sha512-FIqgj2EUvTa7R50u0rGsyTftzjYmv/a3hO345bZNrqabNqjtgiDMgmo4mkUjd+nzU5oF3dClKqFIPUKybUyqoQ==",
       "dev": true,
       "license": "MIT"
+    },
+    "node_modules/quick-lru": {
+      "version": "5.1.1",
+      "resolved": "https://registry.npmjs.org/quick-lru/-/quick-lru-5.1.1.tgz",
+      "integrity": "sha512-WuyALRjWPDGtt/wzJiadO5AXY+8hZ80hVpe6MyivgraREW751X3SbhRvG3eLKOYN+8VEvqLcf3wdnt44Z4S4SA==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=10"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
     },
     "node_modules/range-parser": {
       "version": "1.2.1",
@@ -43288,6 +44010,13 @@ global.fetch = jest.fn(() =>
         "url": "https://github.com/sponsors/ljharb"
       }
     },
+    "node_modules/resolve-alpn": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/resolve-alpn/-/resolve-alpn-1.2.1.tgz",
+      "integrity": "sha512-0a1F4l73/ZFZOakJnQ3FvkJ2+gSTQWz/r2KE5OdDY0TxPm5h4GkqkWWfM47T7HsbnOtcJVEF4epCVy6u7Q3K+g==",
+      "dev": true,
+      "license": "MIT"
+    },
     "node_modules/resolve-cwd": {
       "version": "3.0.0",
       "resolved": "https://registry.npmjs.org/resolve-cwd/-/resolve-cwd-3.0.0.tgz",
@@ -43336,6 +44065,19 @@ global.fetch = jest.fn(() =>
       "peer": true,
       "engines": {
         "node": ">=10"
+      }
+    },
+    "node_modules/responselike": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/responselike/-/responselike-2.0.1.tgz",
+      "integrity": "sha512-4gl03wn3hj1HP3yzgdI7d3lCkF95F21Pz4BPGvKHinyQzALR5CapwC8yIi0Rh58DEMQ/SguC03wFj2k0M/mHhw==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "lowercase-keys": "^2.0.0"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
       }
     },
     "node_modules/restore-cursor": {
@@ -45466,6 +46208,7 @@ global.fetch = jest.fn(() =>
   "private": true,
   "devDependencies": {
     "@eslint/js": "^9.39.5",
+    "@expo/ngrok": "^4.1.0",
     "@testing-library/react-native": "^14.0.1",
     "eslint": "^9.39.5",
     "eslint-config-expo": "^57.0.2",
