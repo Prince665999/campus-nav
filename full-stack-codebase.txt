@@ -11913,8 +11913,10 @@ def chat(
     if route_context is None:
         return ChatResponse(
             reply=(
-                "I can't find that route anymore. Try starting the walk "
-                "again, or ask a general question in the Chat tab."
+                "I can't rebuild the walk context right now — try "
+                "starting the walk again if you need route-specific "
+                "answers. In the meantime, ask a general question in "
+                "the Chat tab."
             ),
             session_id=session_id,
         )
@@ -11944,9 +11946,25 @@ def _build_route_context(body: ChatRequest, session: Session) -> dict | None:
         nodes = get_nodes()
         edge_tags = get_edge_tags()
 
+        # Resolve the from-endpoint. A place id when the walk started
+        # from the picker; coordinates when it started from live GPS.
+        # When neither is present, we can't rebuild the route.
+        if body.from_place_id is None and (
+            body.from_lat is None or body.from_lon is None
+        ):
+            return None
+
         from_node, from_name = _resolve_endpoint(
-            session, graph, nodes, place_id=body.from_place_id
+            session,
+            graph,
+            nodes,
+            place_id=body.from_place_id,
+            lat=body.from_lat,
+            lon=body.from_lon,
+            is_live_fix=(body.from_place_id is None),
         )
+        if body.to_place_id is None:
+            return None
         to_node, to_name = _resolve_endpoint(
             session, graph, nodes, place_id=body.to_place_id
         )
@@ -11991,8 +12009,22 @@ def _load_cached_narration(session: Session, body: ChatRequest) -> str | None:
         nodes = get_nodes()
         edge_tags = get_edge_tags()
 
+        # Same resolution rules as _build_route_context.
+        if body.from_place_id is None and (
+            body.from_lat is None or body.from_lon is None
+        ):
+            return None
+        if body.to_place_id is None:
+            return None
+
         from_node, from_name = _resolve_endpoint(
-            session, graph, nodes, place_id=body.from_place_id
+            session,
+            graph,
+            nodes,
+            place_id=body.from_place_id,
+            lat=body.from_lat,
+            lon=body.from_lon,
+            is_live_fix=(body.from_place_id is None),
         )
         to_node, to_name = _resolve_endpoint(
             session, graph, nodes, place_id=body.to_place_id
@@ -13087,20 +13119,35 @@ class ExtractDestinationResponse(BaseModel):
 class ChatRequest(BaseModel):
     """Body for POST /api/chat — the route chat.
 
-    All route fields are required: this endpoint only makes sense
-    during a walk. If there's no walk, use POST /api/chat/doc.
+    The starting point is either a place (from_place_id, set when the
+    walk began from the starting-point picker) or the walk's original
+    live coordinates (from_lat/from_lon, the normal GPS-started case).
+    At least one of the two is needed to rebuild the route.
+
+    All route fields are optional at the schema level so the endpoint
+    doesn't 422 if the client can't supply them. When they're missing
+    the endpoint answers with a reduced reply rather than failing.
     """
 
     message: str = Field(..., min_length=1, max_length=1000)
     session_id: str | None = None
 
-    from_place_id: int
-    to_place_id: int
-    current_step_index: int
-    distance_from_start_m: float
+    # The route's starting point. Place ID when the walk began from
+    # the picker; coordinates when it began from live GPS.
+    from_place_id: int | None = None
+    from_lat: float | None = Field(None, ge=-90, le=90)
+    from_lon: float | None = Field(None, ge=-180, le=180)
 
-    # The student's position, used to include nearby places in the
-    # prompt. Optional.
+    # The destination. Always known — a walk always has one.
+    to_place_id: int | None = None
+
+    # Where the student is on the route right now. Used to place the
+    # question on the timeline.
+    current_step_index: int = 0
+    distance_from_start_m: float = 0.0
+
+    # The student's live position, used to include nearby places in
+    # the prompt. Optional.
     current_lat: float | None = Field(None, ge=-90, le=90)
     current_lon: float | None = Field(None, ge=-180, le=180)
 
@@ -23453,9 +23500,9 @@ const styles = StyleSheet.create({
 //   - No route params → document chat. Calls /api/chat/doc.
 //     The student is asking about the university.
 //
-//   - Route params present (fromPlaceId, toPlaceId, etc.) →
-//     route chat. Calls /api/chat. The student is walking and
-//     asking about the walk.
+//   - Route params present (a from-place OR from-coordinates, plus a
+//     destination and step index) → route chat. Calls /api/chat. The
+//     student is walking and asking about the walk.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -23498,16 +23545,46 @@ const DOC_QUICK_PROMPTS = [
 export default function ChatScreen() {
   const params = useLocalSearchParams();
 
-  // Route context is present when opened from Walking Mode.
-  const hasRouteContext = params.fromPlaceId && params.toPlaceId;
-  const fromPlaceId = params.fromPlaceId ? Number(params.fromPlaceId) : null;
-  const toPlaceId = params.toPlaceId ? Number(params.toPlaceId) : null;
+  // Route context: a from-place OR from-coordinates, plus a
+  // destination. A place-started walk sends fromPlaceId; a
+  // GPS-started walk sends fromLat/fromLon. Both are valid.
+  const fromPlaceId =
+    params.fromPlaceId && params.fromPlaceId !== ''
+      ? Number(params.fromPlaceId)
+      : null;
+  const fromLat =
+    params.fromLat && params.fromLat !== '' ? Number(params.fromLat) : null;
+  const fromLon =
+    params.fromLon && params.fromLon !== '' ? Number(params.fromLon) : null;
+  const toPlaceId =
+    params.toPlaceId && params.toPlaceId !== ''
+      ? Number(params.toPlaceId)
+      : null;
   const currentStepIndex =
-    params.currentStepIndex != null ? Number(params.currentStepIndex) : null;
+    params.currentStepIndex != null && params.currentStepIndex !== ''
+      ? Number(params.currentStepIndex)
+      : 0;
   const distanceFromStartM =
-    params.distanceFromStartM != null ? Number(params.distanceFromStartM) : null;
-  const currentLat = params.currentLat != null ? Number(params.currentLat) : null;
-  const currentLon = params.currentLon != null ? Number(params.currentLon) : null;
+    params.distanceFromStartM != null && params.distanceFromStartM !== ''
+      ? Number(params.distanceFromStartM)
+      : 0;
+  const currentLat =
+    params.currentLat && params.currentLat !== ''
+      ? Number(params.currentLat)
+      : null;
+  const currentLon =
+    params.currentLon && params.currentLon !== ''
+      ? Number(params.currentLon)
+      : null;
+
+  // Route chat is active when we have a destination AND some form of
+  // starting point. That covers both a place-started walk and a
+  // GPS-started walk — the case that used to silently fall through
+  // to doc chat.
+  const hasRouteContext = !!(
+    toPlaceId &&
+    (fromPlaceId != null || (fromLat != null && fromLon != null))
+  );
 
   const insets = useSafeAreaInsets();
   const scrollRef = useRef(null);
@@ -23570,6 +23647,8 @@ export default function ChatScreen() {
             message,
             sessionId,
             fromPlaceId,
+            fromLat,
+            fromLon,
             toPlaceId,
             currentStepIndex,
             distanceFromStartM,
@@ -23585,10 +23664,17 @@ export default function ChatScreen() {
           { role: 'assistant', content: response.reply },
         ]);
       } catch (err) {
-        setError(err.message || t('common.error'));
+        // Show the actual failure reason, not just a generic message.
+        // The API client already extracts `detail` from the response
+        // body, so `err.message` is the useful text.
+        const detail = err?.message || t('common.error');
+        setError(detail);
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: t('chat.error') },
+          {
+            role: 'assistant',
+            content: `${t('chat.error')} (${detail})`,
+          },
         ]);
       } finally {
         setSending(false);
@@ -23600,6 +23686,8 @@ export default function ChatScreen() {
       sessionId,
       hasRouteContext,
       fromPlaceId,
+      fromLat,
+      fromLon,
       toPlaceId,
       currentStepIndex,
       distanceFromStartM,
@@ -25540,12 +25628,14 @@ export default function WalkingScreen() {
     offRoute,
     progress,
     resetOffRoute,
+    gpsStale,
   } = useWalkingProgress(route);
 
   const { heading } = useCompass({ position: rawPosition });
 
   useEffect(() => {
     if (!destinationId) return;
+    if (!offRoute) return;                 // only recompute when genuinely off-route
     if (recomputeAttemptsRef.current >= 3) return;
     if (!rawPosition) return;
     if (
@@ -25575,7 +25665,7 @@ export default function WalkingScreen() {
     }, RECOMPUTE_AFTER_MS);
 
     return () => clearTimeout(timer);
-  }, [rawPosition, destinationId, resetOffRoute]);
+  }, [offRoute, rawPosition, destinationId, resetOffRoute]);
 
   const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
     position,
@@ -25670,7 +25760,12 @@ export default function WalkingScreen() {
   })();
 
   const handleRecalculate = useCallback(async () => {
-    if (!position) return;
+    // Prefer the freshest live GPS fix. `position` is snapped to the
+    // route and can be stuck on a stale segment; `rawPosition` is the
+    // real raw fix from the OS. Fall back to `position` only if no
+    // raw fix has arrived yet.
+    const from = rawPosition || position;
+    if (!from) return;
     if (!destinationId) return;
     setBannerDismissed(false);
     setPhotoDismissed(false);
@@ -25679,8 +25774,8 @@ export default function WalkingScreen() {
     recomputeAttemptsRef.current = 0;
     try {
       const data = await computeRoute({
-        fromLat: position.lat,
-        fromLon: position.lon,
+        fromLat: from.lat,
+        fromLon: from.lon,
         fromAccuracyM: rawPosition?.accuracyM ?? null,
         toPlaceId: destinationId,
       });
@@ -25689,17 +25784,23 @@ export default function WalkingScreen() {
   }, [position, rawPosition, destinationId, resetOffRoute]);
 
   const openChat = useCallback(() => {
+    const req = routeRequestRef.current;
     router.push({
       pathname: '/chat',
       params: {
-        fromPlaceId: routeRequestRef.current?.fromId
-          ? String(routeRequestRef.current.fromId)
-          : '',
+        // Place-based start, if there was one.
+        fromPlaceId: req?.fromId != null ? String(req.fromId) : '',
+        // GPS-based start, if that's how the walk began. The chat
+        // screen needs one or the other to rebuild the route.
+        fromLat: req?.fromLat != null ? String(req.fromLat) : '',
+        fromLon: req?.fromLon != null ? String(req.fromLon) : '',
+        // The destination and where the student is on the walk.
         toPlaceId: String(destinationId || ''),
         currentStepIndex: String(currentStepIndex ?? 0),
         distanceFromStartM: String(
           (route?.distance_m || 0) - distanceRemainingM
         ),
+        // Live position, used for nearby-places context only.
         currentLat: position ? String(position.lat) : '',
         currentLon: position ? String(position.lon) : '',
       },
@@ -25763,6 +25864,18 @@ export default function WalkingScreen() {
           headerRight: () => (
             <View style={styles.headerButtons}>
               <TouchableOpacity
+                onPress={handleRecalculate}
+                style={styles.headerButton}
+                accessibilityRole="button"
+                accessibilityLabel="Recalculate route"
+              >
+                <MaterialIcons
+                  name="my-location"
+                  size={22}
+                  color={COLORS.text}
+                />
+              </TouchableOpacity>
+              <TouchableOpacity
                 onPress={openChat}
                 style={styles.headerButton}
                 accessibilityRole="button"
@@ -25825,6 +25938,7 @@ export default function WalkingScreen() {
             progress={progress}
             heading={heading}
             bearing={bearing}
+            gpsStale={gpsStale}
           />
         </View>
       </View>
@@ -26542,6 +26656,7 @@ export function InstructionCard({
   progress,
   heading,
   bearing,
+  gpsStale = false,
 }) {
   const insets = useSafeAreaInsets();
   const { fonts } = useAccessibility();
@@ -26570,6 +26685,12 @@ export function InstructionCard({
           style={[styles.progressFill, { width: `${Math.round(progress * 100)}%` }]}
         />
       </View>
+
+      {gpsStale ? (
+        <View style={styles.gpsStrip}>
+          <Text style={styles.gpsText}>{t('walking.searchingGps')}</Text>
+        </View>
+      ) : null}
 
       <View style={styles.body}>
         <CompassArrow
@@ -26613,6 +26734,18 @@ const styles = StyleSheet.create({
   progressFill: {
     height: 4,
     backgroundColor: COLORS.primary,
+  },
+  gpsStrip: {
+    paddingHorizontal: SPACING.lg,
+    paddingVertical: 6,
+    backgroundColor: COLORS.warningBg,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.warningBorder,
+  },
+  gpsText: {
+    fontSize: 12,
+    color: COLORS.warningText,
+    fontWeight: '500',
   },
   body: {
     paddingHorizontal: SPACING.lg,
@@ -28071,7 +28204,7 @@ export const ALL_CATEGORIES = null;
 const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
 
 export const API_BASE_URL =
-process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
+  process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
 
 export const API_TIMEOUT_MS = 15000;
 
@@ -28081,7 +28214,7 @@ export const SEARCH_RESULT_LIMIT = 20;
 // ---------------------------------------------------------------------------
 // GPS accuracy thresholds
 //
-// These three constants work together. Changing one without the others
+// These constants work together. Changing one without the others
 // can leave the app in a state where the dot freezes, routes silently
 // fail, or bad fixes produce wrong routes.
 // ---------------------------------------------------------------------------
@@ -28100,6 +28233,13 @@ export const DISPLAY_MAX_ACCURACY_M = 40;
 // Used in: hooks/useWalkingProgress.js
 export const DISPLAY_STALE_FIX_MS = 8000;
 
+// How long without a good fix before the walking screen shows a
+// "searching for GPS" indicator. Shorter than DISPLAY_STALE_FIX_MS
+// so the student knows the dot is about to start accepting bad fixes.
+//
+// Used in: components/InstructionCard.jsx, via useWalkingProgress.
+export const DISPLAY_STALE_INDICATOR_S = 4;
+
 // The maximum reported accuracy (in metres) a fix is allowed to have
 // before the walking screen's route recompute runs. Recomputes are
 // expensive; a bad fix would produce a wrong route. This threshold is
@@ -28115,6 +28255,16 @@ export const RECOMPUTE_MAX_ACCURACY_M = 50;
 //
 // Used in: app/walking.jsx
 export const RECOMPUTE_AFTER_MS = 2000;
+
+// The maximum reported accuracy (in metres) a fix is allowed to have
+// to be counted as evidence of being off-route. Deliberately looser
+// than DISPLAY_MAX_ACCURACY_M: a fix too rough to move the dot is
+// still real evidence you've drifted off the mapped path. Above this
+// is almost always cell-tower noise, which we don't want triggering
+// a false "you seem off route" banner.
+//
+// Used in: hooks/useWalkingProgress.js
+export const OFF_ROUTE_MAX_ACCURACY_M = 80;
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\icons.js ---
 
@@ -28797,18 +28947,12 @@ import {
   distanceToNextStep,
   progressFraction,
 } from '@/utils/progress';
-
-// GPS fixes above this accuracy are ignored for display purposes —
-// they're usually network-based estimates, not real GPS, and they
-// would jump the dot to a wrong spot. 40 m is generous enough to
-// accept every real GPS fix while rejecting the 80–100+ m network
-// fallbacks.
-const MAX_DISPLAY_ACCURACY_M = 40;
-
-// If no good fix has arrived in this many milliseconds, accept the
-// best available fix even if it's above the accuracy threshold.
-// Without this, walking under cover would freeze the dot entirely.
-const STALE_FIX_MS = 8000;
+import {
+  DISPLAY_MAX_ACCURACY_M,
+  DISPLAY_STALE_FIX_MS,
+  DISPLAY_STALE_INDICATOR_S,
+  OFF_ROUTE_MAX_ACCURACY_M,
+} from '@/constants/config';
 
 export function useWalkingProgress(route) {
   const [permissionGranted, setPermissionGranted] = useState(null);
@@ -28816,12 +28960,13 @@ export function useWalkingProgress(route) {
   const [snappedPosition, setSnappedPosition] = useState(null);
   const [distanceFromStart, setDistanceFromStart] = useState(0);
   const [offRoute, setOffRoute] = useState(false);
+  const [gpsStale, setGpsStale] = useState(false);
 
   const detectorRef = useRef(createOffRouteDetector());
 
   // Track the last time a good fix was accepted. Used by the stale
-  // fallback above.
-  const lastGoodFixAtRef = useRef(0);
+  // fallback and by the "searching for GPS" indicator.
+  const lastGoodFixAtRef = useRef(Date.now());
 
   // The current route geometry, kept in a ref so the location
   // callback always reads the latest without the subscription effect
@@ -28860,6 +29005,7 @@ export function useWalkingProgress(route) {
 
     detectorRef.current.reset();
     lastGoodFixAtRef.current = Date.now();
+    setGpsStale(false);
 
     let cancelled = false;
     let stopFn = null;
@@ -28868,17 +29014,45 @@ export function useWalkingProgress(route) {
       (loc) => {
         if (cancelled) return;
 
-        // Quality gate: skip fixes whose accuracy is worse than the
-        // threshold, unless nothing good has arrived for a while.
         const now = Date.now();
         const isGoodFix =
-          loc.accuracyM != null && loc.accuracyM <= MAX_DISPLAY_ACCURACY_M;
-        const isStale = now - lastGoodFixAtRef.current > STALE_FIX_MS;
+          loc.accuracyM != null && loc.accuracyM <= DISPLAY_MAX_ACCURACY_M;
+        const isStale = now - lastGoodFixAtRef.current > DISPLAY_STALE_FIX_MS;
+        const shouldDisplay = isGoodFix || isStale;
 
-        if (!isGoodFix && !isStale) {
+        // Off-route detection runs on EVERY fix — even ones too rough
+        // to move the dot. A noisy fix is still evidence you've
+        // drifted off the mapped path. The only gate is the looser
+        // OFF_ROUTE_MAX_ACCURACY_M, which rejects cell-tower garbage.
+        const geom = geometryRef.current;
+        let snapped = null;
+        if (geom) {
+          snapped = snapToRoute({ lat: loc.lat, lon: loc.lon }, geom);
+          if (snapped) {
+            const trustedForOffRoute =
+              loc.accuracyM != null &&
+              loc.accuracyM <= OFF_ROUTE_MAX_ACCURACY_M;
+            if (trustedForOffRoute) {
+              const isOffRoute = detectorRef.current.record(snapped.offRouteM);
+              setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
+            }
+          }
+        }
+
+        if (!shouldDisplay) {
+          // Not a good enough fix to move the dot, but we've already
+          // updated off-route detection above. Now check whether we
+          // should tell the student the GPS is degraded.
+          const secondsSinceGoodFix =
+            (now - lastGoodFixAtRef.current) / 1000;
+          if (secondsSinceGoodFix >= DISPLAY_STALE_INDICATOR_S) {
+            setGpsStale((prev) => (prev ? prev : true));
+          }
           return;
         }
+
         lastGoodFixAtRef.current = now;
+        setGpsStale((prev) => (prev ? false : prev));
 
         setRawPosition({
           lat: loc.lat,
@@ -28886,17 +29060,10 @@ export function useWalkingProgress(route) {
           accuracyM: loc.accuracyM,
         });
 
-        const geom = geometryRef.current;
-        if (!geom) return;
-
-        const snapped = snapToRoute({ lat: loc.lat, lon: loc.lon }, geom);
-        if (!snapped) return;
-
-        setSnappedPosition({ lat: snapped.lat, lon: snapped.lon });
-        setDistanceFromStart(snapped.distanceFromStartM);
-
-        const isOffRoute = detectorRef.current.record(snapped.offRouteM);
-        setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
+        if (snapped) {
+          setSnappedPosition({ lat: snapped.lat, lon: snapped.lon });
+          setDistanceFromStart(snapped.distanceFromStartM);
+        }
       },
       () => {
         // Location error. Subscription stays alive.
@@ -28953,6 +29120,10 @@ export function useWalkingProgress(route) {
     offRoute,
     progress,
     resetOffRoute,
+    // True when no good GPS fix has arrived for DISPLAY_STALE_INDICATOR_S.
+    // The dot may still be moving on a stale fallback fix; this just
+    // means the fix is older than we'd like.
+    gpsStale,
   };
 }
 
@@ -29019,14 +29190,15 @@ export function useWalkingProgress(route) {
     "noRoute": "No route found between those places."
   },
   "walking": {
-    "title": "Walking",
-    "offRouteTitle": "You seem off route",
-    "offRouteSubtitle": "Are you on a different path?",
-    "recalculate": "Recalculate",
-    "permissionNeeded": "Location permission is needed to guide you.",
-    "approaching": "You're approaching {name}",
-    "calculating": "Calculating route…"
-  },
+  "title": "Walking",
+  "offRouteTitle": "You seem off route",
+  "offRouteSubtitle": "Are you on a different path?",
+  "recalculate": "Recalculate",
+  "permissionNeeded": "Location permission is needed to guide you.",
+  "approaching": "You're approaching {name}",
+  "calculating": "Calculating route…",
+  "searchingGps": "Searching for GPS…"
+},
   "arrival": {
     "title": "Arrival",
     "arrived": "You've arrived",
@@ -29275,14 +29447,15 @@ export function ttsLanguageForCurrentLang() {
     "noRoute": "Hakuna njia kati ya mahali hapo."
   },
   "walking": {
-    "title": "Kutembea",
-    "offRouteTitle": "Unaonekana uko nje ya njia",
-    "offRouteSubtitle": "Umepitia njia nyingine?",
-    "recalculate": "Hesabu tena",
-    "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
-    "approaching": "Unakaribia {name}",
-    "calculating": "Inahesabu njia…"
-  },
+  "title": "Kutembea",
+  "offRouteTitle": "Unaonekana uko nje ya njia",
+  "offRouteSubtitle": "Umepitia njia nyingine?",
+  "recalculate": "Hesabu tena",
+  "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
+  "approaching": "Unakaribia {name}",
+  "calculating": "Inahesabu njia…",
+  "searchingGps": "Inatafuta GPS…"
+},
   "arrival": {
     "title": "Kufika",
     "arrived": "Umefika",
@@ -46458,6 +46631,8 @@ export async function sendRouteChatMessage({
   message,
   sessionId,
   fromPlaceId,
+  fromLat,
+  fromLon,
   toPlaceId,
   currentStepIndex,
   distanceFromStartM,
@@ -46467,10 +46642,12 @@ export async function sendRouteChatMessage({
   const body = {
     message,
     session_id: sessionId || null,
-    from_place_id: fromPlaceId,
-    to_place_id: toPlaceId,
-    current_step_index: currentStepIndex,
-    distance_from_start_m: distanceFromStartM,
+    from_place_id: fromPlaceId ?? null,
+    from_lat: fromLat ?? null,
+    from_lon: fromLon ?? null,
+    to_place_id: toPlaceId ?? null,
+    current_step_index: currentStepIndex ?? 0,
+    distance_from_start_m: distanceFromStartM ?? 0,
     current_lat: currentLat ?? null,
     current_lon: currentLon ?? null,
   };
