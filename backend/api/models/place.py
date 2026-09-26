@@ -28,8 +28,14 @@ class Place(Base, TimestampMixin):
     name_sw: Mapped[str | None] = mapped_column(String(255), nullable=True)
     alt_names: Mapped[str | None] = mapped_column(Text, nullable=True)  # semicolon-separated
 
-    # Description — OSM-sourced initially, editable by hand later
+    # Public description — shown to students in the app. Formal text
+    # written by an admin. Not fed to the AI.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # AI description — fed to the narration system. Informal text
+    # that mentions landmarks, local nicknames, "the big mango tree".
+    # Never shown in the app front end.
+    description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Coordinates. Kept as separate lat/lon columns for ease of read;
     # Phase 13 adds a proper geometry column alongside these.

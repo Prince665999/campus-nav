@@ -38,7 +38,7 @@ def _osm_only_place_fields(node, tags):
     for osm_key, db_key in (
         ("name:sw", "name_sw"),
         ("alt_name", "alt_names"),
-        ("description", "description"),
+        ("description", "description_ai"),
         ("ref", "ref"),
         ("wheelchair", "wheelchair"),
         ("opening_hours", "opening_hours"),

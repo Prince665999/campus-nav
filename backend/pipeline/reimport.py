@@ -72,7 +72,7 @@ def _osm_only_place_fields(node, tags):
     for osm_key, db_key in (
         ("name:sw", "name_sw"),
         ("alt_name", "alt_names"),
-        ("description", "description"),
+        ("description", "description_ai"),
         ("ref", "ref"),
         ("wheelchair", "wheelchair"),
         ("opening_hours", "opening_hours"),
@@ -151,7 +151,7 @@ def run_reimport(osm_path=None):
             for osm_key, db_key in (
                 ("name:sw", "name_sw"),
                 ("alt_name", "alt_names"),
-                ("description", "description"),
+                ("description", "description_ai"),
             ):
                 if tags.get(osm_key):
                     fields[db_key] = tags[osm_key]
@@ -196,7 +196,7 @@ def run_reimport(osm_path=None):
                 "incline": tags.get("incline"),
                 "wheelchair": tags.get("wheelchair"),
                 "access": tags.get("access"),
-                "description": tags.get("description"),
+                "description_ai": tags.get("description"),
             }
             if row is None:
                 row = PathEdge(node_a_osm=a, node_b_osm=b)

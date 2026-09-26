@@ -65,6 +65,8 @@ def _to_detail(area: Area) -> AreaDetail:
         name=summary.name,
         name_sw=summary.name_sw,
         alt_names=area.alt_names,
+        # Public description only. The AI description
+        # (`area.description_ai`) is never returned here.
         description=area.description,
         category=summary.category,
         boundary=summary.boundary,

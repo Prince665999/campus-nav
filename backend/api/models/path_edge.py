@@ -36,7 +36,14 @@ class PathEdge(Base, TimestampMixin):
     incline: Mapped[str | None] = mapped_column(String(32), nullable=True)
     wheelchair: Mapped[str | None] = mapped_column(String(16), nullable=True)
     access: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Public description — shown to students in the app. Not fed to
+    # the AI.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # AI description — fed to the narration system. Never shown in
+    # the app front end.
+    description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         Index("ix_path_edges_pair", "node_a_osm", "node_b_osm", unique=True),

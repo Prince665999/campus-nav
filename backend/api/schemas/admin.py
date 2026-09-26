@@ -32,7 +32,13 @@ class UpdatePlaceRequest(BaseModel):
     name: str | None = Field(None, max_length=255)
     name_sw: str | None = Field(None, max_length=255)
     alt_names: str | None = None
+
+    # Public description — shown to students in the app.
     description: str | None = None
+
+    # AI description — fed to narration. Never shown to students.
+    description_ai: str | None = None
+
     category: str | None = Field(None, max_length=64)
     ref: str | None = Field(None, max_length=64)
     wheelchair: str | None = Field(None, max_length=16)

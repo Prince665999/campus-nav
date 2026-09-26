@@ -29,6 +29,7 @@ export default function PlaceEditorPage() {
       name_sw: place.name_sw || '',
       alt_names: place.alt_names || '',
       description: place.description || '',
+      description_ai: place.description_ai || '',
       category: place.category || '',
       ref: place.ref || '',
       wheelchair: place.wheelchair || '',
@@ -176,12 +177,23 @@ export default function PlaceEditorPage() {
                   onChange={(v) => setForm({ ...form, alt_names: v })}
                   hint="Semicolon-separated. What students actually call it."
                 />
+
                 <FormField
-                  label="Description"
+                  label="Description (shown to students)"
                   value={form.description}
                   onChange={(v) => setForm({ ...form, description: v })}
                   textarea
+                  hint="Formal text. This is what students see on the place detail screen in the app."
                 />
+
+                <FormField
+                  label="AI description (internal, never shown)"
+                  value={form.description_ai}
+                  onChange={(v) => setForm({ ...form, description_ai: v })}
+                  textarea
+                  hint="Informal text fed to the narration system. Use landmarks, local nicknames, walking hints. Never appears in the app."
+                />
+
                 <FormField
                   label="Category"
                   value={form.category}

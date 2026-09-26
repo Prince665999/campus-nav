@@ -30,6 +30,8 @@ def _to_detail(place: Place) -> PlaceDetail:
         name=place.name,
         name_sw=place.name_sw,
         alt_names=place.alt_names,
+        # Public description only. The AI description
+        # (`place.description_ai`) is never returned here.
         description=place.description,
         category=place.category,
         ref=place.ref,

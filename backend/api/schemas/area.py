@@ -27,7 +27,12 @@ class AreaSummary(BaseModel):
 
 
 class AreaDetail(BaseModel):
-    """Full detail for the admin editor."""
+    """Full detail for the admin editor.
+
+    Note: the `description` here is the public one, read from the
+    database's `description` column. The AI-facing description lives
+    under `description_ai` and is never returned in a public response.
+    """
 
     id: int
     name: str

@@ -24,7 +24,12 @@ class PlaceSummary(BaseModel):
 
 class PlaceDetail(BaseModel):
     """The shape returned by /api/places/{id}. Adds fields the summary
-    doesn't need."""
+    doesn't need.
+
+    Note: the `description` here is the public one, read from the
+    database's `description` column. The AI-facing description lives
+    under `description_ai` and is never returned in a public response.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -93,7 +93,7 @@ def ingest_places(nodes, session):
         if tags.get("alt_name"):
             existing.alt_names = tags["alt_name"]
         if tags.get("description"):
-            existing.description = tags["description"]
+            existing.description_ai = tags["description"]
 
         # Everything below is set-once from OSM. Hand edits to these
         # are rare; if you need them, use edit_place.py which will set
@@ -140,7 +140,7 @@ def ingest_areas(nodes, ways, session):
         if tags.get("alt_name"):
             existing.alt_names = tags["alt_name"]
         if tags.get("description"):
-            existing.description = tags["description"]
+            existing.description_ai = tags["description"]
         existing.category = _category_from_tags(tags) or existing.category
 
         # landmark=yes means "worth mentioning in narration". Default is
@@ -192,7 +192,7 @@ def ingest_path_edges(nodes, ways, session):
         existing.incline = tags.get("incline", existing.incline)
         existing.wheelchair = tags.get("wheelchair", existing.wheelchair)
         existing.access = tags.get("access", existing.access)
-        existing.description = tags.get("description", existing.description)
+        existing.description_ai = tags.get("description", existing.description_ai)
 
         written += 1
     return written

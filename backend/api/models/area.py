@@ -27,7 +27,15 @@ class Area(Base, TimestampMixin):
     name_sw: Mapped[str | None] = mapped_column(String(255), nullable=True)
     alt_names: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Public description — shown to students in the app. Formal text
+    # written by an admin. Not fed to the AI.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # AI description — fed to the narration system. Informal text
+    # that mentions landmarks, local nicknames, "the big mango tree".
+    # Never shown in the app front end.
+    description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # WKT "POLYGON((lon lat, ...))" — Phase 13 changes this column to a
