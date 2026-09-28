@@ -1,8 +1,9 @@
 // Onboarding. Shown once, on first launch.
 //
-// Three slides. Swipe or tap Next. Skip is always available.
-// Completing or skipping sets hasSeenOnboarding and replaces the
-// navigation stack with Home.
+// Four slides now: welcome, search, walk, and program/year selection.
+// Swipe or tap Next. Skip is always available on the first three
+// slides. On the last slide, the student either picks or taps
+// "Get started" without picking — both work.
 
 import { useRef, useState } from 'react';
 import {
@@ -17,6 +18,7 @@ import { MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { ProgramYearPicker } from '@/components/ProgramYearPicker';
 import { useSettings } from '@/context/SettingsContext';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
@@ -43,16 +45,30 @@ const SLIDES = [
     titleKey: 'onboarding.walkTitle',
     bodyKey: 'onboarding.walkBody',
   },
+  {
+    key: 'timetable',
+    icon: 'schedule',
+    titleKey: 'onboarding.timetableTitle',
+    bodyKey: 'onboarding.timetableBody',
+    isPicker: true,
+  },
 ];
 
 export default function OnboardingScreen() {
-  const { updateSetting, settings } = useSettings();
+  const { updateSetting } = useSettings();
   const insets = useSafeAreaInsets();
   const listRef = useRef(null);
   const [index, setIndex] = useState(0);
+  // Set when the student picks a program/year on the last slide.
+  const [pickedProgramYearId, setPickedProgramYearId] = useState(null);
 
   function finish() {
     updateSetting('hasSeenOnboarding', true);
+    // Only save the selection if they actually picked one. Skipping
+    // leaves the setting untouched (null by default).
+    if (pickedProgramYearId != null) {
+      updateSetting('programYearId', pickedProgramYearId);
+    }
     router.replace('/');
   }
 
@@ -72,19 +88,24 @@ export default function OnboardingScreen() {
   }
 
   const isLast = index === SLIDES.length - 1;
+  const isPickerSlide = SLIDES[index]?.isPicker === true;
 
   return (
     <View style={styles.container}>
-      <View style={[styles.skipRow, { top: insets.top + SPACING.sm }]}>
-        <TouchableOpacity
-          onPress={finish}
-          style={styles.skipButton}
-          accessibilityRole="button"
-          accessibilityLabel={t('onboarding.skip')}
-        >
-          <Text style={styles.skipText}>{t('onboarding.skip')}</Text>
-        </TouchableOpacity>
-      </View>
+      {/* Skip is hidden on the picker slide — the student can tap
+          "Get started" without picking instead. */}
+      {!isPickerSlide ? (
+        <View style={[styles.skipRow, { top: insets.top + SPACING.sm }]}>
+          <TouchableOpacity
+            onPress={finish}
+            style={styles.skipButton}
+            accessibilityRole="button"
+            accessibilityLabel={t('onboarding.skip')}
+          >
+            <Text style={styles.skipText}>{t('onboarding.skip')}</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       <FlatList
         ref={listRef}
@@ -101,15 +122,36 @@ export default function OnboardingScreen() {
         })}
         renderItem={({ item }) => (
           <View style={[styles.slide, { width: SCREEN_WIDTH }]}>
-            <View style={styles.iconCircle}>
-              <MaterialIcons
-                name={ICONS[item.icon] || ICONS.place}
-                size={56}
-                color={COLORS.primaryDark}
-              />
-            </View>
-            <Text style={styles.slideTitle}>{t(item.titleKey)}</Text>
-            <Text style={styles.slideBody}>{t(item.bodyKey)}</Text>
+            {item.isPicker ? (
+              <>
+                <View style={styles.pickerHeader}>
+                  <View style={styles.iconCircleSmall}>
+                    <MaterialIcons
+                      name="schedule"
+                      size={40}
+                      color={COLORS.primaryDark}
+                    />
+                  </View>
+                  <Text style={styles.slideTitle}>{t(item.titleKey)}</Text>
+                  <Text style={styles.slideBody}>{t(item.bodyKey)}</Text>
+                </View>
+                <View style={styles.pickerBody}>
+                  <ProgramYearPicker onSelect={setPickedProgramYearId} />
+                </View>
+              </>
+            ) : (
+              <>
+                <View style={styles.iconCircle}>
+                  <MaterialIcons
+                    name={ICONS[item.icon] || ICONS.place}
+                    size={56}
+                    color={COLORS.primaryDark}
+                  />
+                </View>
+                <Text style={styles.slideTitle}>{t(item.titleKey)}</Text>
+                <Text style={styles.slideBody}>{t(item.bodyKey)}</Text>
+              </>
+            )}
           </View>
         )}
       />
@@ -176,6 +218,15 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: SPACING.xl,
   },
+  iconCircleSmall: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: COLORS.backgroundSubtle,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: SPACING.md,
+  },
   slideTitle: {
     fontSize: FONT_SIZE.hero,
     fontWeight: '700',
@@ -188,6 +239,16 @@ const styles = StyleSheet.create({
     color: COLORS.textMuted,
     textAlign: 'center',
     lineHeight: 26,
+  },
+  pickerHeader: {
+    alignItems: 'center',
+    paddingTop: SPACING.xl,
+    paddingBottom: SPACING.md,
+  },
+  pickerBody: {
+    flex: 1,
+    alignSelf: 'stretch',
+    paddingTop: SPACING.sm,
   },
   dots: {
     flexDirection: 'row',

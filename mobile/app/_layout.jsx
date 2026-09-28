@@ -62,6 +62,7 @@ function AppStack() {
       <Stack.Screen name="arrival" options={{ title: 'Arrival' }} />
       <Stack.Screen name="chat" options={{ title: 'Chat' }} />
       <Stack.Screen name="explore" options={{ title: 'Explore' }} />
+      <Stack.Screen name="timetable" options={{ title: 'Timetable' }} />
       <Stack.Screen
         name="onboarding"
         options={{

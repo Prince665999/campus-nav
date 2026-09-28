@@ -113,7 +113,9 @@
     "walkBody": "Maelekezo ya moja kwa moja, yanayosemwa kwa sauti, na mshale wa dira unaoelekeza njia.",
     "getStarted": "Anza",
     "skip": "Ruka",
-    "next": "Endelea"
+    "next": "Endelea",
+    "timetableTitle": "Ratiba yako",
+    "timetableBody": "Chagua programu na mwaka wako ili kuona vipindi vyako na kupata maelekezo kwa kila ukumbi."
   },
   "report": {
     "title": "Ripoti tatizo",
@@ -168,5 +170,41 @@
     "offices": "Ofisi",
     "hostels": "Hosteli",
     "library": "Maktaba"
+  },
+  "timetable": {
+  "title": "Ratiba",
+  "noClasses": "Hakuna vipindi siku hii.",
+  "periodsCount": "Vipindi {count}",
+  "days": {
+    "monday": "Jumatatu",
+    "tuesday": "Jumanne",
+    "wednesday": "Jumatano",
+    "thursday": "Alhamisi",
+    "friday": "Ijumaa",
+    "saturday": "Jumamosi",
+    "sunday": "Jumapili",
+    "mon": "Jtat",
+    "tue": "Jnan",
+    "wed": "Jtan",
+    "thu": "Alh",
+    "fri": "Ijm",
+    "sat": "Jmos",
+    "sun": "Jpil"
+  },
+  "picker": {
+    "intro": "Chagua programu na mwaka wako ili kuona ratiba yako.",
+    "stepProgram": "Hatua 1 — Chagua programu yako",
+    "stepYear": "Hatua 2 — Chagua mwaka wako",
+    "loading": "Inapakia programu…",
+    "empty": "Hakuna programu bado. Angalia tena baadaye.",
+    "noYears": "Hakuna miaka inayopatikana kwa programu hii.",
+    "yearLabel": "Mwaka {n}"
+  },
+  "banner": {
+    "startingNow": "Inaanza sasa",
+    "startsIn": "Baada ya dakika {minutes}",
+    "takeMeThere": "Nipeleke hapo",
+    "viewTimetable": "Ona ratiba"
   }
+}
 }

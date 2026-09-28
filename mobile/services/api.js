@@ -3,7 +3,7 @@
 import { API_BASE_URL, API_TIMEOUT_MS } from '@/constants/config';
 import { getDeviceId } from '@/services/session';
 
-async function request(path, options = {}) {
+export async function request(path, options = {}) {
   const url = API_BASE_URL + path;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
@@ -66,10 +66,11 @@ export async function searchPlaces(q, { limit = 20 } = {}) {
   return request(`/api/places/search?${params.toString()}`);
 }
 
-export async function listPlaces({ q, category, lat, lon, radius_m, limit } = {}) {
+export async function listPlaces({ q, category, intent, lat, lon, radius_m, limit } = {}) {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (category) params.set('category', category);
+  if (intent) params.set('intent', intent);
   if (lat != null) params.set('lat', String(lat));
   if (lon != null) params.set('lon', String(lon));
   if (radius_m != null) params.set('radius_m', String(radius_m));

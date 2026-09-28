@@ -113,7 +113,9 @@
     "walkBody": "Live directions, spoken turn-by-turn, and a compass arrow pointing the way.",
     "getStarted": "Get started",
     "skip": "Skip",
-    "next": "Next"
+    "next": "Next",
+    "timetableTitle": "Your timetable",
+    "timetableBody": "Pick your program and year to see your classes and get directions to each venue."
   },
   "report": {
     "title": "Report a problem",
@@ -168,5 +170,41 @@
     "offices": "Offices",
     "hostels": "Hostels",
     "library": "Library"
+  },
+  "timetable": {
+  "title": "Timetable",
+  "noClasses": "No classes on this day.",
+  "periodsCount": "{count} period(s)",
+  "days": {
+    "monday": "Monday",
+    "tuesday": "Tuesday",
+    "wednesday": "Wednesday",
+    "thursday": "Thursday",
+    "friday": "Friday",
+    "saturday": "Saturday",
+    "sunday": "Sunday",
+    "mon": "Mon",
+    "tue": "Tue",
+    "wed": "Wed",
+    "thu": "Thu",
+    "fri": "Fri",
+    "sat": "Sat",
+    "sun": "Sun"
+  },
+  "picker": {
+    "intro": "Choose your program and year to see your timetable.",
+    "stepProgram": "Step 1 — Choose your program",
+    "stepYear": "Step 2 — Choose your year",
+    "loading": "Loading programs…",
+    "empty": "No programs available yet. Check back later.",
+    "noYears": "No years available for this program.",
+    "yearLabel": "Year {n}"
+  },
+  "banner": {
+    "startingNow": "Starting now",
+    "startsIn": "In {minutes} min",
+    "takeMeThere": "Take me there",
+    "viewTimetable": "View timetable"
   }
+}
 }

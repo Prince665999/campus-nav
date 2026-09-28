@@ -23,6 +23,9 @@ const DEFAULT_SETTINGS = {
   hapticsEnabled: true,
   reduceMotion: false,
   hasSeenOnboarding: false,
+  // The selected program-year for the timetable. Null until the
+  // student picks one (or if they skipped). Local only — no login.
+  programYearId: null,
 };
 
 const SettingsContext = createContext({
@@ -46,8 +49,6 @@ export function SettingsProvider({ children }) {
         setLoaded(true);
       })
       .catch(() => {
-        // Storage failed. Use defaults and mark as loaded so the
-        // app doesn't hang waiting.
         if (cancelled) return;
         setLoaded(true);
       });
@@ -61,7 +62,6 @@ export function SettingsProvider({ children }) {
       const next = { ...prev, [key]: value };
       setJSON(STORAGE_KEY, next);
 
-      // Language is special: it has a side effect on the i18n module.
       if (key === 'language') {
         setI18nLanguage(value);
       }
