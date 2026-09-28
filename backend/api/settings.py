@@ -52,7 +52,7 @@ INGEST_REPLACE = os.environ.get("INGEST_REPLACE", "false").lower() == "true"
 # Media
 # ---------------------------------------------------------------------------
 
-MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://localhost:8000")
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "https://dpi-movement-bryan-relating.trycloudflare.com")
 MEDIA_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 
 MEDIA_VARIANTS = [
