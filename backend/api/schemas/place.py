@@ -18,6 +18,7 @@ class PlaceSummary(BaseModel):
     name: str
     name_sw: str | None = None
     category: str | None = None
+    intents: str | None = None
     location: LatLon
     is_landmark: bool = False
 
@@ -39,6 +40,7 @@ class PlaceDetail(BaseModel):
     alt_names: str | None = None
     description: str | None = None
     category: str | None = None
+    intents: str | None = None
     ref: str | None = None
     location: LatLon
     wheelchair: str | None = None
@@ -53,6 +55,7 @@ class PlaceListParams(BaseModel):
 
     q: str | None = None
     category: str | None = None
+    intent: str | None = None
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)

@@ -19,16 +19,17 @@ router = APIRouter(prefix="/api/places", tags=["places"])
 def list_places(
     q: str | None = Query(None, description="Substring match on name"),
     category: str | None = Query(None),
+    intent: str | None = Query(None, description="Substring match on intents"),
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
     radius_m: float = Query(500, gt=0, le=5000),
     limit: int = Query(50, gt=0, le=200),
     session: Session = Depends(db_session),
 ):
-    """List places, optionally filtered by query, category, or
+    """List places, optionally filtered by query, category, intent, or
     proximity."""
     return place_service.search_places(
-        session, q=q, category=category, lat=lat, lon=lon,
+        session, q=q, category=category, intent=intent, lat=lat, lon=lon,
         radius_m=radius_m, limit=limit,
     )
 

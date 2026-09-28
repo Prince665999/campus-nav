@@ -10,9 +10,12 @@ from .knowledge_document import KnowledgeDocument
 from .media import Media
 from .path_edge import PathEdge
 from .place import Place
+from .program import Program
+from .program_year import ProgramYear
 from .recent_destination import RecentDestination
 from .report import Report
 from .route_cache import RouteCache
+from .timetable_entry import TimetableEntry
 
 __all__ = [
     "Base",
@@ -27,4 +30,7 @@ __all__ = [
     "RouteCache",
     "AdminUser",
     "KnowledgeDocument",
+    "Program",
+    "ProgramYear",
+    "TimetableEntry",
 ]

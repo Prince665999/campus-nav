@@ -37,6 +37,12 @@ class Place(Base, TimestampMixin):
     # Never shown in the app front end.
     description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Free-text list of intents this place serves, semicolon-separated.
+    # Examples: "eat; study; wifi", "print; study".
+    # Used by the Explore screen to filter places by what a student
+    # wants to *do*, as opposed to what the place *is* (category).
+    intents: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Coordinates. Kept as separate lat/lon columns for ease of read;
     # Phase 13 adds a proper geometry column alongside these.
     lat: Mapped[float] = mapped_column(Float, nullable=False)

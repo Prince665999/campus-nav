@@ -19,6 +19,7 @@ def _to_summary(place: Place) -> PlaceSummary:
         name=place.name,
         name_sw=place.name_sw,
         category=place.category,
+        intents=place.intents,
         location=LatLon(lat=place.lat, lon=place.lon),
         is_landmark=place.is_landmark,
     )
@@ -30,10 +31,9 @@ def _to_detail(place: Place) -> PlaceDetail:
         name=place.name,
         name_sw=place.name_sw,
         alt_names=place.alt_names,
-        # Public description only. The AI description
-        # (`place.description_ai`) is never returned here.
         description=place.description,
         category=place.category,
+        intents=place.intents,
         ref=place.ref,
         location=LatLon(lat=place.lat, lon=place.lon),
         wheelchair=place.wheelchair,
@@ -48,6 +48,7 @@ def search_places(
     session: Session,
     q: str | None = None,
     category: str | None = None,
+    intent: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
     radius_m: float = 500,
@@ -58,6 +59,8 @@ def search_places(
 
     - q: case-insensitive substring against name, name_sw, alt_names
     - category: exact match against the category column
+    - intent: case-insensitive substring against the intents column
+      (a place with intents "eat; study" matches an intent of "eat")
     - lat/lon/radius_m: proximity filter
     """
     query = session.query(Place)
@@ -75,10 +78,20 @@ def search_places(
     if category:
         query = query.filter(Place.category == category)
 
+    if intent:
+        # Match against the free-text intents column. We use LIKE
+        # rather than exact equality so that "eat" matches
+        # "eat; study" without the caller needing to know the exact
+        # semicolon-separated format. Word-boundary padding with
+        # semicolons avoids matching "eat" inside "create".
+        needle = f"%{intent.lower()}%"
+        query = query.filter(
+            func.lower(func.coalesce(Place.intents, "")).like(needle)
+        )
+
     # For proximity: do a cheap bounding-box filter in SQL, then refine
     # in Python with haversine. This avoids a full scan on SQLite.
     if lat is not None and lon is not None:
-        # 1 degree of latitude ≈ 111 km; longitude shrinks with cos(lat).
         import math
         dlat = radius_m / 111_000
         dlon = radius_m / (111_000 * max(math.cos(math.radians(lat)), 0.01))
@@ -89,7 +102,6 @@ def search_places(
 
     rows = query.limit(limit).all()
 
-    # If lat/lon given, refine to true haversine distance.
     if lat is not None and lon is not None:
         from backend.core.campus_graph import haversine_m
         rows = [

@@ -29,6 +29,7 @@ from .routers import (
     places,
     reports,
     route,
+    timetable,
     wifi,
 )
 from .routers.admin import (
@@ -40,6 +41,7 @@ from .routers.admin import (
     reimport as admin_reimport,
     reports as admin_reports,
     stats as admin_stats,
+    timetable as admin_timetable,
     users as admin_users,
 )
 from .settings import IS_DEV, MEDIA_DIR, SENTRY_DSN
@@ -81,7 +83,7 @@ def create_app() -> FastAPI:
             "Backend for the Campus Navigation mobile app and the "
             "admin website."
         ),
-        version="0.17.0",
+        version="0.18.0",
         lifespan=lifespan,
     )
 
@@ -130,6 +132,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(wifi.router)
     app.include_router(chat_doc.router)
+    app.include_router(timetable.router)
 
     # Admin auth — NOT behind the guard, because login itself can't
     # require a session.
@@ -161,10 +164,10 @@ def create_app() -> FastAPI:
         admin_users.router, prefix=admin_prefix, dependencies=admin_deps
     )
     app.include_router(
-        admin_users.router, prefix=admin_prefix, dependencies=admin_deps
+        admin_knowledge.router, prefix=admin_prefix, dependencies=admin_deps
     )
     app.include_router(
-        admin_knowledge.router, prefix=admin_prefix, dependencies=admin_deps
+        admin_timetable.router, prefix=admin_prefix, dependencies=admin_deps
     )
 
     app.mount(
@@ -177,7 +180,7 @@ def create_app() -> FastAPI:
     def root():
         return {
             "name": "Campus Navigation API",
-            "version": "0.17.0",
+            "version": "0.18.0",
             "docs": "/docs",
             "health": "/api/health",
         }

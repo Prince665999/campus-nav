@@ -39,6 +39,9 @@ class UpdatePlaceRequest(BaseModel):
     # AI description — fed to narration. Never shown to students.
     description_ai: str | None = None
 
+    # Free-text list of intents this place serves, semicolon-separated.
+    intents: str | None = None
+
     category: str | None = Field(None, max_length=64)
     ref: str | None = Field(None, max_length=64)
     wheelchair: str | None = Field(None, max_length=16)

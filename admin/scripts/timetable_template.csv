@@ -1,0 +1,6 @@
+program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,07:30,08:15,EP 6111,Electrical Workshop Technology I,Mwampulo A,EW,no
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,08:15,09:00,EP 6111,Electrical Workshop Technology I,Mwampulo A,EW,no
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,09:55,10:40,EP 6111,Electrical Workshop Technology I,Mwampulo A,EW,no
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Tuesday,07:30,08:15,EP 6109,Electrical Engineering Materials,Petro M,102-C,no
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Thursday,09:55,10:40,HS 6142,Communication Skills,Fella P,A-115,no
