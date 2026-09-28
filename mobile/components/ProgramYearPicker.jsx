@@ -6,13 +6,19 @@
 //
 // The picker doesn't save anything itself. It calls `onSelect` with
 // the chosen program_year_id. The caller decides what to do with it.
+//
+// The program list can be long (many programs across many colleges
+// and departments), so there's a search box above it. The year list
+// is short — one program has a handful of year levels — so it stays
+// unfiltered.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -26,6 +32,8 @@ export function ProgramYearPicker({ onSelect, selectedProgramYearId = null }) {
   const [years, setYears] = useState([]);
   const [selectedProgramId, setSelectedProgramId] = useState(null);
   const [selectedYearId, setSelectedYearId] = useState(selectedProgramYearId);
+
+  const [programSearch, setProgramSearch] = useState('');
 
   const [loadingPrograms, setLoadingPrograms] = useState(true);
   const [loadingYears, setLoadingYears] = useState(false);
@@ -74,6 +82,24 @@ export function ProgramYearPicker({ onSelect, selectedProgramYearId = null }) {
     };
   }, [selectedProgramId]);
 
+  // Filter the program list by the search string. Case-insensitive
+  // substring match on name, code, and department. If the search is
+  // empty, all programs show.
+  const filteredPrograms = useMemo(() => {
+    const q = programSearch.trim().toLowerCase();
+    if (!q) return programs;
+    return programs.filter((p) => {
+      const haystack = [
+        p.name || '',
+        p.code || '',
+        p.department || '',
+      ]
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [programs, programSearch]);
+
   function chooseProgram(id) {
     setSelectedProgramId(id);
     setSelectedYearId(null);
@@ -113,42 +139,62 @@ export function ProgramYearPicker({ onSelect, selectedProgramYearId = null }) {
     <ScrollView
       style={styles.container}
       contentContainerStyle={styles.content}
+      keyboardShouldPersistTaps="handled"
       nestedScrollEnabled
     >
       <Text style={styles.stepLabel}>{t('timetable.picker.stepProgram')}</Text>
+
+      <TextInput
+        style={styles.searchInput}
+        value={programSearch}
+        onChangeText={setProgramSearch}
+        placeholder={t('timetable.picker.searchPlaceholder')}
+        placeholderTextColor={COLORS.textFaint}
+        autoCapitalize="none"
+        autoCorrect={false}
+        returnKeyType="search"
+      />
+
       <View style={styles.list}>
-        {programs.map((p) => {
-          const isSelected = selectedProgramId === p.id;
-          return (
-            <TouchableOpacity
-              key={p.id}
-              style={[styles.option, isSelected && styles.optionSelected]}
-              onPress={() => chooseProgram(p.id)}
-              accessibilityRole="button"
-              accessibilityState={{ selected: isSelected }}
-            >
-              <Text
-                style={[
-                  styles.optionText,
-                  isSelected && styles.optionTextSelected,
-                ]}
-                numberOfLines={2}
+        {filteredPrograms.length === 0 ? (
+          <Text style={styles.noMatchText}>
+            {t('timetable.picker.noMatch')}
+          </Text>
+        ) : (
+          filteredPrograms.map((p) => {
+            const isSelected = selectedProgramId === p.id;
+            return (
+              <TouchableOpacity
+                key={p.id}
+                style={[styles.option, isSelected && styles.optionSelected]}
+                onPress={() => chooseProgram(p.id)}
+                accessibilityRole="button"
+                accessibilityState={{ selected: isSelected }}
               >
-                {p.name}
-              </Text>
-              {p.department ? (
                 <Text
                   style={[
-                    styles.optionSubtext,
-                    isSelected && styles.optionSubtextSelected,
+                    styles.optionText,
+                    isSelected && styles.optionTextSelected,
                   ]}
+                  numberOfLines={2}
                 >
-                  {p.department}
+                  {p.name}
                 </Text>
-              ) : null}
-            </TouchableOpacity>
-          );
-        })}
+                {p.department ? (
+                  <Text
+                    style={[
+                      styles.optionSubtext,
+                      isSelected && styles.optionSubtextSelected,
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {p.department}
+                  </Text>
+                ) : null}
+              </TouchableOpacity>
+            );
+          })
+        )}
       </View>
 
       {selectedProgramId ? (
@@ -216,8 +262,25 @@ const styles = StyleSheet.create({
   stepLabelSpaced: {
     marginTop: SPACING.lg,
   },
+  searchInput: {
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.sm,
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 10,
+    fontSize: FONT_SIZE.body,
+    color: COLORS.text,
+    marginBottom: SPACING.sm,
+  },
   list: {
     gap: SPACING.sm,
+  },
+  noMatchText: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    paddingVertical: SPACING.md,
+    textAlign: 'center',
   },
   option: {
     paddingHorizontal: SPACING.md,

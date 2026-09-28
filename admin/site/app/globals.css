@@ -250,3 +250,23 @@ code {
   border-radius: var(--radius-sm);
   margin-bottom: 16px;
 }
+
+/* Drop zone for the timetable CSV import page. */
+.drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 40px 20px;
+  text-align: center;
+  cursor: pointer;
+  background: var(--bg);
+  transition: all 0.15s;
+}
+
+.drop-zone:hover {
+  border-color: var(--primary);
+}
+
+.drop-zone-active {
+  border-color: var(--primary);
+  background: var(--info-bg);
+}

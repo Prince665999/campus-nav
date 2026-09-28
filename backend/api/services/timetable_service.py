@@ -11,8 +11,22 @@ place's name and id, which the mobile app uses for "Take me there".
 If we don't find one, the entry still returns with its venue_code,
 just no place_id — the app shows the venue as text.
 
-No foreign key enforces this: venues come and go, and a missing
-match must never block a timetable from being stored or served.
+Adjacent-slot merging
+---------------------
+A timetable typically lists a two-hour session as three 45-minute
+rows (07:30–08:15, 08:15–09:00, 09:00–09:45). Students don't need to
+see three rows — they need to see one period from 07:30 to 09:45.
+
+We merge adjacent entries at read time when they:
+  - are on the same day,
+  - have the same module_code,
+  - have the same venue_code,
+  - have the same lecturer_name,
+  - and touch exactly: next.start_time == current.end_time.
+
+The first row's start_time and the last row's end_time are kept.
+Raw, unmerged data is still available with raw=True — the admin
+viewer uses this, and it's useful for debugging.
 """
 
 from datetime import datetime, timedelta
@@ -69,8 +83,18 @@ def _to_year_item(py: ProgramYear) -> ProgramYearItem:
     )
 
 
-def get_week(session: Session, program_year_id: int) -> TimetableWeekResponse:
-    """Every entry for one program-year, in chronological order."""
+def get_week(
+    session: Session,
+    program_year_id: int,
+    merge_adjacent: bool = True,
+) -> TimetableWeekResponse:
+    """
+    Every entry for one program-year, in chronological order.
+
+    By default, adjacent rows with the same module/venue/lecturer
+    that touch exactly are merged into a single period. Pass
+    merge_adjacent=False to return the raw rows.
+    """
     entries = (
         session.query(TimetableEntry)
         .filter_by(program_year_id=program_year_id)
@@ -81,12 +105,83 @@ def get_week(session: Session, program_year_id: int) -> TimetableWeekResponse:
         .all()
     )
 
-    # Bulk-resolve venues.
+    if merge_adjacent:
+        entries = _merge_adjacent(entries)
+
     venue_places = _venue_places_for(session, entries)
 
     return TimetableWeekResponse(
         program_year_id=program_year_id,
         entries=[_to_entry_item(e, venue_places) for e in entries],
+    )
+
+
+def _merge_adjacent(entries: list[TimetableEntry]) -> list[TimetableEntry]:
+    """
+    Merge runs of adjacent entries that represent the same continuing
+    period. See the module docstring for the rule.
+
+    Returns a new list. The merged rows are lightweight copies of the
+    original ORM objects — we mutate a shallow copy so we don't modify
+    anything in the session.
+    """
+    if not entries:
+        return []
+
+    merged = []
+    for entry in entries:
+        if not merged:
+            merged.append(_copy_entry(entry))
+            continue
+
+        prev = merged[-1]
+        if _should_merge(prev, entry):
+            # Extend the previous entry's end time.
+            prev.end_time = entry.end_time
+        else:
+            merged.append(_copy_entry(entry))
+
+    return merged
+
+
+def _copy_entry(entry: TimetableEntry) -> TimetableEntry:
+    """
+    Shallow copy of a TimetableEntry. The merged list uses copies so
+    we never mutate an object that's still attached to the session.
+    """
+    copy = TimetableEntry(
+        program_year_id=entry.program_year_id,
+        day_of_week=entry.day_of_week,
+        start_time=entry.start_time,
+        end_time=entry.end_time,
+        module_code=entry.module_code,
+        module_name=entry.module_name,
+        lecturer_name=entry.lecturer_name,
+        venue_code=entry.venue_code,
+        is_cross_cutting=entry.is_cross_cutting,
+        notes=entry.notes,
+    )
+    copy.id = entry.id
+    return copy
+
+
+def _should_merge(prev: TimetableEntry, current: TimetableEntry) -> bool:
+    """
+    Whether `current` is a direct continuation of `prev`.
+
+    All of these must be true:
+      - same day
+      - same module code
+      - same venue
+      - same lecturer
+      - prev.end_time exactly equals current.start_time
+    """
+    return (
+        prev.day_of_week == current.day_of_week
+        and prev.module_code == current.module_code
+        and (prev.venue_code or "") == (current.venue_code or "")
+        and (prev.lecturer_name or "") == (current.lecturer_name or "")
+        and prev.end_time == current.start_time
     )
 
 
@@ -132,14 +227,12 @@ def get_next_class(
     Returns has_class=False when nothing is coming up. Otherwise
     includes the entry and how many seconds until it starts.
 
-    Classes are looked at across the current day and the next day —
-    so a Friday-night query correctly finds a Monday morning class
-    (though that will be way beyond 90 minutes, so has_class=False).
+    Merging runs first, so the "next class" is a merged period, not
+    a 45-minute sub-slot.
     """
     if now is None:
         now = datetime.now()
 
-    # Look at the entries for today and tomorrow.
     today = now.weekday()
     tomorrow = (today + 1) % 7
 
@@ -153,9 +246,9 @@ def get_next_class(
     if not entries:
         return NextClassResponse(has_class=False)
 
+    entries = _merge_adjacent(entries)
     venue_places = _venue_places_for(session, entries)
 
-    # Compute the absolute datetime of each entry's start.
     best_entry = None
     best_delta = None
 
@@ -165,9 +258,9 @@ def get_next_class(
             continue
         delta = (start_dt - now).total_seconds()
         if delta < 0:
-            continue  # already started or past
+            continue
         if delta > 90 * 60:
-            continue  # more than 90 minutes away — not the point of this query
+            continue
         if best_delta is None or delta < best_delta:
             best_delta = delta
             best_entry = entry
@@ -185,8 +278,7 @@ def get_next_class(
 def _entry_start_datetime(entry: TimetableEntry, reference: datetime) -> datetime | None:
     """
     Convert an entry's (day_of_week, start_time) into an absolute
-    datetime, relative to `reference`. Handles the case where the
-    entry is tomorrow by adding a day.
+    datetime, relative to `reference`.
     """
     try:
         hh, mm = entry.start_time.split(":")

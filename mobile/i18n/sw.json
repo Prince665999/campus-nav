@@ -102,7 +102,8 @@
     "title": "Vinjari",
     "categoriesTitle": "Vinjari kwa aina",
     "allPlacesTitle": "Mahali pote",
-    "allPlacesCount": "Mahali {count}"
+    "allPlacesCount": "Mahali {count}",
+    "featuredTitle": "Maeneo maarufu"
   },
   "onboarding": {
     "welcome": "Karibu",
@@ -198,7 +199,9 @@
     "loading": "Inapakia programu…",
     "empty": "Hakuna programu bado. Angalia tena baadaye.",
     "noYears": "Hakuna miaka inayopatikana kwa programu hii.",
-    "yearLabel": "Mwaka {n}"
+    "yearLabel": "Mwaka {n}",
+    "searchPlaceholder": "Tafuta programu…",
+    "noMatch": "Hakuna programu inayolingana na utafutaji wako."
   },
   "banner": {
     "startingNow": "Inaanza sasa",
@@ -206,5 +209,15 @@
     "takeMeThere": "Nipeleke hapo",
     "viewTimetable": "Ona ratiba"
   }
+},
+"intents": {
+  "eat": "Chakula",
+  "study": "Kusoma",
+  "print": "Kuchapisha",
+  "wifi": "Wi-Fi",
+  "sports": "Michezo",
+  "meet": "Kukutana",
+  "toilet": "Vyoo",
+  "prayer": "Kuomba"
 }
 }

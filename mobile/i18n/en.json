@@ -102,7 +102,8 @@
     "title": "Explore",
     "categoriesTitle": "Browse by category",
     "allPlacesTitle": "All places",
-    "allPlacesCount": "{count} places"
+    "allPlacesCount": "{count} places",
+    "featuredTitle": "Featured places"
   },
   "onboarding": {
     "welcome": "Welcome",
@@ -198,7 +199,9 @@
     "loading": "Loading programs…",
     "empty": "No programs available yet. Check back later.",
     "noYears": "No years available for this program.",
-    "yearLabel": "Year {n}"
+    "yearLabel": "Year {n}",
+    "searchPlaceholder": "Search programs…",
+    "noMatch": "No programs match your search."
   },
   "banner": {
     "startingNow": "Starting now",
@@ -206,5 +209,15 @@
     "takeMeThere": "Take me there",
     "viewTimetable": "View timetable"
   }
+},
+"intents": {
+  "eat": "Food",
+  "study": "Study",
+  "print": "Print",
+  "wifi": "Wi-Fi",
+  "sports": "Sports",
+  "meet": "Meet up",
+  "toilet": "Toilets",
+  "prayer": "Prayer"
 }
 }

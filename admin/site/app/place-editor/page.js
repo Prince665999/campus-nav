@@ -11,6 +11,7 @@ export default function PlaceEditorPage() {
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState(null);
   const [form, setForm] = useState(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
@@ -22,41 +23,48 @@ export default function PlaceEditorPage() {
       .catch((err) => setError(err.message));
   }, []);
 
-  function selectPlace(place) {
+  async function selectPlace(place) {
     setSelected(place);
-    setForm({
-      name: place.name || '',
-      name_sw: place.name_sw || '',
-      alt_names: place.alt_names || '',
-      description: place.description || '',
-      description_ai: place.description_ai || '',
-      category: place.category || '',
-      ref: place.ref || '',
-      wheelchair: place.wheelchair || '',
-      opening_hours: place.opening_hours || '',
-      is_landmark: !!place.is_landmark,
-      has_wifi: !!place.has_wifi,
-      wifi_ssid: place.wifi_ssid || '',
-      wifi_password: place.wifi_password || '',
-    });
     setSaved(false);
     setError(null);
+    setForm(null);
+    setLoadingDetail(true);
+    try {
+      const detail = await api.getPlaceAdmin(place.id);
+      setForm({
+        name: detail.name || '',
+        name_sw: detail.name_sw || '',
+        alt_names: detail.alt_names || '',
+        description: detail.description || '',
+        description_ai: detail.description_ai || '',
+        intents: detail.intents || '',
+        category: detail.category || '',
+        ref: detail.ref || '',
+        wheelchair: detail.wheelchair || '',
+        opening_hours: detail.opening_hours || '',
+        is_landmark: !!detail.is_landmark,
+        has_wifi: !!detail.has_wifi,
+        wifi_ssid: detail.wifi_ssid || '',
+        wifi_password: detail.wifi_password || '',
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingDetail(false);
+    }
   }
 
   async function save() {
-    if (!selected) return;
+    if (!selected || !form) return;
     setSaving(true);
     setError(null);
     setSaved(false);
 
-    // Only send fields that changed.
     const changed = {};
     for (const key of Object.keys(form)) {
-      // Compare against the original place value.
-      const original = selected[key];
+      const original = form[key] === '' ? '' : selected[key];
       const current = form[key];
-      // Normalise: null and '' both mean "empty".
-      const origNorm = original ?? '';
+      const origNorm = selected[key] ?? '';
       const currNorm = current ?? '';
       if (origNorm !== currNorm) {
         changed[key] = current;
@@ -71,7 +79,6 @@ export default function PlaceEditorPage() {
 
     try {
       const updated = await api.updatePlace(selected.id, changed);
-      // Refresh both the form and the list entry.
       setPlaces((prev) =>
         prev.map((p) => (p.id === selected.id ? { ...p, ...changed } : p))
       );
@@ -97,7 +104,6 @@ export default function PlaceEditorPage() {
       </p>
 
       <div style={{ display: 'grid', gridTemplateColumns: '320px 1fr', gap: 24 }}>
-        {/* List */}
         <div>
           <input
             type="text"
@@ -142,12 +148,23 @@ export default function PlaceEditorPage() {
           </div>
         </div>
 
-        {/* Form */}
         <div>
-          {!selected || !form ? (
+          {!selected ? (
             <div className="card">
               <p className="muted" style={{ margin: 0 }}>
                 Pick a place on the left to edit its fields.
+              </p>
+            </div>
+          ) : loadingDetail ? (
+            <div className="card">
+              <p className="muted" style={{ margin: 0 }}>
+                Loading…
+              </p>
+            </div>
+          ) : !form ? (
+            <div className="card">
+              <p className="muted" style={{ margin: 0 }}>
+                Could not load this place.
               </p>
             </div>
           ) : (
@@ -195,6 +212,13 @@ export default function PlaceEditorPage() {
                 />
 
                 <FormField
+                  label="Intents (semicolon-separated)"
+                  value={form.intents}
+                  onChange={(v) => setForm({ ...form, intents: v })}
+                  hint="What a student might come here to do. Lowercase, semicolons between. Examples: eat; study; wifi"
+                />
+
+                <FormField
                   label="Category"
                   value={form.category}
                   onChange={(v) => setForm({ ...form, category: v })}
@@ -204,7 +228,7 @@ export default function PlaceEditorPage() {
                   label="Reference"
                   value={form.ref}
                   onChange={(v) => setForm({ ...form, ref: v })}
-                  hint="Room or block code, like LT3."
+                  hint="Room or block code, like LT3. Timetable venues match on this."
                 />
                 <FormField
                   label="Wheelchair access"

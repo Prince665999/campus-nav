@@ -18,9 +18,11 @@ class PlaceSummary(BaseModel):
     name: str
     name_sw: str | None = None
     category: str | None = None
+    category_icon_key: str | None = None
     intents: str | None = None
     location: LatLon
     is_landmark: bool = False
+    primary_photo_url: str | None = None
 
 
 class PlaceDetail(BaseModel):

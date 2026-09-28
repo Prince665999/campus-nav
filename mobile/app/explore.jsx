@@ -1,33 +1,56 @@
 // Explore screen.
 //
-// Browse the whole campus by category. Tap any place to see its
-// photos and description. Unlike the rest of the app, this screen
-// doesn't require a route — it's for browsing.
+// A visual browse of the whole campus. Featured places up top,
+// category and intent chips below, then a photo grid.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
-  ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { router, Stack } from 'expo-router';
 
-import { PlaceCard } from '@/components/PlaceCard';
+import { CategoryChips } from '@/components/CategoryChips';
+import { IntentChips } from '@/components/IntentChips';
+import { FeaturedStrip } from '@/components/FeaturedStrip';
+import { ExploreGridCard } from '@/components/ExploreGridCard';
 import { listPlaces } from '@/services/api';
-import { CATEGORIES } from '@/constants/categories';
 import { t } from '@/i18n';
-import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+
+// How many featured places to show. The most prominent ones.
+const FEATURED_LIMIT = 5;
 
 export default function ExploreScreen() {
   const [category, setCategory] = useState(null);
+  const [intent, setIntent] = useState(null);
+
+  const [featured, setFeatured] = useState([]);
   const [places, setPlaces] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // Load featured places once. These don't change with the filters.
+  useEffect(() => {
+    let cancelled = false;
+    listPlaces({ limit: 200 })
+      .then((data) => {
+        if (cancelled) return;
+        const landmarks = data.filter((p) => p.is_landmark);
+        setFeatured(landmarks.slice(0, FEATURED_LIMIT));
+      })
+      .catch(() => {
+        if (!cancelled) setFeatured([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load the grid whenever a filter changes.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -35,6 +58,7 @@ export default function ExploreScreen() {
 
     listPlaces({
       category: category || undefined,
+      intent: intent || undefined,
       limit: 200,
     })
       .then((data) => {
@@ -50,73 +74,82 @@ export default function ExploreScreen() {
     return () => {
       cancelled = true;
     };
-  }, [category]);
+  }, [category, intent]);
 
   const openPlace = useCallback((place) => {
     router.push(`/place/${place.id}`);
   }, []);
 
+  // When the admin picks a category, clear the intent. Only one
+  // filter can be active at a time — the alternative is confusing.
+  const chooseCategory = useCallback((next) => {
+    setCategory(next);
+    if (next) setIntent(null);
+  }, []);
+
+  const chooseIntent = useCallback((next) => {
+    setIntent(next);
+    if (next) setCategory(null);
+  }, []);
+
+  // Convert the flat list of places into rows of 2 for the grid.
+  const gridRows = useMemo(() => {
+    const rows = [];
+    for (let i = 0; i < places.length; i += 2) {
+      rows.push(places.slice(i, i + 2));
+    }
+    return rows;
+  }, [places]);
+
+  const hasActiveFilter = category !== null || intent !== null;
+
   return (
     <>
       <Stack.Screen options={{ title: t('explore.title') }} />
       <View style={styles.container}>
-        {/* Category selector */}
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.chipRow}
-          style={styles.chipScroll}
-        >
-          {CATEGORIES.map((cat) => {
-            const isActive = category === cat.key;
-            return (
-              <TouchableOpacity
-                key={cat.key ?? 'all'}
-                style={[styles.chip, isActive && styles.chipActive]}
-                onPress={() => setCategory(cat.key)}
-                accessibilityRole="button"
-                accessibilityState={{ selected: isActive }}
-                accessibilityLabel={t(cat.labelKey)}
-              >
-                <Text
-                  style={[styles.chipText, isActive && styles.chipTextActive]}
-                  numberOfLines={1}
-                >
-                  {t(cat.labelKey)}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
+        {/* Featured strip. Hidden when a filter is active, so the
+            whole screen focuses on the results. */}
+        {!hasActiveFilter ? (
+          <FeaturedStrip places={featured} onPress={openPlace} />
+        ) : null}
 
-        {loading ? (
-          <View style={styles.state}>
-            <ActivityIndicator color={COLORS.textMuted} />
-          </View>
-        ) : error ? (
+        <View style={styles.chipsWrapper}>
+          <CategoryChips selected={category} onSelect={chooseCategory} />
+          <IntentChips selected={intent} onSelect={chooseIntent} />
+        </View>
+
+        {error ? (
           <View style={styles.state}>
             <Text style={styles.errorText}>{error}</Text>
+          </View>
+        ) : loading && places.length === 0 ? (
+          <View style={styles.state}>
+            <ActivityIndicator color={COLORS.textMuted} />
           </View>
         ) : places.length === 0 ? (
           <View style={styles.state}>
             <Text style={styles.emptyText}>{t('common.noResults')}</Text>
           </View>
         ) : (
-          <>
-            <View style={styles.header}>
-              <Text style={styles.headerText}>
-                {t('explore.allPlacesCount', { count: places.length })}
-              </Text>
-            </View>
-            <FlatList
-              data={places}
-              keyExtractor={(item) => String(item.id)}
-              renderItem={({ item }) => (
-                <PlaceCard place={item} onPress={() => openPlace(item)} />
-              )}
-              contentContainerStyle={styles.listContent}
-            />
-          </>
+          <FlatList
+            data={gridRows}
+            keyExtractor={(row, i) => `row-${i}`}
+            renderItem={({ item: row }) => (
+              <View style={styles.gridRow}>
+                {row.map((place) => (
+                  <ExploreGridCard
+                    key={place.id}
+                    place={place}
+                    onPress={() => openPlace(place)}
+                  />
+                ))}
+                {/* If the row has only one place, fill the other slot
+                    so the layout stays even. */}
+                {row.length === 1 ? <View style={styles.gridFiller} /> : null}
+              </View>
+            )}
+            contentContainerStyle={styles.listContent}
+          />
         )}
       </View>
     </>
@@ -125,51 +158,20 @@ export default function ExploreScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
-  chipScroll: {
+  chipsWrapper: {
     backgroundColor: COLORS.background,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.borderSubtle,
-    maxHeight: TOUCH.minHeight + 24,
-    flexGrow: 0,
-  },
-  chipRow: {
-    paddingHorizontal: SPACING.md,
-    paddingVertical: SPACING.sm,
-    gap: SPACING.sm,
-    alignItems: 'center',
-  },
-  chip: {
-    backgroundColor: COLORS.backgroundSubtle,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: RADIUS.pill,
-    paddingHorizontal: 14,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chipActive: {
-    backgroundColor: COLORS.primaryDark,
-    borderColor: COLORS.primaryDark,
-  },
-  chipText: {
-    fontSize: FONT_SIZE.small + 1,
-    color: COLORS.text,
-    fontWeight: '500',
-  },
-  chipTextActive: { color: '#ffffff' },
-  header: {
-    paddingHorizontal: SPACING.md,
-    paddingTop: SPACING.md,
     paddingBottom: SPACING.sm,
   },
-  headerText: {
-    fontSize: FONT_SIZE.small,
-    color: COLORS.textMuted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    fontWeight: '600',
+  gridRow: {
+    flexDirection: 'row',
+    gap: SPACING.sm,
+    paddingHorizontal: SPACING.md,
+    marginBottom: SPACING.sm,
   },
+  gridFiller: { flex: 1 },
+  listContent: { paddingTop: SPACING.md, paddingBottom: SPACING.xl },
   state: {
     flex: 1,
     alignItems: 'center',
@@ -186,5 +188,4 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.body,
     textAlign: 'center',
   },
-  listContent: { paddingBottom: SPACING.xl },
 });

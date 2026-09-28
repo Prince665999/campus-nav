@@ -48,13 +48,20 @@ def list_years(program_id: int, session: Session = Depends(db_session)):
     return timetable_service.list_years_for_program(session, program_id)
 
 
-@router.get("/schedule", response_model=TimetableWeekResponse)
+@router.get("/schedule")
 def get_schedule(
-    program_year_id: int = Query(...),
+    program_year_id: int,
+    raw: bool = False,
     session: Session = Depends(db_session),
 ):
-    """Full week of entries for one program-year."""
-    return timetable_service.get_week(session, program_year_id)
+    """
+    Full week for a program-year. By default, adjacent rows that
+    represent the same continuing period are merged. Pass raw=true
+    to see the unmerged rows.
+    """
+    return timetable_service.get_week(
+        session, program_year_id, merge_adjacent=not raw
+    )
 
 
 @router.get("/next", response_model=NextClassResponse)

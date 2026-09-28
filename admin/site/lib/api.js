@@ -45,6 +45,9 @@ export const api = {
     return request(`/api/places${qs ? '?' + qs : ''}`);
   },
   getPlace: (id) => request(`/api/places/${id}`),
+    // Admin-specific: includes description_ai, which is never exposed
+  // by the public /api/places/{id} endpoint.
+  getPlaceAdmin: (id) => request(`/api/admin/places/${id}`),
   updatePlace: (id, data) =>
     request(`/api/admin/places/${id}`, {
       method: 'PATCH',
@@ -107,4 +110,37 @@ export const api = {
   listKnowledgeDocuments: () => request('/api/admin/knowledge'),
   deleteKnowledgeDocument: (id) =>
     request(`/api/admin/knowledge/${id}`, { method: 'DELETE' }),
+
+  // ---------- Timetable ----------
+  // Programs are read through the admin endpoint (identical shape to
+  // the public one, but consistent with the rest of the admin site).
+  listPrograms: () => request('/api/admin/timetable/programs'),
+  listYearsForProgram: (programId) =>
+    request(`/api/admin/timetable/programs/${programId}/years`),
+  getSchedule: (programYearId) =>
+    request(`/api/admin/timetable/schedule?program_year_id=${programYearId}`),
+  deleteProgram: (programId) =>
+    request(`/api/admin/timetable/programs/${programId}`, {
+      method: 'DELETE',
+    }),
+  deleteProgramYear: (programYearId) =>
+    request(`/api/admin/timetable/program-years/${programYearId}`, {
+      method: 'DELETE',
+    }),
+  deleteTimetableEntry: (entryId) =>
+    request(`/api/admin/timetable/entries/${entryId}`, {
+      method: 'DELETE',
+    }),
+
+  // CSV upload. The `replace` flag wipes existing entries for each
+  // program-year in the CSV before inserting the new ones.
+  importTimetableCsv: (file, { replace = false } = {}) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const qs = replace ? '?replace=true' : '';
+    return request(`/api/admin/timetable/import${qs}`, {
+      method: 'POST',
+      body: formData,
+    });
+  },
 };

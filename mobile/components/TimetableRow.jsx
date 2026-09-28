@@ -22,17 +22,7 @@ export function TimetableRow({ entry, onPress }) {
 
       {/* Body */}
       <View style={styles.body}>
-        <View style={styles.codeLine}>
-          <Text style={styles.moduleCode}>{entry.module_code}</Text>
-          {entry.is_cross_cutting ? (
-            <MaterialIcons
-              name="star"
-              size={14}
-              color={TIMETABLE_COLORS.crossCutting}
-              style={styles.crossIcon}
-            />
-          ) : null}
-        </View>
+        <Text style={styles.moduleCode}>{entry.module_code}</Text>
         {entry.module_name ? (
           <Text style={styles.moduleName} numberOfLines={2}>
             {entry.module_name}
@@ -102,16 +92,11 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   body: { flex: 1 },
-  codeLine: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
   moduleCode: {
     fontSize: FONT_SIZE.body + 1,
     fontWeight: '700',
     color: TIMETABLE_COLORS.moduleCode,
   },
-  crossIcon: { marginLeft: 6 },
   moduleName: {
     fontSize: FONT_SIZE.small,
     color: TIMETABLE_COLORS.moduleName,

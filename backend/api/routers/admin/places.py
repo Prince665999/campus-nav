@@ -12,13 +12,49 @@ from ...dependencies import db_session
 from ...errors import NotFoundError
 from ...models.place import Place
 from ...schemas.admin import UpdatePlaceRequest
-from ...schemas.place import PlaceDetail
-from ...services import cache_service, graph_service, place_service
+from ...services import cache_service, graph_service
 
 router = APIRouter(prefix="/places", tags=["admin:places"])
 
 
-@router.patch("/{place_id}", response_model=PlaceDetail)
+def _to_admin_detail(place: Place) -> dict:
+    """
+    Full detail for the admin editor. Unlike the public PlaceDetail
+    schema, this includes `description_ai`, so an admin can see and
+    edit the AI-facing text.
+    """
+    return {
+        "id": place.id,
+        "name": place.name,
+        "name_sw": place.name_sw,
+        "alt_names": place.alt_names,
+        "description": place.description,
+        "description_ai": place.description_ai,
+        "intents": place.intents,
+        "category": place.category,
+        "ref": place.ref,
+        "location": {"lat": place.lat, "lon": place.lon},
+        "wheelchair": place.wheelchair,
+        "opening_hours": place.opening_hours,
+        "is_landmark": place.is_landmark,
+        "has_wifi": place.has_wifi,
+        "wifi_ssid": place.wifi_ssid,
+    }
+
+
+@router.get("/{place_id}")
+def get_place_admin(place_id: int, session: Session = Depends(db_session)):
+    """
+    Full detail for one place, including the AI description.
+    Used by the admin place editor.
+    """
+    place = session.query(Place).filter_by(id=place_id).one_or_none()
+    if place is None:
+        raise NotFoundError(f"Place {place_id} not found")
+    return _to_admin_detail(place)
+
+
+@router.patch("/{place_id}")
 def update_place(
     place_id: int,
     body: UpdatePlaceRequest,
@@ -37,7 +73,6 @@ def update_place(
     if place is None:
         raise NotFoundError(f"Place {place_id} not found")
 
-    # Only apply fields that were explicitly sent.
     updates = body.model_dump(exclude_unset=True)
 
     ai_description_changed = "description_ai" in updates
@@ -47,14 +82,12 @@ def update_place(
 
     session.flush()
 
-    # If the AI description changed, the loaded graph and any cached
-    # narrations are stale. Reload and invalidate.
     if ai_description_changed:
         graph_service.reset()
         if cache.is_available():
             cache_service.invalidate_narrations()
 
-    return place_service.get_place(session, place_id)
+    return _to_admin_detail(place)
 
 
 @router.delete("/{place_id}", status_code=204)

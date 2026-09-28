@@ -11,6 +11,8 @@ const NAV_ITEMS = [
   { href: '/report-queue', label: 'Reports', icon: 'flag' },
   { href: '/photo-manager', label: 'Photos', icon: 'camera' },
   { href: '/place-editor', label: 'Places', icon: 'pin' },
+  { href: '/timetable', label: 'Timetable', icon: 'calendar' },
+  { href: '/timetable-import', label: 'Import CSV', icon: 'upload' },
   { href: '/knowledge', label: 'Knowledge', icon: 'book' },
   { href: '/route-tester', label: 'Route Tester', icon: 'compass' },
   { href: '/reimport-view', label: 'Re-import', icon: 'refresh' },
@@ -64,6 +66,23 @@ function Icon({ name }) {
         <svg {...common}>
           <path d="M12 22s7-6 7-12a7 7 0 10-14 0c0 6 7 12 7 12z" />
           <circle cx="12" cy="10" r="2.5" />
+        </svg>
+      );
+    case 'calendar':
+      return (
+        <svg {...common}>
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+          <line x1="16" y1="2" x2="16" y2="6" />
+          <line x1="8" y1="2" x2="8" y2="6" />
+          <line x1="3" y1="10" x2="21" y2="10" />
+        </svg>
+      );
+    case 'upload':
+      return (
+        <svg {...common}>
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+          <polyline points="17 8 12 3 7 8" />
+          <line x1="12" y1="3" x2="12" y2="15" />
         </svg>
       );
     case 'book':
