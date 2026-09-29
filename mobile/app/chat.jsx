@@ -295,7 +295,7 @@ export default function ChatScreen() {
             accessibilityRole="button"
             accessibilityLabel={t('chat.send')}
           >
-            <Text style={styles.sendText}>↑</Text>
+            <Text style={styles.sendText}>GO</Text>
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
