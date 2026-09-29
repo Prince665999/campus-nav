@@ -33,6 +33,13 @@ export function useWalkingProgress(route) {
 
   const detectorRef = useRef(createOffRouteDetector());
 
+  // The segment index of the last successful snap. Used to constrain
+  // the next snap's search to segments near where we were. On a
+  // campus with looping paths, an unconstrained search can jump to
+  // the wrong segment; at corners, the previous segment's endpoint
+  // can pin the dot. Both are fixed by preferring nearby segments.
+  const lastSegmentIndexRef = useRef(null);
+
   // Track the last time a good fix was accepted. Used by the stale
   // fallback and by the "searching for GPS" indicator.
   const lastGoodFixAtRef = useRef(Date.now());
@@ -73,6 +80,7 @@ export function useWalkingProgress(route) {
     if (!hasGeometry) return;
 
     detectorRef.current.reset();
+    lastSegmentIndexRef.current = null;
     lastGoodFixAtRef.current = Date.now();
     setGpsStale(false);
 
@@ -96,8 +104,17 @@ export function useWalkingProgress(route) {
         const geom = geometryRef.current;
         let snapped = null;
         if (geom) {
-          snapped = snapToRoute({ lat: loc.lat, lon: loc.lon }, geom);
+          // Forward-constrained snap. The `nearIndex` hint is the
+          // segment index from the last successful snap. If it's
+          // null (first fix, or the route changed) the snap does a
+          // full search.
+          snapped = snapToRoute(
+            { lat: loc.lat, lon: loc.lon },
+            geom,
+            { nearIndex: lastSegmentIndexRef.current }
+          );
           if (snapped) {
+            lastSegmentIndexRef.current = snapped.segmentIndex;
             const trustedForOffRoute =
               loc.accuracyM != null &&
               loc.accuracyM <= OFF_ROUTE_MAX_ACCURACY_M;
@@ -110,7 +127,7 @@ export function useWalkingProgress(route) {
 
         if (!shouldDisplay) {
           // Not a good enough fix to move the dot, but we've already
-          // updated off-route detection above. Now check whether we
+          // updated off-route detection above. Check whether we
           // should tell the student the GPS is degraded.
           const secondsSinceGoodFix =
             (now - lastGoodFixAtRef.current) / 1000;
@@ -153,9 +170,11 @@ export function useWalkingProgress(route) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionGranted, hasGeometry]);
 
-  // Reset the detector when the route object changes.
+  // Reset the detector and segment hint when the route object
+  // changes. A new route means the old segment index is meaningless.
   useEffect(() => {
     detectorRef.current.reset();
+    lastSegmentIndexRef.current = null;
     setOffRoute(false);
   }, [route]);
 
@@ -175,6 +194,7 @@ export function useWalkingProgress(route) {
 
   const resetOffRoute = useCallback(() => {
     detectorRef.current.reset();
+    lastSegmentIndexRef.current = null;
     setOffRoute(false);
   }, []);
 
@@ -190,8 +210,6 @@ export function useWalkingProgress(route) {
     progress,
     resetOffRoute,
     // True when no good GPS fix has arrived for DISPLAY_STALE_INDICATOR_S.
-    // The dot may still be moving on a stale fallback fix; this just
-    // means the fix is older than we'd like.
     gpsStale,
   };
 }
