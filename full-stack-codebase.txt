@@ -230,6 +230,366 @@ def main():
 if __name__ == "__main__":
     main()
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\scripts\import_timetable.py ---
+
+"""
+import_timetable.py
+
+Read a timetable CSV and load it into the database. Every row in the
+CSV is one class slot. The file is validated row-by-row before
+anything is written — if any row is bad, the whole import is aborted
+so we never write a partial timetable.
+
+Usage:
+
+    # Dry run first — validates and reports, writes nothing.
+    python admin/scripts/import_timetable.py --file timetable.csv --dry-run
+
+    # Real import — inserts new rows, updates existing ones.
+    python admin/scripts/import_timetable.py --file timetable.csv
+
+    # Replace mode — wipes the program-years the CSV mentions and
+    # re-creates them. Use when the department gives you a corrected
+    # full timetable for the same program/year.
+    python admin/scripts/import_timetable.py --file timetable.csv --replace
+
+Exit codes:
+  0 — import succeeded (or dry run passed)
+  1 — validation failed, nothing was written
+"""
+
+import argparse
+import csv
+import sys
+from pathlib import Path
+
+# Repo root on sys.path so `backend...` imports resolve.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from backend.api.db.init_db import init_db
+from backend.api.db.session import session_scope
+from backend.api.models.program import Program
+from backend.api.models.program_year import ProgramYear
+from backend.api.models.timetable_entry import (
+    DAY_NAMES,
+    TimetableEntry,
+)
+
+
+_REQUIRED_COLUMNS = {
+    "program",
+    "year",
+    "academic_year",
+    "semester",
+    "day",
+    "start_time",
+    "end_time",
+    "module_code",
+}
+
+
+_DAY_LOOKUP = {name.lower(): num for num, name in DAY_NAMES.items()}
+for _num in range(7):
+    _DAY_LOOKUP[str(_num)] = _num
+
+
+def _parse_bool(value: str) -> bool:
+    if value is None:
+        return False
+    v = str(value).strip().lower()
+    return v in ("yes", "true", "1", "y", "t")
+
+
+def _parse_day(value: str) -> int | None:
+    if value is None:
+        return None
+    return _DAY_LOOKUP.get(str(value).strip().lower())
+
+
+def _validate_time(value: str) -> bool:
+    """Accepts HH:MM, 24-hour, zero-padded. Rejects 7:30, 7:30 AM, etc."""
+    if not value:
+        return False
+    s = str(value).strip()
+    if len(s) != 5 or s[2] != ":":
+        return False
+    hh, mm = s[:2], s[3:]
+    if not (hh.isdigit() and mm.isdigit()):
+        return False
+    h, m = int(hh), int(mm)
+    return 0 <= h <= 23 and 0 <= m <= 59
+
+
+def _load_and_validate(path: Path) -> list[dict]:
+    """Read the CSV. Raise ValueError if anything is wrong."""
+    if not path.exists():
+        raise ValueError(f"CSV not found: {path}")
+
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError("CSV has no header row")
+
+        headers = {h.strip().lower() for h in reader.fieldnames}
+        missing = _REQUIRED_COLUMNS - headers
+        if missing:
+            raise ValueError(
+                "CSV is missing required columns: " + ", ".join(sorted(missing))
+            )
+
+        rows = []
+        errors = []
+        for line_no, raw in enumerate(reader, start=2):  # start=2 because row 1 is headers
+            # Normalise the row keys to lowercase stripped.
+            row = {
+                (k or "").strip().lower(): (v or "").strip()
+                for k, v in raw.items()
+            }
+
+            # Skip blank rows silently.
+            if not any(row.values()):
+                continue
+
+            day = _parse_day(row.get("day", ""))
+            if day is None:
+                errors.append(
+                    f"line {line_no}: day '{row.get('day')}' is not a "
+                    f"day name or 0–6"
+                )
+                continue
+
+            if not _validate_time(row.get("start_time", "")):
+                errors.append(
+                    f"line {line_no}: start_time '{row.get('start_time')}' "
+                    f"must be HH:MM (e.g. 07:30)"
+                )
+                continue
+
+            if not _validate_time(row.get("end_time", "")):
+                errors.append(
+                    f"line {line_no}: end_time '{row.get('end_time')}' "
+                    f"must be HH:MM (e.g. 08:15)"
+                )
+                continue
+
+            try:
+                year_num = int(row["year"])
+                semester = int(row["semester"])
+            except (KeyError, ValueError) as e:
+                errors.append(f"line {line_no}: year or semester not an integer ({e})")
+                continue
+
+            if not row.get("program"):
+                errors.append(f"line {line_no}: program is blank")
+                continue
+
+            if not row.get("module_code"):
+                errors.append(f"line {line_no}: module_code is blank")
+                continue
+
+            rows.append({
+                "program": row["program"],
+                "year_number": year_num,
+                "academic_year": row["academic_year"],
+                "semester": semester,
+                "day_of_week": day,
+                "start_time": row["start_time"],
+                "end_time": row["end_time"],
+                "module_code": row["module_code"],
+                "module_name": row.get("module_name") or None,
+                "lecturer_name": row.get("lecturer") or None,
+                "venue_code": row.get("venue") or None,
+                "is_cross_cutting": _parse_bool(row.get("cross_cutting")),
+            })
+
+    if errors:
+        # Show the first 20 errors — more than that usually means the
+        # CSV is fundamentally malformed.
+        shown = errors[:20]
+        msg = "CSV validation failed:\n  " + "\n  ".join(shown)
+        if len(errors) > len(shown):
+            msg += f"\n  ...and {len(errors) - len(shown)} more."
+        raise ValueError(msg)
+
+    if not rows:
+        raise ValueError("CSV contained no data rows.")
+
+    return rows
+
+
+def _import(rows: list[dict], replace: bool, dry_run: bool):
+    """Write the rows. Returns a report dict."""
+    init_db()
+
+    report = {
+        "programs_created": 0,
+        "program_years_created": 0,
+        "program_years_wiped": 0,
+        "entries_created": 0,
+        "entries_updated": 0,
+        "entries_unchanged": 0,
+    }
+
+    # If dry_run, we still want to compute the report, so we do
+    # everything inside a transaction and roll back at the end.
+    with session_scope() as session:
+        # Group rows by (program, year, academic_year, semester).
+        groups: dict[tuple, list[dict]] = {}
+        for row in rows:
+            key = (
+                row["program"],
+                row["year_number"],
+                row["academic_year"],
+                row["semester"],
+            )
+            groups.setdefault(key, []).append(row)
+
+        for (program_name, year_num, academic_year, semester), group_rows in groups.items():
+            # --- find or create the program ---
+            program = (
+                session.query(Program)
+                .filter(Program.name == program_name)
+                .one_or_none()
+            )
+            if program is None:
+                program = Program(name=program_name)
+                session.add(program)
+                session.flush()
+                report["programs_created"] += 1
+
+            # --- find or create the program-year ---
+            py = (
+                session.query(ProgramYear)
+                .filter_by(
+                    program_id=program.id,
+                    year_number=year_num,
+                    academic_year=academic_year,
+                    semester=semester,
+                )
+                .one_or_none()
+            )
+            if py is None:
+                py = ProgramYear(
+                    program_id=program.id,
+                    year_number=year_num,
+                    academic_year=academic_year,
+                    semester=semester,
+                )
+                session.add(py)
+                session.flush()
+                report["program_years_created"] += 1
+
+            # --- replace mode: wipe existing entries for this program-year ---
+            if replace:
+                deleted = (
+                    session.query(TimetableEntry)
+                    .filter(TimetableEntry.program_year_id == py.id)
+                    .delete(synchronize_session=False)
+                )
+                report["program_years_wiped"] += 1
+
+            # --- upsert each entry ---
+            for row in group_rows:
+                existing = (
+                    session.query(TimetableEntry)
+                    .filter_by(
+                        program_year_id=py.id,
+                        day_of_week=row["day_of_week"],
+                        start_time=row["start_time"],
+                        module_code=row["module_code"],
+                    )
+                    .one_or_none()
+                )
+                if existing is None:
+                    session.add(
+                        TimetableEntry(
+                            program_year_id=py.id,
+                            day_of_week=row["day_of_week"],
+                            start_time=row["start_time"],
+                            end_time=row["end_time"],
+                            module_code=row["module_code"],
+                            module_name=row["module_name"],
+                            lecturer_name=row["lecturer_name"],
+                            venue_code=row["venue_code"],
+                            is_cross_cutting=row["is_cross_cutting"],
+                        )
+                    )
+                    report["entries_created"] += 1
+                else:
+                    changed = False
+                    for field in (
+                        "end_time",
+                        "module_name",
+                        "lecturer_name",
+                        "venue_code",
+                        "is_cross_cutting",
+                    ):
+                        if getattr(existing, field) != row[field]:
+                            setattr(existing, field, row[field])
+                            changed = True
+                    if changed:
+                        report["entries_updated"] += 1
+                    else:
+                        report["entries_unchanged"] += 1
+
+        if dry_run:
+            # Roll back so nothing is written.
+            session.rollback()
+
+    return report
+
+
+def _print_report(report: dict, dry_run: bool):
+    header = "Dry run — nothing written" if dry_run else "Import complete"
+    print()
+    print(header)
+    print(f"  programs created:         {report['programs_created']}")
+    print(f"  program-years created:    {report['program_years_created']}")
+    if report["program_years_wiped"]:
+        print(f"  program-years wiped:      {report['program_years_wiped']}")
+    print(f"  entries created:          {report['entries_created']}")
+    print(f"  entries updated:          {report['entries_updated']}")
+    print(f"  entries unchanged:        {report['entries_unchanged']}")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Import a timetable CSV.")
+    parser.add_argument("--file", required=True, help="Path to the CSV.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and report, write nothing.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help=(
+            "Delete existing entries for each program-year the CSV "
+            "mentions, then insert fresh. Use for corrected full "
+            "timetables."
+        ),
+    )
+    args = parser.parse_args()
+
+    path = Path(args.file)
+    try:
+        rows = _load_and_validate(path)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Parsed {len(rows)} rows from {path}.")
+
+    report = _import(rows, replace=args.replace, dry_run=args.dry_run)
+    _print_report(report, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\scripts\map_health_check.py ---
 
 """
@@ -1651,6 +2011,7 @@ export default function PlaceEditorPage() {
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState(null);
   const [form, setForm] = useState(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
@@ -1662,41 +2023,48 @@ export default function PlaceEditorPage() {
       .catch((err) => setError(err.message));
   }, []);
 
-  function selectPlace(place) {
+  async function selectPlace(place) {
     setSelected(place);
-    setForm({
-      name: place.name || '',
-      name_sw: place.name_sw || '',
-      alt_names: place.alt_names || '',
-      description: place.description || '',
-      description_ai: place.description_ai || '',
-      category: place.category || '',
-      ref: place.ref || '',
-      wheelchair: place.wheelchair || '',
-      opening_hours: place.opening_hours || '',
-      is_landmark: !!place.is_landmark,
-      has_wifi: !!place.has_wifi,
-      wifi_ssid: place.wifi_ssid || '',
-      wifi_password: place.wifi_password || '',
-    });
     setSaved(false);
     setError(null);
+    setForm(null);
+    setLoadingDetail(true);
+    try {
+      const detail = await api.getPlaceAdmin(place.id);
+      setForm({
+        name: detail.name || '',
+        name_sw: detail.name_sw || '',
+        alt_names: detail.alt_names || '',
+        description: detail.description || '',
+        description_ai: detail.description_ai || '',
+        intents: detail.intents || '',
+        category: detail.category || '',
+        ref: detail.ref || '',
+        wheelchair: detail.wheelchair || '',
+        opening_hours: detail.opening_hours || '',
+        is_landmark: !!detail.is_landmark,
+        has_wifi: !!detail.has_wifi,
+        wifi_ssid: detail.wifi_ssid || '',
+        wifi_password: detail.wifi_password || '',
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingDetail(false);
+    }
   }
 
   async function save() {
-    if (!selected) return;
+    if (!selected || !form) return;
     setSaving(true);
     setError(null);
     setSaved(false);
 
-    // Only send fields that changed.
     const changed = {};
     for (const key of Object.keys(form)) {
-      // Compare against the original place value.
-      const original = selected[key];
+      const original = form[key] === '' ? '' : selected[key];
       const current = form[key];
-      // Normalise: null and '' both mean "empty".
-      const origNorm = original ?? '';
+      const origNorm = selected[key] ?? '';
       const currNorm = current ?? '';
       if (origNorm !== currNorm) {
         changed[key] = current;
@@ -1711,7 +2079,6 @@ export default function PlaceEditorPage() {
 
     try {
       const updated = await api.updatePlace(selected.id, changed);
-      // Refresh both the form and the list entry.
       setPlaces((prev) =>
         prev.map((p) => (p.id === selected.id ? { ...p, ...changed } : p))
       );
@@ -1737,7 +2104,6 @@ export default function PlaceEditorPage() {
       </p>
 
       <div style={{ display: 'grid', gridTemplateColumns: '320px 1fr', gap: 24 }}>
-        {/* List */}
         <div>
           <input
             type="text"
@@ -1782,12 +2148,23 @@ export default function PlaceEditorPage() {
           </div>
         </div>
 
-        {/* Form */}
         <div>
-          {!selected || !form ? (
+          {!selected ? (
             <div className="card">
               <p className="muted" style={{ margin: 0 }}>
                 Pick a place on the left to edit its fields.
+              </p>
+            </div>
+          ) : loadingDetail ? (
+            <div className="card">
+              <p className="muted" style={{ margin: 0 }}>
+                Loading…
+              </p>
+            </div>
+          ) : !form ? (
+            <div className="card">
+              <p className="muted" style={{ margin: 0 }}>
+                Could not load this place.
               </p>
             </div>
           ) : (
@@ -1835,6 +2212,13 @@ export default function PlaceEditorPage() {
                 />
 
                 <FormField
+                  label="Intents (semicolon-separated)"
+                  value={form.intents}
+                  onChange={(v) => setForm({ ...form, intents: v })}
+                  hint="What a student might come here to do. Lowercase, semicolons between. Examples: eat; study; wifi"
+                />
+
+                <FormField
                   label="Category"
                   value={form.category}
                   onChange={(v) => setForm({ ...form, category: v })}
@@ -1844,7 +2228,7 @@ export default function PlaceEditorPage() {
                   label="Reference"
                   value={form.ref}
                   onChange={(v) => setForm({ ...form, ref: v })}
-                  hint="Room or block code, like LT3."
+                  hint="Room or block code, like LT3. Timetable venues match on this."
                 />
                 <FormField
                   label="Wheelchair access"
@@ -2810,6 +3194,630 @@ function SummaryBox({ label, value }) {
   );
 }
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\app\timetable\page.js ---
+
+// Timetable viewer. Browse programs, drill into years, see the
+// entries, delete what you don't want.
+
+'use client';
+
+import { useEffect, useState } from 'react';
+
+import { api } from '@/lib/api';
+
+const DAY_NAMES = [
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+  'Sunday',
+];
+
+export default function TimetablePage() {
+  const [programs, setPrograms] = useState([]);
+  const [selectedProgram, setSelectedProgram] = useState(null);
+  const [years, setYears] = useState([]);
+  const [selectedYear, setSelectedYear] = useState(null);
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api
+      .listPrograms()
+      .then((data) => {
+        if (!cancelled) setPrograms(data);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function selectProgram(program) {
+    setSelectedProgram(program);
+    setSelectedYear(null);
+    setEntries([]);
+    setError(null);
+    try {
+      const data = await api.listYearsForProgram(program.id);
+      setYears(data);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function selectYear(year) {
+    setSelectedYear(year);
+    setError(null);
+    try {
+      const data = await api.getSchedule(year.id);
+      setEntries(data.entries || []);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function deleteEntry(entry) {
+    if (!confirm(`Delete ${entry.module_code} at ${entry.start_time}?`)) return;
+    try {
+      await api.deleteTimetableEntry(entry.id);
+      setEntries((prev) => prev.filter((e) => e.id !== entry.id));
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+
+  async function deleteYear(year) {
+    if (
+      !confirm(
+        `Delete Year ${year.year_number} (${year.academic_year} S${year.semester}) and all its entries?`
+      )
+    )
+      return;
+    try {
+      await api.deleteProgramYear(year.id);
+      setYears((prev) => prev.filter((y) => y.id !== year.id));
+      if (selectedYear?.id === year.id) {
+        setSelectedYear(null);
+        setEntries([]);
+      }
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+
+  async function deleteProgram(program) {
+    if (!confirm(`Delete "${program.name}" and everything under it?`)) return;
+    try {
+      await api.deleteProgram(program.id);
+      setPrograms((prev) => prev.filter((p) => p.id !== program.id));
+      if (selectedProgram?.id === program.id) {
+        setSelectedProgram(null);
+        setYears([]);
+        setSelectedYear(null);
+        setEntries([]);
+      }
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+
+  // Group entries by day for display.
+  const entriesByDay = {};
+  for (const entry of entries) {
+    if (!entriesByDay[entry.day_of_week]) entriesByDay[entry.day_of_week] = [];
+    entriesByDay[entry.day_of_week].push(entry);
+  }
+
+  return (
+    <>
+      <h1 className="page-title">Timetable</h1>
+      <p className="page-subtitle">
+        Browse imported timetables. Programs and years are created by the
+        CSV import; this page lets you view and delete.
+      </p>
+
+      {error ? <div className="error-box">{error}</div> : null}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 24, marginTop: 20 }}>
+        {/* Programs */}
+        <div>
+          <div className="faint" style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>
+            Programs
+          </div>
+          <div
+            style={{
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius)',
+              background: 'var(--bg-elevated)',
+              maxHeight: '70vh',
+              overflowY: 'auto',
+            }}
+          >
+            {loading ? (
+              <div style={{ padding: 16 }} className="muted">Loading…</div>
+            ) : programs.length === 0 ? (
+              <div style={{ padding: 16 }} className="muted">
+                No programs. Import a CSV first.
+              </div>
+            ) : (
+              programs.map((p) => (
+                <div
+                  key={p.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    borderBottom: '1px solid var(--border-subtle)',
+                    background:
+                      selectedProgram?.id === p.id
+                        ? 'var(--border-subtle)'
+                        : 'transparent',
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => selectProgram(p)}
+                    style={{
+                      flex: 1,
+                      textAlign: 'left',
+                      padding: '12px 16px',
+                      background: 'transparent',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontSize: 14,
+                    }}
+                  >
+                    {p.name}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deleteProgram(p)}
+                    title="Delete"
+                    style={{
+                      padding: 8,
+                      background: 'transparent',
+                      border: 'none',
+                      cursor: 'pointer',
+                      color: 'var(--danger)',
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Years */}
+        <div>
+          {!selectedProgram ? (
+            <div className="card">
+              <p className="muted" style={{ margin: 0 }}>
+                Pick a program to see its year levels.
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="faint" style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>
+                Years — {selectedProgram.name}
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 24 }}>
+                {years.map((y) => (
+                  <div
+                    key={y.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      padding: '6px 10px',
+                      borderRadius: '999px',
+                      border: '1px solid var(--border)',
+                      background:
+                        selectedYear?.id === y.id ? 'var(--primary)' : 'var(--bg-elevated)',
+                      color:
+                        selectedYear?.id === y.id ? '#fff' : 'var(--text)',
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => selectYear(y)}
+                      style={{
+                        background: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        color: 'inherit',
+                        fontSize: 14,
+                        fontWeight: 500,
+                      }}
+                    >
+                      Year {y.year_number} · {y.academic_year} · S{y.semester}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteYear(y)}
+                      title="Delete"
+                      style={{
+                        background: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        color: 'inherit',
+                        opacity: 0.6,
+                        padding: 0,
+                        fontSize: 12,
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                {years.length === 0 ? (
+                  <span className="muted" style={{ fontSize: 14 }}>
+                    No year levels.
+                  </span>
+                ) : null}
+              </div>
+
+              {selectedYear ? (
+                <>
+                  <div className="faint" style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>
+                    Entries ({entries.length})
+                  </div>
+                  {entries.length === 0 ? (
+                    <div className="card">
+                      <p className="muted" style={{ margin: 0 }}>
+                        No entries for this year.
+                      </p>
+                    </div>
+                  ) : (
+                    [0, 1, 2, 3, 4, 5, 6].map((day) => {
+                      const dayEntries = entriesByDay[day];
+                      if (!dayEntries || dayEntries.length === 0) return null;
+                      return (
+                        <div key={day} className="card" style={{ marginBottom: 12 }}>
+                          <h3 className="card-title">{DAY_NAMES[day]}</h3>
+                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
+                            <tbody>
+                              {dayEntries
+                                .sort((a, b) => a.start_time.localeCompare(b.start_time))
+                                .map((e) => (
+                                  <tr
+                                    key={e.id}
+                                    style={{ borderTop: '1px solid var(--border-subtle)' }}
+                                  >
+                                    <td style={{ padding: '8px 0', width: 110, color: 'var(--text-muted)' }}>
+                                      {e.start_time}–{e.end_time}
+                                    </td>
+                                    <td style={{ padding: '8px 0', fontWeight: 600 }}>
+                                      {e.module_code}
+                                    </td>
+                                    <td style={{ padding: '8px 0', color: 'var(--text-muted)' }}>
+                                      {e.module_name || ''}
+                                    </td>
+                                    <td style={{ padding: '8px 0', color: 'var(--text-muted)' }}>
+                                      {e.venue_code || ''}
+                                    </td>
+                                    <td style={{ padding: '8px 0', textAlign: 'right', width: 60 }}>
+                                      <button
+                                        className="btn btn-danger"
+                                        style={{ fontSize: 12, padding: '4px 8px' }}
+                                        onClick={() => deleteEntry(e)}
+                                      >
+                                        Delete
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      );
+                    })
+                  )}
+                </>
+              ) : (
+                <div className="card">
+                  <p className="muted" style={{ margin: 0 }}>
+                    Pick a year to see its entries.
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\app\timetable-import\page.js ---
+
+// Timetable CSV import. Drag-and-drop a CSV, preview the first rows,
+// then confirm the import. The parser runs on the server — this page
+// just sends the file and shows the result.
+
+'use client';
+
+import { useCallback, useRef, useState } from 'react';
+
+import { api } from '@/lib/api';
+import { CsvPreview } from '@/components/CsvPreview';
+
+// Preview-only parser. Doesn't validate — that's the server's job.
+// Splits on commas and handles quoted fields. Enough for the kinds
+// of CSVs we care about.
+function parseCsvText(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '');
+  if (lines.length === 0) return { columns: [], rows: [] };
+
+  function splitLine(line) {
+    const cells = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        cells.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    cells.push(current);
+    return cells;
+  }
+
+  const columns = splitLine(lines[0]).map((c) => c.trim());
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = splitLine(lines[i]);
+    const row = {};
+    for (let j = 0; j < columns.length; j++) {
+      row[columns[j]] = (cells[j] ?? '').trim();
+    }
+    rows.push(row);
+  }
+  return { columns, rows };
+}
+
+export default function TimetableImportPage() {
+  const inputRef = useRef(null);
+  const [dragging, setDragging] = useState(false);
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [replace, setReplace] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  const handleFile = useCallback(async (f) => {
+    if (!f) return;
+    setFile(f);
+    setResult(null);
+    setError(null);
+    try {
+      const text = await f.text();
+      setPreview(parseCsvText(text));
+    } catch (err) {
+      setError(`Could not read file: ${err.message}`);
+      setPreview(null);
+    }
+  }, []);
+
+  function onDrop(e) {
+    e.preventDefault();
+    setDragging(false);
+    const f = e.dataTransfer.files?.[0];
+    if (f) handleFile(f);
+  }
+  function onDragOver(e) {
+    e.preventDefault();
+    setDragging(true);
+  }
+  function onDragLeave(e) {
+    e.preventDefault();
+    setDragging(false);
+  }
+  function onChooseClick() {
+    inputRef.current?.click();
+  }
+  function onFileChosen(e) {
+    const f = e.target.files?.[0];
+    if (f) handleFile(f);
+    e.target.value = '';
+  }
+
+  async function confirmImport() {
+    if (!file) return;
+    setImporting(true);
+    setError(null);
+    setResult(null);
+    try {
+      const data = await api.importTimetableCsv(file, { replace });
+      setResult(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  function reset() {
+    setFile(null);
+    setPreview(null);
+    setResult(null);
+    setError(null);
+    setReplace(false);
+  }
+
+  return (
+    <>
+      <h1 className="page-title">Import Timetable</h1>
+      <p className="page-subtitle">
+        Upload a timetable CSV. Every row becomes one class slot. The
+        file is validated before anything is written — if any row is
+        bad, the whole import is rejected.
+      </p>
+
+      {/* Drop zone */}
+      {!result ? (
+        <>
+          <div
+            onDrop={onDrop}
+            onDragOver={onDragOver}
+            onDragLeave={onDragLeave}
+            onClick={onChooseClick}
+            className={`drop-zone ${dragging ? 'drop-zone-active' : ''}`}
+          >
+            <div style={{ fontSize: 32, marginBottom: 12 }}>📄</div>
+            <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>
+              {file ? file.name : 'Drop a CSV here'}
+            </div>
+            <div className="muted" style={{ fontSize: 14 }}>
+              {file
+                ? `${preview?.rows.length ?? 0} data rows parsed.`
+                : 'or click to choose. Must be a .csv file.'}
+            </div>
+            <input
+              ref={inputRef}
+              type="file"
+              accept=".csv,text/csv"
+              onChange={onFileChosen}
+              style={{ display: 'none' }}
+            />
+          </div>
+
+          {preview && preview.rows.length > 0 ? (
+            <div style={{ marginTop: 24 }}>
+              <h2 style={{ fontSize: 16, marginBottom: 12 }}>
+                Preview ({preview.rows.length} row
+                {preview.rows.length === 1 ? '' : 's'})
+              </h2>
+              <CsvPreview rows={preview.rows} columns={preview.columns} />
+            </div>
+          ) : null}
+
+          {error ? (
+            <div className="error-box" style={{ marginTop: 20 }}>
+              {error}
+            </div>
+          ) : null}
+
+          {file ? (
+            <div style={{ marginTop: 24 }}>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  marginBottom: 16,
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={replace}
+                  onChange={(e) => setReplace(e.target.checked)}
+                />
+                <span>
+                  Replace existing entries for the program-years this CSV
+                  mentions
+                </span>
+              </label>
+              <div className="muted" style={{ fontSize: 13, marginBottom: 16 }}>
+                Without this, existing rows are updated in place. With this,
+                they are deleted and reinserted. Use it when a department
+                sends a corrected full timetable for the same program.
+              </div>
+
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  className="btn"
+                  onClick={confirmImport}
+                  disabled={importing}
+                >
+                  {importing ? 'Importing…' : 'Confirm import'}
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={reset}
+                  disabled={importing}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <>
+          <div className="success-box">
+            <strong>Import complete.</strong>
+          </div>
+          <div className="card" style={{ marginTop: 20 }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <tbody>
+                {[
+                  ['Programs created', result.programs_created],
+                  ['Program-years created', result.program_years_created],
+                  ['Program-years wiped', result.program_years_wiped],
+                  ['Entries created', result.entries_created],
+                  ['Entries updated', result.entries_updated],
+                  ['Entries unchanged', result.entries_unchanged],
+                ].map(([label, value]) => (
+                  <tr
+                    key={label}
+                    style={{ borderBottom: '1px solid var(--border-subtle)' }}
+                  >
+                    <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>
+                      {label}
+                    </td>
+                    <td
+                      style={{
+                        padding: '10px 0',
+                        textAlign: 'right',
+                        fontWeight: 600,
+                      }}
+                    >
+                      {value ?? 0}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ marginTop: 20, display: 'flex', gap: 8 }}>
+            <a href="/timetable" className="btn">
+              View timetable
+            </a>
+            <button className="btn btn-secondary" onClick={reset}>
+              Import another
+            </button>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\components\BearingPicker.js ---
 
 // A compass-direction picker for photo bearings.
@@ -2872,6 +3880,101 @@ export function BearingPicker({ value, onChange }) {
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\components\CarouselPreview.js ---
 
 
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\components\CsvPreview.js ---
+
+// A compact table showing the first N rows of a parsed CSV, so the
+// admin can eyeball the data before confirming the import.
+
+export function CsvPreview({ rows, columns, maxRows = 20 }) {
+  if (!rows || rows.length === 0) {
+    return (
+      <div className="empty-state" style={{ padding: 24 }}>
+        No rows to preview.
+      </div>
+    );
+  }
+
+  const shown = rows.slice(0, maxRows);
+  const remaining = rows.length - shown.length;
+
+  return (
+    <div
+      style={{
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        overflow: 'auto',
+        maxHeight: 400,
+      }}
+    >
+      <table
+        style={{
+          width: '100%',
+          borderCollapse: 'collapse',
+          fontSize: 13,
+        }}
+      >
+        <thead>
+          <tr
+            style={{
+              background: 'var(--border-subtle)',
+              textAlign: 'left',
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+              color: 'var(--text-muted)',
+            }}
+          >
+            {columns.map((col) => (
+              <th
+                key={col}
+                style={{
+                  padding: '8px 12px',
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {col}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {shown.map((row, i) => (
+            <tr
+              key={i}
+              style={{ borderTop: '1px solid var(--border-subtle)' }}
+            >
+              {columns.map((col) => (
+                <td
+                  key={col}
+                  style={{
+                    padding: '8px 12px',
+                    whiteSpace: 'nowrap',
+                    color: 'var(--text)',
+                  }}
+                >
+                  {row[col] ?? ''}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {remaining > 0 ? (
+        <div
+          style={{
+            padding: '10px 12px',
+            fontSize: 12,
+            color: 'var(--text-faint)',
+            borderTop: '1px solid var(--border-subtle)',
+          }}
+        >
+          …and {remaining} more row{remaining === 1 ? '' : 's'}.
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\components\DataTable.js ---
 
@@ -3607,6 +4710,8 @@ const NAV_ITEMS = [
   { href: '/report-queue', label: 'Reports', icon: 'flag' },
   { href: '/photo-manager', label: 'Photos', icon: 'camera' },
   { href: '/place-editor', label: 'Places', icon: 'pin' },
+  { href: '/timetable', label: 'Timetable', icon: 'calendar' },
+  { href: '/timetable-import', label: 'Import CSV', icon: 'upload' },
   { href: '/knowledge', label: 'Knowledge', icon: 'book' },
   { href: '/route-tester', label: 'Route Tester', icon: 'compass' },
   { href: '/reimport-view', label: 'Re-import', icon: 'refresh' },
@@ -3660,6 +4765,23 @@ function Icon({ name }) {
         <svg {...common}>
           <path d="M12 22s7-6 7-12a7 7 0 10-14 0c0 6 7 12 7 12z" />
           <circle cx="12" cy="10" r="2.5" />
+        </svg>
+      );
+    case 'calendar':
+      return (
+        <svg {...common}>
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+          <line x1="16" y1="2" x2="16" y2="6" />
+          <line x1="8" y1="2" x2="8" y2="6" />
+          <line x1="3" y1="10" x2="21" y2="10" />
+        </svg>
+      );
+    case 'upload':
+      return (
+        <svg {...common}>
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+          <polyline points="17 8 12 3 7 8" />
+          <line x1="12" y1="3" x2="12" y2="15" />
         </svg>
       );
     case 'book':
@@ -3948,6 +5070,9 @@ export const api = {
     return request(`/api/places${qs ? '?' + qs : ''}`);
   },
   getPlace: (id) => request(`/api/places/${id}`),
+    // Admin-specific: includes description_ai, which is never exposed
+  // by the public /api/places/{id} endpoint.
+  getPlaceAdmin: (id) => request(`/api/admin/places/${id}`),
   updatePlace: (id, data) =>
     request(`/api/admin/places/${id}`, {
       method: 'PATCH',
@@ -4010,6 +5135,39 @@ export const api = {
   listKnowledgeDocuments: () => request('/api/admin/knowledge'),
   deleteKnowledgeDocument: (id) =>
     request(`/api/admin/knowledge/${id}`, { method: 'DELETE' }),
+
+  // ---------- Timetable ----------
+  // Programs are read through the admin endpoint (identical shape to
+  // the public one, but consistent with the rest of the admin site).
+  listPrograms: () => request('/api/admin/timetable/programs'),
+  listYearsForProgram: (programId) =>
+    request(`/api/admin/timetable/programs/${programId}/years`),
+  getSchedule: (programYearId) =>
+    request(`/api/admin/timetable/schedule?program_year_id=${programYearId}`),
+  deleteProgram: (programId) =>
+    request(`/api/admin/timetable/programs/${programId}`, {
+      method: 'DELETE',
+    }),
+  deleteProgramYear: (programYearId) =>
+    request(`/api/admin/timetable/program-years/${programYearId}`, {
+      method: 'DELETE',
+    }),
+  deleteTimetableEntry: (entryId) =>
+    request(`/api/admin/timetable/entries/${entryId}`, {
+      method: 'DELETE',
+    }),
+
+  // CSV upload. The `replace` flag wipes existing entries for each
+  // program-year in the CSV before inserting the new ones.
+  importTimetableCsv: (file, { replace = false } = {}) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const qs = replace ? '?replace=true' : '';
+    return request(`/api/admin/timetable/import${qs}`, {
+      method: 'POST',
+      body: formData,
+    });
+  },
 };
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\lib\auth.js ---
@@ -9809,6 +10967,144 @@ def downgrade():
         # Rename the AI column back to `description`.
         op.alter_column(table, "description_ai", new_column_name="description")
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\migrations\versions\0005_timetable_and_intents.py ---
+
+"""Add timetable tables and Place.intents.
+
+Revision ID: 0005
+Revises: 0004
+
+What this does:
+  1. Adds `intents` to `places` (nullable Text).
+  2. Creates `programs`.
+  3. Creates `program_years`.
+  4. Creates `timetable_entries`.
+
+Nothing is dropped, nothing is renamed. Every existing row is
+preserved, and the new tables start empty.
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0005"
+down_revision = "0004"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    # --- intents on places ---
+    op.add_column("places", sa.Column("intents", sa.Text(), nullable=True))
+
+    # --- programs ---
+    op.create_table(
+        "programs",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("department", sa.String(255), nullable=True),
+        sa.Column("code", sa.String(32), nullable=True),
+        sa.Column("level", sa.String(32), nullable=True),
+        sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index("ix_programs_name_lower", "programs", [sa.text("lower(name)")])
+    op.create_index("ix_programs_code", "programs", ["code"])
+
+    # --- program_years ---
+    op.create_table(
+        "program_years",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column(
+            "program_id",
+            sa.Integer(),
+            sa.ForeignKey("programs.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("year_number", sa.Integer(), nullable=False),
+        sa.Column("academic_year", sa.String(16), nullable=False),
+        sa.Column("semester", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("display_name", sa.String(64), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index("ix_program_years_program_id", "program_years", ["program_id"])
+    op.create_index(
+        "ix_program_years_unique",
+        "program_years",
+        ["program_id", "year_number", "academic_year", "semester"],
+        unique=True,
+    )
+
+    # --- timetable_entries ---
+    op.create_table(
+        "timetable_entries",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column(
+            "program_year_id",
+            sa.Integer(),
+            sa.ForeignKey("program_years.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("day_of_week", sa.Integer(), nullable=False),
+        sa.Column("start_time", sa.String(5), nullable=False),
+        sa.Column("end_time", sa.String(5), nullable=False),
+        sa.Column("module_code", sa.String(32), nullable=False),
+        sa.Column("module_name", sa.String(255), nullable=True),
+        sa.Column("lecturer_name", sa.String(255), nullable=True),
+        sa.Column("venue_code", sa.String(64), nullable=True),
+        sa.Column("is_cross_cutting", sa.Boolean(), nullable=False, server_default="0"),
+        sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index(
+        "ix_timetable_entries_program_year_id",
+        "timetable_entries",
+        ["program_year_id"],
+    )
+    op.create_index(
+        "ix_timetable_entries_day_of_week",
+        "timetable_entries",
+        ["day_of_week"],
+    )
+    op.create_index(
+        "ix_timetable_entries_venue_code",
+        "timetable_entries",
+        ["venue_code"],
+    )
+    op.create_index(
+        "ix_timetable_entries_natural_key",
+        "timetable_entries",
+        ["program_year_id", "day_of_week", "start_time", "module_code"],
+        unique=True,
+    )
+    op.create_index(
+        "ix_timetable_entries_lookup",
+        "timetable_entries",
+        ["program_year_id", "day_of_week"],
+    )
+
+
+def downgrade():
+    op.drop_index("ix_timetable_entries_lookup", table_name="timetable_entries")
+    op.drop_index("ix_timetable_entries_natural_key", table_name="timetable_entries")
+    op.drop_index("ix_timetable_entries_venue_code", table_name="timetable_entries")
+    op.drop_index("ix_timetable_entries_day_of_week", table_name="timetable_entries")
+    op.drop_index("ix_timetable_entries_program_year_id", table_name="timetable_entries")
+    op.drop_table("timetable_entries")
+
+    op.drop_index("ix_program_years_unique", table_name="program_years")
+    op.drop_index("ix_program_years_program_id", table_name="program_years")
+    op.drop_table("program_years")
+
+    op.drop_index("ix_programs_code", table_name="programs")
+    op.drop_index("ix_programs_name_lower", table_name="programs")
+    op.drop_table("programs")
+
+    op.drop_column("places", "intents")
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\session.py ---
 
 """
@@ -10133,6 +11429,7 @@ from .routers import (
     places,
     reports,
     route,
+    timetable,
     wifi,
 )
 from .routers.admin import (
@@ -10144,6 +11441,7 @@ from .routers.admin import (
     reimport as admin_reimport,
     reports as admin_reports,
     stats as admin_stats,
+    timetable as admin_timetable,
     users as admin_users,
 )
 from .settings import IS_DEV, MEDIA_DIR, SENTRY_DSN
@@ -10185,7 +11483,7 @@ def create_app() -> FastAPI:
             "Backend for the Campus Navigation mobile app and the "
             "admin website."
         ),
-        version="0.17.0",
+        version="0.18.0",
         lifespan=lifespan,
     )
 
@@ -10234,6 +11532,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(wifi.router)
     app.include_router(chat_doc.router)
+    app.include_router(timetable.router)
 
     # Admin auth — NOT behind the guard, because login itself can't
     # require a session.
@@ -10265,10 +11564,10 @@ def create_app() -> FastAPI:
         admin_users.router, prefix=admin_prefix, dependencies=admin_deps
     )
     app.include_router(
-        admin_users.router, prefix=admin_prefix, dependencies=admin_deps
+        admin_knowledge.router, prefix=admin_prefix, dependencies=admin_deps
     )
     app.include_router(
-        admin_knowledge.router, prefix=admin_prefix, dependencies=admin_deps
+        admin_timetable.router, prefix=admin_prefix, dependencies=admin_deps
     )
 
     app.mount(
@@ -10281,7 +11580,7 @@ def create_app() -> FastAPI:
     def root():
         return {
             "name": "Campus Navigation API",
-            "version": "0.17.0",
+            "version": "0.18.0",
             "docs": "/docs",
             "health": "/api/health",
         }
@@ -10697,6 +11996,12 @@ class Place(Base, TimestampMixin):
     # Never shown in the app front end.
     description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Free-text list of intents this place serves, semicolon-separated.
+    # Examples: "eat; study; wifi", "print; study".
+    # Used by the Explore screen to filter places by what a student
+    # wants to *do*, as opposed to what the place *is* (category).
+    intents: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Coordinates. Kept as separate lat/lon columns for ease of read;
     # Phase 13 adds a proper geometry column alongside these.
     lat: Mapped[float] = mapped_column(Float, nullable=False)
@@ -10724,6 +12029,133 @@ class Place(Base, TimestampMixin):
 
     def __repr__(self):
         return f"<Place id={self.id} name={self.name!r}>"
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\program.py ---
+
+"""
+program.py
+
+A degree or diploma program offered by a department. This is what a
+student picks during onboarding: "Diploma in Electrical and Electronic
+Engineering", "Bachelor of Electrical and Electronic Engineering",
+etc.
+
+Programs are what timetables hang off. Each program has one or more
+year levels, and each year level has its own timetable.
+
+Programs are always created by an admin — either through the CLI
+import script or (later) through the admin site. There's no public
+API to create them.
+"""
+
+from sqlalchemy import Index, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .base import Base, TimestampMixin
+
+
+class Program(Base, TimestampMixin):
+    __tablename__ = "programs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # The program's full name, as it appears on the timetable.
+    # e.g. "Diploma in Electrical and Electronic Engineering"
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # The department that offers the program.
+    # e.g. "Electrical and Power Engineering"
+    department: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # A short code, useful for display and for the CSV import.
+    # e.g. "DEEE" (Diploma in Electrical and Electronic Engineering)
+    code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Which academic level this belongs to.
+    # Free text for now — values seen in the wild: "UQF6", "UQF8".
+    # Not enforced because different institutions use different schemes.
+    level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Optional notes, for the admin's own reference.
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_programs_name_lower", name),
+        Index("ix_programs_code", code),
+    )
+
+    def __repr__(self):
+        return f"<Program id={self.id} name={self.name!r}>"
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\program_year.py ---
+
+"""
+program_year.py
+
+One year-level of one program. This is the unit that actually has a
+timetable. A student selects "Program X, Year 2" and gets the
+timetable attached to this row.
+
+Why a separate table and not just a "year" column on Program: because
+each year level has its own independent timetable. The First Year of
+a program shares modules with the First Year of a different program;
+the Second Year doesn't. Storing them separately means a reimport of
+one year's timetable can't corrupt another's.
+
+The `academic_year` and `semester` fields exist so we can keep old
+timetables around when a new academic year starts. The student always
+sees the current one; the admin can look back at previous ones.
+"""
+
+from sqlalchemy import ForeignKey, Index, Integer, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .base import Base, TimestampMixin
+
+
+class ProgramYear(Base, TimestampMixin):
+    __tablename__ = "program_years"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # Which program this year belongs to.
+    program_id: Mapped[int] = mapped_column(
+        ForeignKey("programs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Which year level. Typically 1, 2, 3, 4.
+    year_number: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # The academic year, e.g. "2025-2026". Free-form string so the
+    # exact format can vary by institution.
+    academic_year: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # Which semester. Typically 1 or 2.
+    semester: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    # Optional display name — used on the mobile picker if we want
+    # to show "Second Year" instead of "Year 2". Leave null to fall
+    # back to "Year {year_number}".
+    display_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_program_years_unique",
+            "program_id",
+            "year_number",
+            "academic_year",
+            "semester",
+            unique=True,
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<ProgramYear program_id={self.program_id} "
+            f"year={self.year_number} {self.academic_year} S{self.semester}>"
+        )
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\recent_destination.py ---
 
@@ -10934,6 +12366,127 @@ class RouteCache(Base, TimestampMixin):
             f"hits={self.hit_count}>"
         )
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\timetable_entry.py ---
+
+"""
+timetable_entry.py
+
+One class slot. Flat structure — one row per class per day, no merged
+cells, no layout quirks. The CSV import writes these, and the mobile
+timetable screen reads them.
+
+Every field on this row corresponds to a column in the timetable PDF
+(or its spreadsheet source). The mapping is intentional and flat so
+that reading and writing are obvious, and so that a future admin UI
+can edit one field at a time without special cases.
+
+Venue linking: `venue_code` is matched against `Place.ref` at read
+time. When there's a match, the mobile app can offer "Take me there"
+for that row. When there isn't (a venue that hasn't been mapped into
+the places database yet), the app shows the venue text without a
+navigation button. The link is not enforced by a foreign key, because
+venues come and go and a mismatch should never block the timetable
+from being stored.
+"""
+
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .base import Base, TimestampMixin
+
+
+# The days we accept. Stored as integers so sorting and comparison
+# are trivial, and so a future change to display names doesn't touch
+# the database.
+DAY_MONDAY = 0
+DAY_TUESDAY = 1
+DAY_WEDNESDAY = 2
+DAY_THURSDAY = 3
+DAY_FRIDAY = 4
+DAY_SATURDAY = 5
+DAY_SUNDAY = 6
+
+DAY_NAMES = {
+    DAY_MONDAY: "Monday",
+    DAY_TUESDAY: "Tuesday",
+    DAY_WEDNESDAY: "Wednesday",
+    DAY_THURSDAY: "Thursday",
+    DAY_FRIDAY: "Friday",
+    DAY_SATURDAY: "Saturday",
+    DAY_SUNDAY: "Sunday",
+}
+
+
+class TimetableEntry(Base, TimestampMixin):
+    __tablename__ = "timetable_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # Which program-year this class belongs to.
+    program_year_id: Mapped[int] = mapped_column(
+        ForeignKey("program_years.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Which day of the week. 0 = Monday, 4 = Friday.
+    day_of_week: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    # Start and end time, stored as "HH:MM" strings. Storing them as
+    # strings (not time objects) keeps SQLite and Postgres identical
+    # and avoids timezone headaches — these are local wall-clock times,
+    # not instants.
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)
+
+    # Module identity.
+    module_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    module_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Who teaches it. Free text — sometimes one name, sometimes two,
+    # sometimes "Not Set".
+    lecturer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Where it's held. Matches `Place.ref` when the venue is mapped.
+    venue_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    # Cross-cutting courses are shared with other programs. The
+    # timetable PDFs mark them with an asterisk. Kept as a flag so
+    # the app can show "shared with other programs" if useful.
+    is_cross_cutting: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Optional free-text note. Not in the PDFs, but useful for the
+    # admin if a class has a special instruction ("bring your own
+    # calculator", "double session").
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        # The natural key for deduplication during import. If a CSV
+        # row matches on all of these, it's an update; otherwise it's
+        # an insert. We deliberately don't include the module name or
+        # lecturer — those can change without creating a new slot.
+        Index(
+            "ix_timetable_entries_natural_key",
+            "program_year_id",
+            "day_of_week",
+            "start_time",
+            "module_code",
+            unique=True,
+        ),
+        Index(
+            "ix_timetable_entries_lookup",
+            "program_year_id",
+            "day_of_week",
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<TimetableEntry py={self.program_year_id} "
+            f"day={self.day_of_week} {self.start_time}-{self.end_time} "
+            f"{self.module_code}>"
+        )
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\__init__.py ---
 
 """
@@ -10948,9 +12501,12 @@ from .knowledge_document import KnowledgeDocument
 from .media import Media
 from .path_edge import PathEdge
 from .place import Place
+from .program import Program
+from .program_year import ProgramYear
 from .recent_destination import RecentDestination
 from .report import Report
 from .route_cache import RouteCache
+from .timetable_entry import TimetableEntry
 
 __all__ = [
     "Base",
@@ -10965,6 +12521,9 @@ __all__ = [
     "RouteCache",
     "AdminUser",
     "KnowledgeDocument",
+    "Program",
+    "ProgramYear",
+    "TimetableEntry",
 ]
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\rate_limit.py ---
@@ -11402,13 +12961,49 @@ from ...dependencies import db_session
 from ...errors import NotFoundError
 from ...models.place import Place
 from ...schemas.admin import UpdatePlaceRequest
-from ...schemas.place import PlaceDetail
-from ...services import cache_service, graph_service, place_service
+from ...services import cache_service, graph_service
 
 router = APIRouter(prefix="/places", tags=["admin:places"])
 
 
-@router.patch("/{place_id}", response_model=PlaceDetail)
+def _to_admin_detail(place: Place) -> dict:
+    """
+    Full detail for the admin editor. Unlike the public PlaceDetail
+    schema, this includes `description_ai`, so an admin can see and
+    edit the AI-facing text.
+    """
+    return {
+        "id": place.id,
+        "name": place.name,
+        "name_sw": place.name_sw,
+        "alt_names": place.alt_names,
+        "description": place.description,
+        "description_ai": place.description_ai,
+        "intents": place.intents,
+        "category": place.category,
+        "ref": place.ref,
+        "location": {"lat": place.lat, "lon": place.lon},
+        "wheelchair": place.wheelchair,
+        "opening_hours": place.opening_hours,
+        "is_landmark": place.is_landmark,
+        "has_wifi": place.has_wifi,
+        "wifi_ssid": place.wifi_ssid,
+    }
+
+
+@router.get("/{place_id}")
+def get_place_admin(place_id: int, session: Session = Depends(db_session)):
+    """
+    Full detail for one place, including the AI description.
+    Used by the admin place editor.
+    """
+    place = session.query(Place).filter_by(id=place_id).one_or_none()
+    if place is None:
+        raise NotFoundError(f"Place {place_id} not found")
+    return _to_admin_detail(place)
+
+
+@router.patch("/{place_id}")
 def update_place(
     place_id: int,
     body: UpdatePlaceRequest,
@@ -11427,7 +13022,6 @@ def update_place(
     if place is None:
         raise NotFoundError(f"Place {place_id} not found")
 
-    # Only apply fields that were explicitly sent.
     updates = body.model_dump(exclude_unset=True)
 
     ai_description_changed = "description_ai" in updates
@@ -11437,14 +13031,12 @@ def update_place(
 
     session.flush()
 
-    # If the AI description changed, the loaded graph and any cached
-    # narrations are stale. Reload and invalidate.
     if ai_description_changed:
         graph_service.reset()
         if cache.is_available():
             cache_service.invalidate_narrations()
 
-    return place_service.get_place(session, place_id)
+    return _to_admin_detail(place)
 
 
 @router.delete("/{place_id}", status_code=204)
@@ -11641,6 +13233,158 @@ def get_stats(session: Session = Depends(db_session)):
         reports_in_progress=count(Report, Report.status == "in_progress"),
         reports_resolved=count(Report, Report.status == "resolved"),
     )
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\admin\timetable.py ---
+
+"""
+timetable.py (admin)
+
+Admin endpoints for managing timetable data. Used by the admin site
+(Phase 3) and by tooling. Guarded by the same admin dependency as
+every other admin route.
+
+The CSV import endpoint lives here too, but its parsing logic is
+shared with the CLI script — the admin endpoint just accepts a file
+upload and calls the same `_load_and_validate` function.
+"""
+
+import tempfile
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, UploadFile
+from sqlalchemy.orm import Session
+
+from ...dependencies import db_session
+from ...errors import BadRequestError, NotFoundError
+from ...models.program import Program
+from ...models.program_year import ProgramYear
+from ...models.timetable_entry import TimetableEntry
+from ...schemas.timetable import (
+    ProgramItem,
+    ProgramYearItem,
+    TimetableEntryItem,
+)
+from ...services import timetable_service
+
+router = APIRouter(prefix="/timetable", tags=["admin:timetable"])
+
+
+# ---------------------------------------------------------------------------
+# Reads (mirror the public endpoints, but available behind the guard too)
+# ---------------------------------------------------------------------------
+
+@router.get("/programs", response_model=list[ProgramItem])
+def list_programs(session: Session = Depends(db_session)):
+    return timetable_service.list_programs(session)
+
+
+@router.get(
+    "/programs/{program_id}/years",
+    response_model=list[ProgramYearItem],
+)
+def list_years(program_id: int, session: Session = Depends(db_session)):
+    program = session.query(Program).filter_by(id=program_id).one_or_none()
+    if program is None:
+        raise NotFoundError(f"Program {program_id} not found")
+    return timetable_service.list_years_for_program(session, program_id)
+
+
+@router.get("/schedule")
+def get_schedule(program_year_id: int, session: Session = Depends(db_session)):
+    return timetable_service.get_week(session, program_year_id)
+
+
+# ---------------------------------------------------------------------------
+# Deletes (creating and updating is done via the CSV import for now)
+# ---------------------------------------------------------------------------
+
+@router.delete("/programs/{program_id}", status_code=204)
+def delete_program(program_id: int, session: Session = Depends(db_session)):
+    """
+    Delete a program and, by cascade, its years and their entries.
+    """
+    program = session.query(Program).filter_by(id=program_id).one_or_none()
+    if program is None:
+        raise NotFoundError(f"Program {program_id} not found")
+    session.delete(program)
+    return None
+
+
+@router.delete("/program-years/{program_year_id}", status_code=204)
+def delete_program_year(program_year_id: int, session: Session = Depends(db_session)):
+    py = (
+        session.query(ProgramYear)
+        .filter_by(id=program_year_id)
+        .one_or_none()
+    )
+    if py is None:
+        raise NotFoundError(f"ProgramYear {program_year_id} not found")
+    session.delete(py)
+    return None
+
+
+@router.delete("/entries/{entry_id}", status_code=204)
+def delete_entry(entry_id: int, session: Session = Depends(db_session)):
+    entry = (
+        session.query(TimetableEntry)
+        .filter_by(id=entry_id)
+        .one_or_none()
+    )
+    if entry is None:
+        raise NotFoundError(f"Entry {entry_id} not found")
+    session.delete(entry)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# CSV import
+# ---------------------------------------------------------------------------
+
+@router.post("/import")
+async def import_csv(
+    file: UploadFile = File(...),
+    replace: bool = False,
+    session: Session = Depends(db_session),
+):
+    """
+    Import a timetable CSV. Same parser the CLI script uses, so the
+    formats are guaranteed to stay in sync.
+
+    Returns a report dict with counts of what was created/updated/
+    unchanged. Any validation error returns 400 with the details.
+    """
+    # Local import — the CLI script imports from the backend, so we
+    # avoid a circular import at module load time.
+    import sys
+    from pathlib import Path as _Path
+    _REPO_ROOT = _Path(__file__).resolve().parents[4]
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
+    from admin.scripts.import_timetable import _load_and_validate, _import
+
+    contents = await file.read()
+
+    # The parser reads from a path, so write to a temp file.
+    with tempfile.NamedTemporaryFile(
+        mode="wb", suffix=".csv", delete=False
+    ) as tmp:
+        tmp.write(contents)
+        tmp_path = Path(tmp.name)
+
+    try:
+        try:
+            rows = _load_and_validate(tmp_path)
+        except ValueError as e:
+            raise BadRequestError(str(e)) from e
+
+        report = _import(rows, replace=replace, dry_run=False)
+        return report
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\admin\users.py ---
 
@@ -12659,16 +14403,17 @@ router = APIRouter(prefix="/api/places", tags=["places"])
 def list_places(
     q: str | None = Query(None, description="Substring match on name"),
     category: str | None = Query(None),
+    intent: str | None = Query(None, description="Substring match on intents"),
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
     radius_m: float = Query(500, gt=0, le=5000),
     limit: int = Query(50, gt=0, le=200),
     session: Session = Depends(db_session),
 ):
-    """List places, optionally filtered by query, category, or
+    """List places, optionally filtered by query, category, intent, or
     proximity."""
     return place_service.search_places(
-        session, q=q, category=category, lat=lat, lon=lon,
+        session, q=q, category=category, intent=intent, lat=lat, lon=lon,
         radius_m=radius_m, limit=limit,
     )
 
@@ -12823,6 +14568,85 @@ def compute(
 
     return result
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\timetable.py ---
+
+"""
+timetable.py
+
+Public timetable endpoints:
+
+  GET /api/timetable/programs
+  GET /api/timetable/programs/{program_id}/years
+  GET /api/timetable/schedule?program_year_id=X
+  GET /api/timetable/next?program_year_id=X
+
+These are read-only and don't require a session cookie. The mobile
+app calls them directly. Writing is done through the admin endpoints
+(Phase 3) and the CLI import script (Phase 1).
+"""
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from ..dependencies import db_session
+from ..errors import NotFoundError
+from ..models.program import Program
+from ..schemas.timetable import (
+    NextClassResponse,
+    ProgramItem,
+    ProgramYearItem,
+    TimetableWeekResponse,
+)
+from ..services import timetable_service
+
+router = APIRouter(prefix="/api/timetable", tags=["timetable"])
+
+
+@router.get("/programs", response_model=list[ProgramItem])
+def list_programs(session: Session = Depends(db_session)):
+    """Every program, alphabetical. Used by the onboarding picker."""
+    return timetable_service.list_programs(session)
+
+
+@router.get(
+    "/programs/{program_id}/years",
+    response_model=list[ProgramYearItem],
+)
+def list_years(program_id: int, session: Session = Depends(db_session)):
+    """Year-levels available for one program."""
+    program = session.query(Program).filter_by(id=program_id).one_or_none()
+    if program is None:
+        raise NotFoundError(f"Program {program_id} not found")
+    return timetable_service.list_years_for_program(session, program_id)
+
+
+@router.get("/schedule")
+def get_schedule(
+    program_year_id: int,
+    raw: bool = False,
+    session: Session = Depends(db_session),
+):
+    """
+    Full week for a program-year. By default, adjacent rows that
+    represent the same continuing period are merged. Pass raw=true
+    to see the unmerged rows.
+    """
+    return timetable_service.get_week(
+        session, program_year_id, merge_adjacent=not raw
+    )
+
+
+@router.get("/next", response_model=NextClassResponse)
+def get_next(
+    program_year_id: int = Query(...),
+    session: Session = Depends(db_session),
+):
+    """
+    The next class within the next 90 minutes, if any.
+    Used by the home screen's banner.
+    """
+    return timetable_service.get_next_class(session, program_year_id)
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\wifi.py ---
 
 """
@@ -12934,6 +14758,9 @@ class UpdatePlaceRequest(BaseModel):
 
     # AI description — fed to narration. Never shown to students.
     description_ai: str | None = None
+
+    # Free-text list of intents this place serves, semicolon-separated.
+    intents: str | None = None
 
     category: str | None = Field(None, max_length=64)
     ref: str | None = Field(None, max_length=64)
@@ -13446,8 +15273,11 @@ class PlaceSummary(BaseModel):
     name: str
     name_sw: str | None = None
     category: str | None = None
+    category_icon_key: str | None = None
+    intents: str | None = None
     location: LatLon
     is_landmark: bool = False
+    primary_photo_url: str | None = None
 
 
 class PlaceDetail(BaseModel):
@@ -13467,6 +15297,7 @@ class PlaceDetail(BaseModel):
     alt_names: str | None = None
     description: str | None = None
     category: str | None = None
+    intents: str | None = None
     ref: str | None = None
     location: LatLon
     wheelchair: str | None = None
@@ -13481,6 +15312,7 @@ class PlaceListParams(BaseModel):
 
     q: str | None = None
     category: str | None = None
+    intent: str | None = None
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)
@@ -13563,6 +15395,68 @@ class RouteParams(BaseModel):
     to_lat: float | None = Field(None, ge=-90, le=90)
     to_lon: float | None = Field(None, ge=-180, le=180)
     profile: str = "fastest"
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\timetable.py ---
+
+"""
+timetable.py
+
+Request and response shapes for the timetable endpoints.
+"""
+
+from pydantic import BaseModel
+
+
+class ProgramItem(BaseModel):
+    """One program, as shown in the onboarding picker."""
+
+    id: int
+    name: str
+    department: str | None = None
+    code: str | None = None
+    level: str | None = None
+
+
+class ProgramYearItem(BaseModel):
+    """One year-level of one program."""
+
+    id: int
+    program_id: int
+    year_number: int
+    academic_year: str
+    semester: int
+    display_name: str | None = None
+
+
+class TimetableEntryItem(BaseModel):
+    """One class slot, as returned by the timetable endpoints."""
+
+    id: int
+    day_of_week: int
+    start_time: str
+    end_time: str
+    module_code: str
+    module_name: str | None = None
+    lecturer_name: str | None = None
+    venue_code: str | None = None
+    venue_name: str | None = None          # resolved from Place, if a match
+    venue_place_id: int | None = None      # for "Take me there"
+    is_cross_cutting: bool = False
+
+
+class TimetableWeekResponse(BaseModel):
+    """The full week of entries for one program-year."""
+
+    program_year_id: int
+    entries: list[TimetableEntryItem]
+
+
+class NextClassResponse(BaseModel):
+    """The next class for a program-year, if any."""
+
+    has_class: bool
+    entry: TimetableEntryItem | None = None
+    starts_in_seconds: int | None = None
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\wifi.py ---
 
@@ -15974,32 +17868,75 @@ Search and lookup against the places table. Used by /api/places and
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from ..models.media import Media
 from ..models.place import Place
 from ..schemas.place import PlaceDetail, PlaceSummary
 from ..schemas.common import LatLon
 
 
-def _to_summary(place: Place) -> PlaceSummary:
+# Maps OSM category values to icon keys the mobile app understands.
+# The mobile side has an ICONS map with matching keys. Anything not
+# listed falls back to the default "place" icon.
+_CATEGORY_ICON_KEYS = {
+    "amenity=library": "library",
+    "amenity=cafe": "food",
+    "amenity=restaurant": "food",
+    "amenity=fast_food": "food",
+    "amenity=bank": "bank",
+    "amenity=toilets": "toilet",
+    "amenity=drinking_water": "water",
+    "building=university": "lecture",
+    "office=yes": "office",
+    "tourism=hostel": "hostel",
+}
+
+
+def _icon_key_for_category(category):
+    if not category:
+        return None
+    return _CATEGORY_ICON_KEYS.get(category)
+
+
+def _primary_photo_for(session, place_id):
+    """
+    Return the URL of a place's primary photo, or None. Uses the card
+    variant, which is what the app shows in grids.
+    """
+    row = (
+        session.query(Media)
+        .filter_by(place_id=place_id)
+        .order_by(Media.is_primary.desc(), Media.sort_order.asc(), Media.id.asc())
+        .first()
+    )
+    if row is None:
+        return None
+    from . import media_service
+    return media_service.url_for(row, "card")
+
+
+def _to_summary(session, place: Place) -> PlaceSummary:
     return PlaceSummary(
         id=place.id,
         name=place.name,
         name_sw=place.name_sw,
         category=place.category,
+        category_icon_key=_icon_key_for_category(place.category),
+        intents=place.intents,
         location=LatLon(lat=place.lat, lon=place.lon),
         is_landmark=place.is_landmark,
+        primary_photo_url=_primary_photo_for(session, place.id),
     )
 
 
-def _to_detail(place: Place) -> PlaceDetail:
+def _to_detail(session, place: Place) -> PlaceDetail:
     return PlaceDetail(
         id=place.id,
         name=place.name,
         name_sw=place.name_sw,
         alt_names=place.alt_names,
-        # Public description only. The AI description
-        # (`place.description_ai`) is never returned here.
         description=place.description,
         category=place.category,
+        intents=place.intents,
         ref=place.ref,
         location=LatLon(lat=place.lat, lon=place.lon),
         wheelchair=place.wheelchair,
@@ -16014,6 +17951,7 @@ def search_places(
     session: Session,
     q: str | None = None,
     category: str | None = None,
+    intent: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
     radius_m: float = 500,
@@ -16024,6 +17962,7 @@ def search_places(
 
     - q: case-insensitive substring against name, name_sw, alt_names
     - category: exact match against the category column
+    - intent: case-insensitive substring against the intents column
     - lat/lon/radius_m: proximity filter
     """
     query = session.query(Place)
@@ -16041,10 +17980,13 @@ def search_places(
     if category:
         query = query.filter(Place.category == category)
 
-    # For proximity: do a cheap bounding-box filter in SQL, then refine
-    # in Python with haversine. This avoids a full scan on SQLite.
+    if intent:
+        needle = f"%{intent.lower()}%"
+        query = query.filter(
+            func.lower(func.coalesce(Place.intents, "")).like(needle)
+        )
+
     if lat is not None and lon is not None:
-        # 1 degree of latitude ≈ 111 km; longitude shrinks with cos(lat).
         import math
         dlat = radius_m / 111_000
         dlon = radius_m / (111_000 * max(math.cos(math.radians(lat)), 0.01))
@@ -16055,7 +17997,6 @@ def search_places(
 
     rows = query.limit(limit).all()
 
-    # If lat/lon given, refine to true haversine distance.
     if lat is not None and lon is not None:
         from backend.core.campus_graph import haversine_m
         rows = [
@@ -16063,7 +18004,7 @@ def search_places(
             if haversine_m(lat, lon, r.lat, r.lon) <= radius_m
         ]
 
-    return [_to_summary(r) for r in rows]
+    return [_to_summary(session, r) for r in rows]
 
 
 def get_place(session: Session, place_id: int) -> PlaceDetail | None:
@@ -16071,7 +18012,7 @@ def get_place(session: Session, place_id: int) -> PlaceDetail | None:
     row = session.query(Place).filter_by(id=place_id).one_or_none()
     if row is None:
         return None
-    return _to_detail(row)
+    return _to_detail(session, row)
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\reimport_service.py ---
 
@@ -16643,6 +18584,302 @@ def _upsert_durable_cache(
         existing.path_json = json.dumps(route_dict)
         existing.hit_count += 1
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\timetable_service.py ---
+
+"""
+timetable_service.py
+
+Read timetable data. All the SQL lives here; the routers are thin.
+
+Venue resolution
+----------------
+When a TimetableEntry has a `venue_code`, we look up a Place whose
+`ref` matches that code. If we find one, the response includes the
+place's name and id, which the mobile app uses for "Take me there".
+If we don't find one, the entry still returns with its venue_code,
+just no place_id — the app shows the venue as text.
+
+Adjacent-slot merging
+---------------------
+A timetable typically lists a two-hour session as three 45-minute
+rows (07:30–08:15, 08:15–09:00, 09:00–09:45). Students don't need to
+see three rows — they need to see one period from 07:30 to 09:45.
+
+We merge adjacent entries at read time when they:
+  - are on the same day,
+  - have the same module_code,
+  - have the same venue_code,
+  - have the same lecturer_name,
+  - and touch exactly: next.start_time == current.end_time.
+
+The first row's start_time and the last row's end_time are kept.
+Raw, unmerged data is still available with raw=True — the admin
+viewer uses this, and it's useful for debugging.
+"""
+
+from datetime import datetime, timedelta
+
+from sqlalchemy.orm import Session
+
+from ..models.place import Place
+from ..models.program import Program
+from ..models.program_year import ProgramYear
+from ..models.timetable_entry import TimetableEntry
+from ..schemas.timetable import (
+    NextClassResponse,
+    ProgramItem,
+    ProgramYearItem,
+    TimetableEntryItem,
+    TimetableWeekResponse,
+)
+
+
+def list_programs(session: Session) -> list[ProgramItem]:
+    """Every program, alphabetical."""
+    rows = session.query(Program).order_by(Program.name).all()
+    return [
+        ProgramItem(
+            id=p.id,
+            name=p.name,
+            department=p.department,
+            code=p.code,
+            level=p.level,
+        )
+        for p in rows
+    ]
+
+
+def list_years_for_program(session: Session, program_id: int) -> list[ProgramYearItem]:
+    """Every year-level for one program, ordered by year then semester."""
+    rows = (
+        session.query(ProgramYear)
+        .filter_by(program_id=program_id)
+        .order_by(ProgramYear.year_number, ProgramYear.semester)
+        .all()
+    )
+    return [_to_year_item(py) for py in rows]
+
+
+def _to_year_item(py: ProgramYear) -> ProgramYearItem:
+    return ProgramYearItem(
+        id=py.id,
+        program_id=py.program_id,
+        year_number=py.year_number,
+        academic_year=py.academic_year,
+        semester=py.semester,
+        display_name=py.display_name,
+    )
+
+
+def get_week(
+    session: Session,
+    program_year_id: int,
+    merge_adjacent: bool = True,
+) -> TimetableWeekResponse:
+    """
+    Every entry for one program-year, in chronological order.
+
+    By default, adjacent rows with the same module/venue/lecturer
+    that touch exactly are merged into a single period. Pass
+    merge_adjacent=False to return the raw rows.
+    """
+    entries = (
+        session.query(TimetableEntry)
+        .filter_by(program_year_id=program_year_id)
+        .order_by(
+            TimetableEntry.day_of_week,
+            TimetableEntry.start_time,
+        )
+        .all()
+    )
+
+    if merge_adjacent:
+        entries = _merge_adjacent(entries)
+
+    venue_places = _venue_places_for(session, entries)
+
+    return TimetableWeekResponse(
+        program_year_id=program_year_id,
+        entries=[_to_entry_item(e, venue_places) for e in entries],
+    )
+
+
+def _merge_adjacent(entries: list[TimetableEntry]) -> list[TimetableEntry]:
+    """
+    Merge runs of adjacent entries that represent the same continuing
+    period. See the module docstring for the rule.
+
+    Returns a new list. The merged rows are lightweight copies of the
+    original ORM objects — we mutate a shallow copy so we don't modify
+    anything in the session.
+    """
+    if not entries:
+        return []
+
+    merged = []
+    for entry in entries:
+        if not merged:
+            merged.append(_copy_entry(entry))
+            continue
+
+        prev = merged[-1]
+        if _should_merge(prev, entry):
+            # Extend the previous entry's end time.
+            prev.end_time = entry.end_time
+        else:
+            merged.append(_copy_entry(entry))
+
+    return merged
+
+
+def _copy_entry(entry: TimetableEntry) -> TimetableEntry:
+    """
+    Shallow copy of a TimetableEntry. The merged list uses copies so
+    we never mutate an object that's still attached to the session.
+    """
+    copy = TimetableEntry(
+        program_year_id=entry.program_year_id,
+        day_of_week=entry.day_of_week,
+        start_time=entry.start_time,
+        end_time=entry.end_time,
+        module_code=entry.module_code,
+        module_name=entry.module_name,
+        lecturer_name=entry.lecturer_name,
+        venue_code=entry.venue_code,
+        is_cross_cutting=entry.is_cross_cutting,
+        notes=entry.notes,
+    )
+    copy.id = entry.id
+    return copy
+
+
+def _should_merge(prev: TimetableEntry, current: TimetableEntry) -> bool:
+    """
+    Whether `current` is a direct continuation of `prev`.
+
+    All of these must be true:
+      - same day
+      - same module code
+      - same venue
+      - same lecturer
+      - prev.end_time exactly equals current.start_time
+    """
+    return (
+        prev.day_of_week == current.day_of_week
+        and prev.module_code == current.module_code
+        and (prev.venue_code or "") == (current.venue_code or "")
+        and (prev.lecturer_name or "") == (current.lecturer_name or "")
+        and prev.end_time == current.start_time
+    )
+
+
+def _venue_places_for(session: Session, entries: list[TimetableEntry]) -> dict:
+    """
+    Given a list of entries, return a dict mapping venue_code -> Place
+    for any codes that match a Place.ref. Codes with no match are
+    simply absent from the dict.
+    """
+    codes = {e.venue_code for e in entries if e.venue_code}
+    if not codes:
+        return {}
+    rows = session.query(Place).filter(Place.ref.in_(codes)).all()
+    return {p.ref: p for p in rows}
+
+
+def _to_entry_item(entry: TimetableEntry, venue_places: dict) -> TimetableEntryItem:
+    place = venue_places.get(entry.venue_code) if entry.venue_code else None
+    return TimetableEntryItem(
+        id=entry.id,
+        day_of_week=entry.day_of_week,
+        start_time=entry.start_time,
+        end_time=entry.end_time,
+        module_code=entry.module_code,
+        module_name=entry.module_name,
+        lecturer_name=entry.lecturer_name,
+        venue_code=entry.venue_code,
+        venue_name=place.name if place else None,
+        venue_place_id=place.id if place else None,
+        is_cross_cutting=entry.is_cross_cutting,
+    )
+
+
+def get_next_class(
+    session: Session,
+    program_year_id: int,
+    now: datetime | None = None,
+) -> NextClassResponse:
+    """
+    The next class for a program-year, if it starts within the next
+    90 minutes.
+
+    Returns has_class=False when nothing is coming up. Otherwise
+    includes the entry and how many seconds until it starts.
+
+    Merging runs first, so the "next class" is a merged period, not
+    a 45-minute sub-slot.
+    """
+    if now is None:
+        now = datetime.now()
+
+    today = now.weekday()
+    tomorrow = (today + 1) % 7
+
+    entries = (
+        session.query(TimetableEntry)
+        .filter_by(program_year_id=program_year_id)
+        .filter(TimetableEntry.day_of_week.in_([today, tomorrow]))
+        .all()
+    )
+
+    if not entries:
+        return NextClassResponse(has_class=False)
+
+    entries = _merge_adjacent(entries)
+    venue_places = _venue_places_for(session, entries)
+
+    best_entry = None
+    best_delta = None
+
+    for entry in entries:
+        start_dt = _entry_start_datetime(entry, now)
+        if start_dt is None:
+            continue
+        delta = (start_dt - now).total_seconds()
+        if delta < 0:
+            continue
+        if delta > 90 * 60:
+            continue
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best_entry = entry
+
+    if best_entry is None:
+        return NextClassResponse(has_class=False)
+
+    return NextClassResponse(
+        has_class=True,
+        entry=_to_entry_item(best_entry, venue_places),
+        starts_in_seconds=int(best_delta),
+    )
+
+
+def _entry_start_datetime(entry: TimetableEntry, reference: datetime) -> datetime | None:
+    """
+    Convert an entry's (day_of_week, start_time) into an absolute
+    datetime, relative to `reference`.
+    """
+    try:
+        hh, mm = entry.start_time.split(":")
+        h, m = int(hh), int(mm)
+    except (ValueError, AttributeError):
+        return None
+
+    ref_day = reference.weekday()
+    day_offset = (entry.day_of_week - ref_day) % 7
+
+    candidate = reference.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=day_offset)
+    return candidate
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\wifi_service.py ---
 
 """
@@ -16766,7 +19003,7 @@ INGEST_REPLACE = os.environ.get("INGEST_REPLACE", "false").lower() == "true"
 # Media
 # ---------------------------------------------------------------------------
 
-MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://localhost:8000")
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://192.168.100.148:8000")
 MEDIA_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 
 MEDIA_VARIANTS = [
@@ -20784,6 +23021,70 @@ def client(seeded_db, monkeypatch):
     with TestClient(app) as c:
         yield c
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\fixtures\timetable_samples.py ---
+
+"""
+timetable_samples.py
+
+Small CSV strings used by the timetable tests. Kept as strings rather
+than as committed .csv files so the tests are self-contained and it's
+obvious what data they exercise.
+
+Each sample is a complete CSV with a header row and one or more data
+rows.
+"""
+
+# A minimal, valid CSV: one program, one year, two entries on Monday.
+SIMPLE_WEEK = """program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,07:30,08:15,EP 6111,Electrical Workshop Technology I,Mwampulo A,EW,no
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,09:55,10:40,EP 6101,Basics Of Electrical Engineering,Ntahumbwa L,A-103,no
+"""
+
+# Two years of the same program. Tests that program-years are created
+# independently.
+TWO_YEARS = """program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,07:30,08:15,EP 6111,Workshop,Mwampulo A,EW,no
+Diploma in Electrical and Electronic Engineering,2,2025-2026,1,Monday,07:30,08:15,EE 6205,Fundamental Of Automations,Rukanda G,A-114,no
+"""
+
+# Two programs. Tests that programs are created independently.
+TWO_PROGRAMS = """program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,07:30,08:15,EP 6111,Workshop,Mwampulo A,EW,no
+Bachelor of Electrical and Electronic Engineering,1,2025-2026,1,Monday,07:30,08:15,EP 8101,Workshop,Mwasomi R,EW,no
+"""
+
+# Invalid: end_time is not HH:MM.
+BAD_TIME = """program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,07:30,8:15,EP 6111,Workshop,Mwampulo A,EW,no
+"""
+
+# Invalid: day is not a valid day name or number.
+BAD_DAY = """program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Blursday,07:30,08:15,EP 6111,Workshop,Mwampulo A,EW,no
+"""
+
+# Invalid: year is not an integer.
+BAD_YEAR = """program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,first,2025-2026,1,Monday,07:30,08:15,EP 6111,Workshop,Mwampulo A,EW,no
+"""
+
+# Invalid: program column is blank.
+BLANK_PROGRAM = """program,year,academic_year,semester,day,start_time,end_time,module_code,module_name,lecturer,venue,cross_cutting
+,1,2025-2026,1,Monday,07:30,08:15,EP 6111,Workshop,Mwampulo A,EW,no
+"""
+
+# Invalid: missing required column.
+MISSING_COLUMN = """program,year,academic_year,semester,day,start_time,module_code,module_name,lecturer,venue,cross_cutting
+Diploma in Electrical and Electronic Engineering,1,2025-2026,1,Monday,07:30,EP 6111,Workshop,Mwampulo A,EW,no
+"""
+
+
+def write_csv(content: str, tmp_path, name="timetable.csv"):
+    """Write one of the samples to a file and return its path."""
+    path = tmp_path / name
+    path.write_text(content, encoding="utf-8")
+    return path
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\perf\benchmark_api.py ---
 
 """
@@ -22172,6 +24473,156 @@ class TestRouteErrors:
         r = client.get(f"/api/route?from_place_id={a['id']}&to_place_id=99999999")
         assert r.status_code == 404
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_api_timetable.py ---
+
+"""
+Tests for the timetable API endpoints (public and admin).
+"""
+
+from backend.tests.fixtures.timetable_samples import SIMPLE_WEEK, write_csv
+
+
+def _seed_timetable(tmp_path):
+    """Load the simple week into the (already-created) test DB."""
+    from admin.scripts.import_timetable import _import, _load_and_validate
+
+    path = write_csv(SIMPLE_WEEK, tmp_path)
+    rows = _load_and_validate(path)
+    return _import(rows, replace=False, dry_run=False)
+
+
+class TestPublicPrograms:
+    def test_empty_programs_list(self, client, temp_db):
+        r = client.get("/api/timetable/programs")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_programs_after_import(self, client, temp_db, tmp_path):
+        _seed_timetable(tmp_path)
+
+        r = client.get("/api/timetable/programs")
+        assert r.status_code == 200
+        programs = r.json()
+        assert len(programs) == 1
+        assert programs[0]["name"] == (
+            "Diploma in Electrical and Electronic Engineering"
+        )
+
+
+class TestPublicYears:
+    def test_years_for_imported_program(self, client, temp_db, tmp_path):
+        _seed_timetable(tmp_path)
+        program_id = client.get("/api/timetable/programs").json()[0]["id"]
+
+        r = client.get(f"/api/timetable/programs/{program_id}/years")
+        assert r.status_code == 200
+        years = r.json()
+        assert len(years) == 1
+        assert years[0]["year_number"] == 1
+
+    def test_years_for_missing_program_returns_404(self, client, temp_db):
+        r = client.get("/api/timetable/programs/99999999/years")
+        assert r.status_code == 404
+
+
+class TestPublicSchedule:
+    def test_empty_schedule(self, client, temp_db):
+        r = client.get("/api/timetable/schedule?program_year_id=99999999")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["entries"] == []
+
+    def test_schedule_after_import(self, client, temp_db, tmp_path):
+        _seed_timetable(tmp_path)
+
+        program_id = client.get("/api/timetable/programs").json()[0]["id"]
+        py_id = client.get(
+            f"/api/timetable/programs/{program_id}/years"
+        ).json()[0]["id"]
+
+        r = client.get(f"/api/timetable/schedule?program_year_id={py_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["program_year_id"] == py_id
+        assert len(body["entries"]) == 2
+        # Entries come back in day/time order.
+        assert body["entries"][0]["start_time"] == "07:30"
+        assert body["entries"][1]["start_time"] == "09:55"
+
+
+class TestPublicNext:
+    def test_no_class_when_empty(self, client, temp_db):
+        r = client.get("/api/timetable/next?program_year_id=99999999")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_class"] is False
+
+
+class TestAdminTimetable:
+    def test_admin_can_list_programs(self, client, temp_db, tmp_path):
+        _seed_timetable(tmp_path)
+        r = client.get(
+            "/api/admin/timetable/programs",
+            headers={"X-Admin-Key": "test-admin-key"},
+        )
+        assert r.status_code == 200
+        assert len(r.json()) == 1
+
+    def test_admin_guard_applies(self, client, temp_db):
+        r = client.get("/api/admin/timetable/programs")
+        assert r.status_code == 401
+
+    def test_admin_can_delete_program(self, client, temp_db, tmp_path):
+        _seed_timetable(tmp_path)
+        program_id = client.get(
+            "/api/admin/timetable/programs",
+            headers={"X-Admin-Key": "test-admin-key"},
+        ).json()[0]["id"]
+
+        r = client.delete(
+            f"/api/admin/timetable/programs/{program_id}",
+            headers={"X-Admin-Key": "test-admin-key"},
+        )
+        assert r.status_code == 204
+
+        # Program is gone, and the public endpoint reflects that.
+        r = client.get("/api/timetable/programs")
+        assert r.json() == []
+
+
+class TestIntentFilter:
+    def test_intent_filter_matches(self, client, temp_db, tmp_path):
+        """
+        Setting intents on a place and filtering by one of them
+        returns the place. Uses the admin place update endpoint to
+        set intents first.
+        """
+        # Grab any place.
+        places = client.get("/api/places?limit=1").json()
+        if not places:
+            return
+        place_id = places[0]["id"]
+
+        # Set intents on it.
+        r = client.patch(
+            f"/api/admin/places/{place_id}",
+            json={"intents": "eat; study"},
+            headers={"X-Admin-Key": "test-admin-key"},
+        )
+        assert r.status_code == 200
+        assert r.json()["intents"] == "eat; study"
+
+        # Filter by intent.
+        r = client.get("/api/places?intent=eat")
+        assert r.status_code == 200
+        results = r.json()
+        assert any(p["id"] == place_id for p in results)
+
+        # Filter by a different intent that shouldn't match.
+        r = client.get("/api/places?intent=printing")
+        assert r.status_code == 200
+        assert all(p["id"] != place_id for p in r.json())
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_api_wifi.py ---
 
 """
@@ -22627,6 +25078,206 @@ class TestDurableRouteCache:
                     )
                     assert r2.status_code == 200
                     return
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_import_timetable.py ---
+
+"""
+Tests for the timetable CSV import.
+
+Two halves:
+  - validation: bad CSVs are caught before anything is written
+  - import: good CSVs create programs / years / entries, and
+    re-imports update rather than duplicate
+"""
+
+import pytest
+
+from backend.tests.fixtures.timetable_samples import (
+    BAD_DAY,
+    BAD_TIME,
+    BAD_YEAR,
+    BLANK_PROGRAM,
+    MISSING_COLUMN,
+    SIMPLE_WEEK,
+    TWO_PROGRAMS,
+    TWO_YEARS,
+    write_csv,
+)
+
+
+# ---------------------------------------------------------------------------
+# Validation — the parser itself
+# ---------------------------------------------------------------------------
+
+class TestValidation:
+    def test_simple_week_parses(self, tmp_path):
+        from admin.scripts.import_timetable import _load_and_validate
+
+        path = write_csv(SIMPLE_WEEK, tmp_path)
+        rows = _load_and_validate(path)
+        assert len(rows) == 2
+        assert rows[0]["day_of_week"] == 0            # Monday
+        assert rows[0]["start_time"] == "07:30"
+        assert rows[0]["module_code"] == "EP 6111"
+
+    def test_bad_time_rejected(self, tmp_path):
+        from admin.scripts.import_timetable import _load_and_validate
+
+        path = write_csv(BAD_TIME, tmp_path)
+        with pytest.raises(ValueError) as exc:
+            _load_and_validate(path)
+        assert "start_time" in str(exc.value) or "end_time" in str(exc.value)
+
+    def test_bad_day_rejected(self, tmp_path):
+        from admin.scripts.import_timetable import _load_and_validate
+
+        path = write_csv(BAD_DAY, tmp_path)
+        with pytest.raises(ValueError) as exc:
+            _load_and_validate(path)
+        assert "Blursday" in str(exc.value)
+
+    def test_bad_year_rejected(self, tmp_path):
+        from admin.scripts.import_timetable import _load_and_validate
+
+        path = write_csv(BAD_YEAR, tmp_path)
+        with pytest.raises(ValueError) as exc:
+            _load_and_validate(path)
+        assert "integer" in str(exc.value).lower()
+
+    def test_blank_program_rejected(self, tmp_path):
+        from admin.scripts.import_timetable import _load_and_validate
+
+        path = write_csv(BLANK_PROGRAM, tmp_path)
+        with pytest.raises(ValueError) as exc:
+            _load_and_validate(path)
+        assert "program" in str(exc.value).lower()
+
+    def test_missing_column_rejected(self, tmp_path):
+        from admin.scripts.import_timetable import _load_and_validate
+
+        path = write_csv(MISSING_COLUMN, tmp_path)
+        with pytest.raises(ValueError) as exc:
+            _load_and_validate(path)
+        assert "end_time" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Import — writing to the database
+# ---------------------------------------------------------------------------
+
+class TestImport:
+    def test_creates_program_year_and_entries(self, temp_db, tmp_path):
+        from admin.scripts.import_timetable import _import, _load_and_validate
+        from backend.api.db.session import session_scope
+        from backend.api.models.program import Program
+        from backend.api.models.program_year import ProgramYear
+        from backend.api.models.timetable_entry import TimetableEntry
+
+        path = write_csv(SIMPLE_WEEK, tmp_path)
+        rows = _load_and_validate(path)
+        report = _import(rows, replace=False, dry_run=False)
+
+        assert report["programs_created"] == 1
+        assert report["program_years_created"] == 1
+        assert report["entries_created"] == 2
+
+        with session_scope() as session:
+            assert session.query(Program).count() == 1
+            assert session.query(ProgramYear).count() == 1
+            assert session.query(TimetableEntry).count() == 2
+
+    def test_two_years_creates_two_program_years(self, temp_db, tmp_path):
+        from admin.scripts.import_timetable import _import, _load_and_validate
+        from backend.api.db.session import session_scope
+        from backend.api.models.program_year import ProgramYear
+
+        path = write_csv(TWO_YEARS, tmp_path)
+        rows = _load_and_validate(path)
+        report = _import(rows, replace=False, dry_run=False)
+
+        assert report["programs_created"] == 1
+        assert report["program_years_created"] == 2
+
+        with session_scope() as session:
+            assert session.query(ProgramYear).count() == 2
+
+    def test_two_programs_creates_two_programs(self, temp_db, tmp_path):
+        from admin.scripts.import_timetable import _import, _load_and_validate
+        from backend.api.db.session import session_scope
+        from backend.api.models.program import Program
+
+        path = write_csv(TWO_PROGRAMS, tmp_path)
+        rows = _load_and_validate(path)
+        report = _import(rows, replace=False, dry_run=False)
+
+        assert report["programs_created"] == 2
+
+        with session_scope() as session:
+            assert session.query(Program).count() == 2
+
+    def test_dry_run_writes_nothing(self, temp_db, tmp_path):
+        from admin.scripts.import_timetable import _import, _load_and_validate
+        from backend.api.db.session import session_scope
+        from backend.api.models.program import Program
+        from backend.api.models.timetable_entry import TimetableEntry
+
+        path = write_csv(SIMPLE_WEEK, tmp_path)
+        rows = _load_and_validate(path)
+        report = _import(rows, replace=False, dry_run=True)
+
+        # The report still says what *would* have happened.
+        assert report["programs_created"] == 1
+        assert report["entries_created"] == 2
+
+        # But nothing is in the DB.
+        with session_scope() as session:
+            assert session.query(Program).count() == 0
+            assert session.query(TimetableEntry).count() == 0
+
+    def test_reimport_updates_not_duplicates(self, temp_db, tmp_path):
+        """Re-importing the same CSV should leave the counts unchanged."""
+        from admin.scripts.import_timetable import _import, _load_and_validate
+        from backend.api.db.session import session_scope
+        from backend.api.models.program import Program
+        from backend.api.models.program_year import ProgramYear
+        from backend.api.models.timetable_entry import TimetableEntry
+
+        path = write_csv(SIMPLE_WEEK, tmp_path)
+        rows = _load_and_validate(path)
+        _import(rows, replace=False, dry_run=False)
+
+        # Second run.
+        rows = _load_and_validate(path)
+        report = _import(rows, replace=False, dry_run=False)
+
+        assert report["programs_created"] == 0
+        assert report["program_years_created"] == 0
+        assert report["entries_created"] == 0
+        assert report["entries_unchanged"] == 2
+
+        with session_scope() as session:
+            assert session.query(Program).count() == 1
+            assert session.query(ProgramYear).count() == 1
+            assert session.query(TimetableEntry).count() == 2
+
+    def test_replace_mode_wipes_and_reinserts(self, temp_db, tmp_path):
+        from admin.scripts.import_timetable import _import, _load_and_validate
+        from backend.api.db.session import session_scope
+        from backend.api.models.timetable_entry import TimetableEntry
+
+        path = write_csv(SIMPLE_WEEK, tmp_path)
+        rows = _load_and_validate(path)
+        _import(rows, replace=False, dry_run=False)
+
+        # Second import with --replace.
+        rows = _load_and_validate(path)
+        report = _import(rows, replace=True, dry_run=False)
+
+        assert report["program_years_wiped"] == 1
+        assert report["entries_created"] == 2
+
+        with session_scope() as session:
+            assert session.query(TimetableEntry).count() == 2
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_ingest.py ---
 
@@ -23885,34 +26536,57 @@ const styles = StyleSheet.create({
 
 // Explore screen.
 //
-// Browse the whole campus by category. Tap any place to see its
-// photos and description. Unlike the rest of the app, this screen
-// doesn't require a route — it's for browsing.
+// A visual browse of the whole campus. Featured places up top,
+// category and intent chips below, then a photo grid.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
-  ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { router, Stack } from 'expo-router';
 
-import { PlaceCard } from '@/components/PlaceCard';
+import { CategoryChips } from '@/components/CategoryChips';
+import { IntentChips } from '@/components/IntentChips';
+import { FeaturedStrip } from '@/components/FeaturedStrip';
+import { ExploreGridCard } from '@/components/ExploreGridCard';
 import { listPlaces } from '@/services/api';
-import { CATEGORIES } from '@/constants/categories';
 import { t } from '@/i18n';
-import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+
+// How many featured places to show. The most prominent ones.
+const FEATURED_LIMIT = 5;
 
 export default function ExploreScreen() {
   const [category, setCategory] = useState(null);
+  const [intent, setIntent] = useState(null);
+
+  const [featured, setFeatured] = useState([]);
   const [places, setPlaces] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // Load featured places once. These don't change with the filters.
+  useEffect(() => {
+    let cancelled = false;
+    listPlaces({ limit: 200 })
+      .then((data) => {
+        if (cancelled) return;
+        const landmarks = data.filter((p) => p.is_landmark);
+        setFeatured(landmarks.slice(0, FEATURED_LIMIT));
+      })
+      .catch(() => {
+        if (!cancelled) setFeatured([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load the grid whenever a filter changes.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -23920,6 +26594,7 @@ export default function ExploreScreen() {
 
     listPlaces({
       category: category || undefined,
+      intent: intent || undefined,
       limit: 200,
     })
       .then((data) => {
@@ -23935,73 +26610,82 @@ export default function ExploreScreen() {
     return () => {
       cancelled = true;
     };
-  }, [category]);
+  }, [category, intent]);
 
   const openPlace = useCallback((place) => {
     router.push(`/place/${place.id}`);
   }, []);
 
+  // When the admin picks a category, clear the intent. Only one
+  // filter can be active at a time — the alternative is confusing.
+  const chooseCategory = useCallback((next) => {
+    setCategory(next);
+    if (next) setIntent(null);
+  }, []);
+
+  const chooseIntent = useCallback((next) => {
+    setIntent(next);
+    if (next) setCategory(null);
+  }, []);
+
+  // Convert the flat list of places into rows of 2 for the grid.
+  const gridRows = useMemo(() => {
+    const rows = [];
+    for (let i = 0; i < places.length; i += 2) {
+      rows.push(places.slice(i, i + 2));
+    }
+    return rows;
+  }, [places]);
+
+  const hasActiveFilter = category !== null || intent !== null;
+
   return (
     <>
       <Stack.Screen options={{ title: t('explore.title') }} />
       <View style={styles.container}>
-        {/* Category selector */}
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.chipRow}
-          style={styles.chipScroll}
-        >
-          {CATEGORIES.map((cat) => {
-            const isActive = category === cat.key;
-            return (
-              <TouchableOpacity
-                key={cat.key ?? 'all'}
-                style={[styles.chip, isActive && styles.chipActive]}
-                onPress={() => setCategory(cat.key)}
-                accessibilityRole="button"
-                accessibilityState={{ selected: isActive }}
-                accessibilityLabel={t(cat.labelKey)}
-              >
-                <Text
-                  style={[styles.chipText, isActive && styles.chipTextActive]}
-                  numberOfLines={1}
-                >
-                  {t(cat.labelKey)}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
+        {/* Featured strip. Hidden when a filter is active, so the
+            whole screen focuses on the results. */}
+        {!hasActiveFilter ? (
+          <FeaturedStrip places={featured} onPress={openPlace} />
+        ) : null}
 
-        {loading ? (
-          <View style={styles.state}>
-            <ActivityIndicator color={COLORS.textMuted} />
-          </View>
-        ) : error ? (
+        <View style={styles.chipsWrapper}>
+          <CategoryChips selected={category} onSelect={chooseCategory} />
+          <IntentChips selected={intent} onSelect={chooseIntent} />
+        </View>
+
+        {error ? (
           <View style={styles.state}>
             <Text style={styles.errorText}>{error}</Text>
+          </View>
+        ) : loading && places.length === 0 ? (
+          <View style={styles.state}>
+            <ActivityIndicator color={COLORS.textMuted} />
           </View>
         ) : places.length === 0 ? (
           <View style={styles.state}>
             <Text style={styles.emptyText}>{t('common.noResults')}</Text>
           </View>
         ) : (
-          <>
-            <View style={styles.header}>
-              <Text style={styles.headerText}>
-                {t('explore.allPlacesCount', { count: places.length })}
-              </Text>
-            </View>
-            <FlatList
-              data={places}
-              keyExtractor={(item) => String(item.id)}
-              renderItem={({ item }) => (
-                <PlaceCard place={item} onPress={() => openPlace(item)} />
-              )}
-              contentContainerStyle={styles.listContent}
-            />
-          </>
+          <FlatList
+            data={gridRows}
+            keyExtractor={(row, i) => `row-${i}`}
+            renderItem={({ item: row }) => (
+              <View style={styles.gridRow}>
+                {row.map((place) => (
+                  <ExploreGridCard
+                    key={place.id}
+                    place={place}
+                    onPress={() => openPlace(place)}
+                  />
+                ))}
+                {/* If the row has only one place, fill the other slot
+                    so the layout stays even. */}
+                {row.length === 1 ? <View style={styles.gridFiller} /> : null}
+              </View>
+            )}
+            contentContainerStyle={styles.listContent}
+          />
         )}
       </View>
     </>
@@ -24010,51 +26694,20 @@ export default function ExploreScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
-  chipScroll: {
+  chipsWrapper: {
     backgroundColor: COLORS.background,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.borderSubtle,
-    maxHeight: TOUCH.minHeight + 24,
-    flexGrow: 0,
-  },
-  chipRow: {
-    paddingHorizontal: SPACING.md,
-    paddingVertical: SPACING.sm,
-    gap: SPACING.sm,
-    alignItems: 'center',
-  },
-  chip: {
-    backgroundColor: COLORS.backgroundSubtle,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: RADIUS.pill,
-    paddingHorizontal: 14,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chipActive: {
-    backgroundColor: COLORS.primaryDark,
-    borderColor: COLORS.primaryDark,
-  },
-  chipText: {
-    fontSize: FONT_SIZE.small + 1,
-    color: COLORS.text,
-    fontWeight: '500',
-  },
-  chipTextActive: { color: '#ffffff' },
-  header: {
-    paddingHorizontal: SPACING.md,
-    paddingTop: SPACING.md,
     paddingBottom: SPACING.sm,
   },
-  headerText: {
-    fontSize: FONT_SIZE.small,
-    color: COLORS.textMuted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    fontWeight: '600',
+  gridRow: {
+    flexDirection: 'row',
+    gap: SPACING.sm,
+    paddingHorizontal: SPACING.md,
+    marginBottom: SPACING.sm,
   },
+  gridFiller: { flex: 1 },
+  listContent: { paddingTop: SPACING.md, paddingBottom: SPACING.xl },
   state: {
     flex: 1,
     alignItems: 'center',
@@ -24071,29 +26724,31 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.body,
     textAlign: 'center',
   },
-  listContent: { paddingBottom: SPACING.xl },
 });
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\index.jsx ---
 
 // Home screen.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
   ScrollView,
   StyleSheet,
   Text,
+  TouchableOpacity,
   View,
 } from 'react-native';
-import { router } from 'expo-router';
+import { Link, router, Stack } from 'expo-router';
+import { MaterialIcons } from '@expo/vector-icons';
 
 import { SearchBar } from '@/components/SearchBar';
 import { PlaceCard } from '@/components/PlaceCard';
 import { CategoryChips } from '@/components/CategoryChips';
 import { FeatureCard } from '@/components/FeatureCard';
 import { RecentStrip } from '@/components/RecentStrip';
+import { NextClassBanner } from '@/components/NextClassBanner';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
@@ -24104,10 +26759,18 @@ import {
   listRecents,
   listFavorites,
 } from '@/services/api';
+import { getWeek } from '@/services/timetable';
 import { t } from '@/i18n';
 import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
-import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
+
+// How close a class has to be to appear on the banner. 30 minutes.
+const BANNER_WINDOW_S = 30 * 60;
+
+// How often to re-check the schedule while Home is foregrounded.
+// Every 60 seconds. The check itself is local — no network.
+const BANNER_TICK_MS = 60 * 1000;
 
 export default function HomeScreen() {
   const { settings, loaded } = useSettings();
@@ -24119,6 +26782,11 @@ export default function HomeScreen() {
   const [favorites, setFavorites] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+
+  // Timetable-related state.
+  const [weekEntries, setWeekEntries] = useState([]);
+  const [nextClass, setNextClass] = useState(null);
+  const [, setTick] = useState(0); // forces recompute of nextClass every minute
 
   const navigatingRef = useRef(false);
 
@@ -24150,6 +26818,77 @@ export default function HomeScreen() {
       cancelled = true;
     };
   }, []);
+
+  // Load the timetable week when the selection changes.
+  useEffect(() => {
+    const programYearId = settings.programYearId;
+    if (!programYearId) {
+      setWeekEntries([]);
+      setNextClass(null);
+      return;
+    }
+    let cancelled = false;
+    getWeek(programYearId)
+      .then((data) => {
+        if (!cancelled) setWeekEntries(data.entries || []);
+      })
+      .catch(() => {
+        if (!cancelled) setWeekEntries([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.programYearId]);
+
+  // Compute the next class. Recomputes when the week changes, and
+  // every 60 seconds otherwise (so the countdown stays fresh).
+  useEffect(() => {
+    function computeNext() {
+      if (!weekEntries.length) {
+        setNextClass(null);
+        return;
+      }
+      const now = new Date();
+      const todayDow = (now.getDay() + 6) % 7; // 0 = Monday
+
+      let bestEntry = null;
+      let bestDelta = null;
+
+      for (const entry of weekEntries) {
+        // Days forward from today to this entry's day.
+        const daysAhead = (entry.day_of_week - todayDow + 7) % 7;
+
+        const [hh, mm] = entry.start_time.split(':').map(Number);
+        const start = new Date(now);
+        start.setDate(start.getDate() + daysAhead);
+        start.setHours(hh, mm, 0, 0);
+
+        const deltaSec = (start - now) / 1000;
+
+        // Skip already-started classes and classes beyond the window.
+        if (deltaSec < 0) continue;
+        if (deltaSec > BANNER_WINDOW_S) continue;
+
+        if (bestDelta === null || deltaSec < bestDelta) {
+          bestDelta = deltaSec;
+          bestEntry = entry;
+        }
+      }
+
+      if (bestEntry) {
+        setNextClass({ entry: bestEntry, startsInSeconds: bestDelta });
+      } else {
+        setNextClass(null);
+      }
+    }
+
+    computeNext();
+    const id = setInterval(() => {
+      computeNext();
+      setTick((n) => n + 1);
+    }, BANNER_TICK_MS);
+    return () => clearInterval(id);
+  }, [weekEntries]);
 
   // Search when query or category changes.
   useEffect(() => {
@@ -24183,7 +26922,6 @@ export default function HomeScreen() {
   }, []);
 
   const openChat = useCallback(() => {
-    // No route context — this is the document chat.
     router.push('/chat');
   }, []);
 
@@ -24191,12 +26929,57 @@ export default function HomeScreen() {
     router.push('/explore');
   }, []);
 
+  const openTimetable = useCallback(() => {
+    router.push('/timetable');
+  }, []);
+
+  // When the banner's "Take me there" is tapped, start a route to
+  // the venue. Same flow as the place detail screen.
+  const navigateToNextClass = useCallback(
+    async (entry) => {
+      if (entry.venue_place_id == null) return;
+      if (navigatingRef.current) return;
+      navigatingRef.current = true;
+
+      try {
+        const start = await resolveStart({
+          destinationPlaceId: entry.venue_place_id,
+        });
+        if (!start) {
+          navigatingRef.current = false;
+          return;
+        }
+
+        if (start.lat != null && start.lon != null) {
+          setRouteRequest({
+            fromLat: start.lat,
+            fromLon: start.lon,
+            fromAccuracyM: start.accuracyM,
+            toId: entry.venue_place_id,
+          });
+        } else if (start.placeId != null) {
+          setRouteRequest({
+            fromId: start.placeId,
+            toId: entry.venue_place_id,
+          });
+        } else {
+          navigatingRef.current = false;
+          return;
+        }
+
+        router.push('/route-preview');
+      } catch {
+        navigatingRef.current = false;
+      }
+    },
+    [resolveStart]
+  );
+
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
     if (text.split(/\s+/).length < 3) return;
 
-    // Guard against double-fire.
     if (navigatingRef.current) return;
     navigatingRef.current = true;
 
@@ -24222,24 +27005,11 @@ export default function HomeScreen() {
           fromLon: start.lon,
           toId: extracted.place_id,
         });
-        console.log(
-          'index: navigate from GPS',
-          start.lat,
-          start.lon,
-          '→',
-          extracted.place_id
-        );
       } else if (start.placeId != null) {
         setRouteRequest({
           fromId: start.placeId,
           toId: extracted.place_id,
         });
-        console.log(
-          'index: navigate from place',
-          start.placeId,
-          '→',
-          extracted.place_id
-        );
       } else {
         navigatingRef.current = false;
         return;
@@ -24253,84 +27023,129 @@ export default function HomeScreen() {
 
   const showSearchResults = isSearching;
 
-  return (
-    <View style={styles.container}>
-      <SearchBar
-        value={query}
-        onChangeText={setQuery}
-        onSubmit={tryResolveSentence}
-        placeholder={t('home.searchPlaceholder')}
-        loading={loading && !error && isSearching}
-      />
-
-      {showSearchResults ? (
-        // Search results replace the Home content.
-        <>
-          <CategoryChips selected={category} onSelect={setCategory} />
-          {error ? (
-            <View style={styles.state}>
-              <Text style={styles.errorText}>{error}</Text>
-            </View>
-          ) : results.length === 0 && !loading ? (
-            <View style={styles.state}>
-              <Text style={styles.emptyText}>{t('common.noResults')}</Text>
-            </View>
-          ) : (
-            <FlatList
-              data={results}
-              keyExtractor={(item) => String(item.id)}
-              renderItem={({ item }) => (
-                <PlaceCard place={item} onPress={() => openPlace(item)} />
-              )}
-              keyboardShouldPersistTaps="handled"
-              contentContainerStyle={styles.listContent}
-            />
-          )}
-          {loading && results.length === 0 ? (
-            <View style={styles.state}>
-              <ActivityIndicator color={COLORS.textMuted} />
-            </View>
-          ) : null}
-        </>
-      ) : (
-        // Default Home content.
-        <ScrollView
-          style={styles.scroll}
-          contentContainerStyle={styles.scrollContent}
+  // The header-right area. Two icons side by side: timetable and
+  // settings. Order: timetable first (more frequently used), then
+  // settings.
+  const headerRight = useCallback(
+    () => (
+      <View style={styles.headerButtons}>
+        <TouchableOpacity
+          onPress={openTimetable}
+          style={styles.headerButton}
+          accessibilityRole="button"
+          accessibilityLabel={t('timetable.title')}
         >
-          {/* Two feature cards */}
-          <View style={styles.featureRow}>
-            <FeatureCard
-              icon={ICONS.compass}
-              iconColor="#0d9488"
-              title={t('home.exploreTitle')}
-              description={t('home.exploreDescription')}
-              onPress={openExplore}
-            />
-            <FeatureCard
-              icon={ICONS.chat}
-              iconColor="#6366f1"
-              title={t('home.chatTitle')}
-              description={t('home.chatDescription')}
-              onPress={openChat}
-            />
-          </View>
-
-          {/* Recent and favorite places */}
-          <RecentStrip
-            recents={recents}
-            favorites={favorites}
-            onPress={openPlace}
+          <MaterialIcons
+            name="calendar-today"
+            size={22}
+            color={COLORS.text}
           />
+        </TouchableOpacity>
+        <Link href="/settings" asChild>
+          <TouchableOpacity
+            style={styles.headerButton}
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+          >
+            <MaterialIcons
+              name={ICONS.settings}
+              size={22}
+              color={COLORS.text}
+            />
+          </TouchableOpacity>
+        </Link>
+      </View>
+    ),
+    [openTimetable]
+  );
 
-          {/* Category chips */}
-          <View style={styles.chipsWrapper}>
-            <Text style={styles.sectionTitle}>{t('home.categoriesTitle')}</Text>
-            <CategoryChips selected={null} onSelect={setCategory} />
-          </View>
-        </ScrollView>
-      )}
-    </View>
+  return (
+    <>
+      <Stack.Screen options={{ headerRight }} />
+      <View style={styles.container}>
+        <SearchBar
+          value={query}
+          onChangeText={setQuery}
+          onSubmit={tryResolveSentence}
+          placeholder={t('home.searchPlaceholder')}
+          loading={loading && !error && isSearching}
+        />
+
+        {/* The next-class banner. Only shows when there's a class
+            within 90 minutes. */}
+        {nextClass ? (
+          <NextClassBanner
+            entry={nextClass.entry}
+            startsInSeconds={nextClass.startsInSeconds}
+            onNavigate={navigateToNextClass}
+            onViewTimetable={openTimetable}
+          />
+        ) : null}
+
+        {showSearchResults ? (
+          <>
+            <CategoryChips selected={category} onSelect={setCategory} />
+            {error ? (
+              <View style={styles.state}>
+                <Text style={styles.errorText}>{error}</Text>
+              </View>
+            ) : results.length === 0 && !loading ? (
+              <View style={styles.state}>
+                <Text style={styles.emptyText}>{t('common.noResults')}</Text>
+              </View>
+            ) : (
+              <FlatList
+                data={results}
+                keyExtractor={(item) => String(item.id)}
+                renderItem={({ item }) => (
+                  <PlaceCard place={item} onPress={() => openPlace(item)} />
+                )}
+                keyboardShouldPersistTaps="handled"
+                contentContainerStyle={styles.listContent}
+              />
+            )}
+            {loading && results.length === 0 ? (
+              <View style={styles.state}>
+                <ActivityIndicator color={COLORS.textMuted} />
+              </View>
+            ) : null}
+          </>
+        ) : (
+          <ScrollView
+            style={styles.scroll}
+            contentContainerStyle={styles.scrollContent}
+          >
+            <View style={styles.featureRow}>
+              <FeatureCard
+                icon={ICONS.compass}
+                iconColor="#0d9488"
+                title={t('home.exploreTitle')}
+                description={t('home.exploreDescription')}
+                onPress={openExplore}
+              />
+              <FeatureCard
+                icon={ICONS.chat}
+                iconColor="#6366f1"
+                title={t('home.chatTitle')}
+                description={t('home.chatDescription')}
+                onPress={openChat}
+              />
+            </View>
+
+            <RecentStrip
+              recents={recents}
+              favorites={favorites}
+              onPress={openPlace}
+            />
+
+            <View style={styles.chipsWrapper}>
+              <Text style={styles.sectionTitle}>{t('home.categoriesTitle')}</Text>
+              <CategoryChips selected={null} onSelect={setCategory} />
+            </View>
+          </ScrollView>
+        )}
+      </View>
+    </>
   );
 }
 
@@ -24363,6 +27178,17 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.md,
     marginBottom: SPACING.sm,
   },
+  headerButtons: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  headerButton: {
+    paddingHorizontal: 10,
+    minWidth: TOUCH.minWidth,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   state: {
     paddingVertical: 40,
     paddingHorizontal: 16,
@@ -24385,9 +27211,10 @@ const styles = StyleSheet.create({
 
 // Onboarding. Shown once, on first launch.
 //
-// Three slides. Swipe or tap Next. Skip is always available.
-// Completing or skipping sets hasSeenOnboarding and replaces the
-// navigation stack with Home.
+// Four slides now: welcome, search, walk, and program/year selection.
+// Swipe or tap Next. Skip is always available on the first three
+// slides. On the last slide, the student either picks or taps
+// "Get started" without picking — both work.
 
 import { useRef, useState } from 'react';
 import {
@@ -24402,6 +27229,7 @@ import { MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { ProgramYearPicker } from '@/components/ProgramYearPicker';
 import { useSettings } from '@/context/SettingsContext';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
@@ -24428,16 +27256,30 @@ const SLIDES = [
     titleKey: 'onboarding.walkTitle',
     bodyKey: 'onboarding.walkBody',
   },
+  {
+    key: 'timetable',
+    icon: 'schedule',
+    titleKey: 'onboarding.timetableTitle',
+    bodyKey: 'onboarding.timetableBody',
+    isPicker: true,
+  },
 ];
 
 export default function OnboardingScreen() {
-  const { updateSetting, settings } = useSettings();
+  const { updateSetting } = useSettings();
   const insets = useSafeAreaInsets();
   const listRef = useRef(null);
   const [index, setIndex] = useState(0);
+  // Set when the student picks a program/year on the last slide.
+  const [pickedProgramYearId, setPickedProgramYearId] = useState(null);
 
   function finish() {
     updateSetting('hasSeenOnboarding', true);
+    // Only save the selection if they actually picked one. Skipping
+    // leaves the setting untouched (null by default).
+    if (pickedProgramYearId != null) {
+      updateSetting('programYearId', pickedProgramYearId);
+    }
     router.replace('/');
   }
 
@@ -24457,19 +27299,24 @@ export default function OnboardingScreen() {
   }
 
   const isLast = index === SLIDES.length - 1;
+  const isPickerSlide = SLIDES[index]?.isPicker === true;
 
   return (
     <View style={styles.container}>
-      <View style={[styles.skipRow, { top: insets.top + SPACING.sm }]}>
-        <TouchableOpacity
-          onPress={finish}
-          style={styles.skipButton}
-          accessibilityRole="button"
-          accessibilityLabel={t('onboarding.skip')}
-        >
-          <Text style={styles.skipText}>{t('onboarding.skip')}</Text>
-        </TouchableOpacity>
-      </View>
+      {/* Skip is hidden on the picker slide — the student can tap
+          "Get started" without picking instead. */}
+      {!isPickerSlide ? (
+        <View style={[styles.skipRow, { top: insets.top + SPACING.sm }]}>
+          <TouchableOpacity
+            onPress={finish}
+            style={styles.skipButton}
+            accessibilityRole="button"
+            accessibilityLabel={t('onboarding.skip')}
+          >
+            <Text style={styles.skipText}>{t('onboarding.skip')}</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       <FlatList
         ref={listRef}
@@ -24486,15 +27333,36 @@ export default function OnboardingScreen() {
         })}
         renderItem={({ item }) => (
           <View style={[styles.slide, { width: SCREEN_WIDTH }]}>
-            <View style={styles.iconCircle}>
-              <MaterialIcons
-                name={ICONS[item.icon] || ICONS.place}
-                size={56}
-                color={COLORS.primaryDark}
-              />
-            </View>
-            <Text style={styles.slideTitle}>{t(item.titleKey)}</Text>
-            <Text style={styles.slideBody}>{t(item.bodyKey)}</Text>
+            {item.isPicker ? (
+              <>
+                <View style={styles.pickerHeader}>
+                  <View style={styles.iconCircleSmall}>
+                    <MaterialIcons
+                      name="schedule"
+                      size={40}
+                      color={COLORS.primaryDark}
+                    />
+                  </View>
+                  <Text style={styles.slideTitle}>{t(item.titleKey)}</Text>
+                  <Text style={styles.slideBody}>{t(item.bodyKey)}</Text>
+                </View>
+                <View style={styles.pickerBody}>
+                  <ProgramYearPicker onSelect={setPickedProgramYearId} />
+                </View>
+              </>
+            ) : (
+              <>
+                <View style={styles.iconCircle}>
+                  <MaterialIcons
+                    name={ICONS[item.icon] || ICONS.place}
+                    size={56}
+                    color={COLORS.primaryDark}
+                  />
+                </View>
+                <Text style={styles.slideTitle}>{t(item.titleKey)}</Text>
+                <Text style={styles.slideBody}>{t(item.bodyKey)}</Text>
+              </>
+            )}
           </View>
         )}
       />
@@ -24561,6 +27429,15 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: SPACING.xl,
   },
+  iconCircleSmall: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: COLORS.backgroundSubtle,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: SPACING.md,
+  },
   slideTitle: {
     fontSize: FONT_SIZE.hero,
     fontWeight: '700',
@@ -24573,6 +27450,16 @@ const styles = StyleSheet.create({
     color: COLORS.textMuted,
     textAlign: 'center',
     lineHeight: 26,
+  },
+  pickerHeader: {
+    alignItems: 'center',
+    paddingTop: SPACING.xl,
+    paddingBottom: SPACING.md,
+  },
+  pickerBody: {
+    flex: 1,
+    alignSelf: 'stretch',
+    paddingTop: SPACING.sm,
   },
   dots: {
     flexDirection: 'row',
@@ -25497,6 +28384,253 @@ const styles = StyleSheet.create({
   footerText: { color: COLORS.textFaint, fontSize: FONT_SIZE.small },
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\timetable.jsx ---
+
+// The timetable screen. Shows one day at a time, with day tabs
+// across the top. If no program/year is stored, shows the picker
+// inline.
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { router, Stack } from 'expo-router';
+
+import { ProgramYearPicker } from '@/components/ProgramYearPicker';
+import { TimetableRow } from '@/components/TimetableRow';
+import { useTimetableSelection } from '@/hooks/useTimetableSelection';
+import { getWeek } from '@/services/timetable';
+import { setRouteRequest } from '@/services/routeRequest';
+import { t } from '@/i18n';
+import {
+  DAY_LABEL_KEYS,
+  DAY_NAMES,
+  DAY_SHORT_LABEL_KEYS,
+  WEEKDAYS,
+} from '@/constants/timetable';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+export default function TimetableScreen() {
+  const { programYearId, setSelection } = useTimetableSelection();
+
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [selectedDay, setSelectedDay] = useState(() => {
+    const today = new Date().getDay(); // 0 = Sunday in JS
+    // Convert JS day (0=Sun) to our day (0=Mon). Sat/Sun → Monday.
+    const mondayBased = (today + 6) % 7;
+    return mondayBased <= 4 ? mondayBased : 0;
+  });
+
+  const loadWeek = useCallback(async () => {
+    if (!programYearId) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await getWeek(programYearId);
+      setEntries(data.entries || []);
+    } catch (err) {
+      setError(err.message || t('common.error'));
+    } finally {
+      setLoading(false);
+    }
+  }, [programYearId]);
+
+  useEffect(() => {
+    loadWeek();
+  }, [loadWeek]);
+
+  // Filter entries for the selected day.
+  const dayEntries = useMemo(
+    () => entries.filter((e) => e.day_of_week === selectedDay),
+    [entries, selectedDay]
+  );
+
+  // Open the venue's place detail, or route directly to it.
+  const openVenue = useCallback((entry) => {
+    if (entry.venue_place_id == null) return;
+    router.push(`/place/${entry.venue_place_id}`);
+  }, []);
+
+  // If no selection yet, show the picker first.
+  if (!programYearId) {
+    return (
+      <>
+        <Stack.Screen options={{ title: t('timetable.title') }} />
+        <View style={styles.pickerWrapper}>
+          <Text style={styles.pickerIntro}>
+            {t('timetable.picker.intro')}
+          </Text>
+          <ProgramYearPicker onSelect={setSelection} />
+        </View>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <Stack.Screen options={{ title: t('timetable.title') }} />
+      <View style={styles.container}>
+        {/* Day tabs */}
+        <View style={styles.tabsWrapper}>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.tabsRow}
+          >
+            {WEEKDAYS.map((d) => {
+              const active = selectedDay === d;
+              return (
+                <TouchableOpacity
+                  key={d}
+                  style={[styles.tab, active && styles.tabActive]}
+                  onPress={() => setSelectedDay(d)}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active }}
+                >
+                  <Text
+                    style={[styles.tabText, active && styles.tabTextActive]}
+                  >
+                    {t(DAY_SHORT_LABEL_KEYS[d])}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+        </View>
+
+        {/* Day header */}
+        <View style={styles.dayHeader}>
+          <Text style={styles.dayHeaderText}>
+            {t(DAY_LABEL_KEYS[selectedDay])}
+          </Text>
+          {dayEntries.length > 0 ? (
+            <Text style={styles.dayHeaderCount}>
+              {t('timetable.periodsCount', { count: dayEntries.length })}
+            </Text>
+          ) : null}
+        </View>
+
+        {/* Content */}
+        {loading ? (
+          <View style={styles.state}>
+            <ActivityIndicator color={COLORS.textMuted} />
+          </View>
+        ) : error ? (
+          <View style={styles.state}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        ) : dayEntries.length === 0 ? (
+          <View style={styles.state}>
+            <Text style={styles.emptyText}>
+              {t('timetable.noClasses')}
+            </Text>
+          </View>
+        ) : (
+          <ScrollView style={styles.list}>
+            {dayEntries.map((entry) => (
+              <TimetableRow
+                key={entry.id}
+                entry={entry}
+                onPress={openVenue}
+              />
+            ))}
+          </ScrollView>
+        )}
+      </View>
+    </>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: COLORS.background },
+  pickerWrapper: {
+    flex: 1,
+    padding: SPACING.md,
+    backgroundColor: COLORS.background,
+  },
+  pickerIntro: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    marginBottom: SPACING.md,
+  },
+  tabsWrapper: {
+    backgroundColor: COLORS.backgroundSubtle,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+    flexGrow: 0,
+  },
+  tabsRow: {
+    paddingHorizontal: SPACING.sm,
+    paddingVertical: SPACING.sm,
+    gap: SPACING.sm,
+  },
+  tab: {
+    paddingHorizontal: 16,
+    height: 36,
+    borderRadius: RADIUS.pill,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 54,
+  },
+  tabActive: {
+    backgroundColor: COLORS.primaryDark,
+    borderColor: COLORS.primaryDark,
+  },
+  tabText: {
+    fontSize: FONT_SIZE.small + 1,
+    color: COLORS.text,
+    fontWeight: '600',
+  },
+  tabTextActive: { color: '#ffffff' },
+  dayHeader: {
+    paddingHorizontal: SPACING.md,
+    paddingTop: SPACING.md,
+    paddingBottom: SPACING.sm,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+  },
+  dayHeaderText: {
+    fontSize: FONT_SIZE.large,
+    fontWeight: '700',
+    color: COLORS.text,
+  },
+  dayHeaderCount: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+  },
+  list: { flex: 1 },
+  state: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: SPACING.lg,
+  },
+  emptyText: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    textAlign: 'center',
+  },
+  errorText: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.danger,
+    textAlign: 'center',
+  },
+});
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\walking.jsx ---
 
 // Walking Mode screen.
@@ -26058,6 +29192,7 @@ function AppStack() {
       <Stack.Screen name="arrival" options={{ title: 'Arrival' }} />
       <Stack.Screen name="chat" options={{ title: 'Chat' }} />
       <Stack.Screen name="explore" options={{ title: 'Explore' }} />
+      <Stack.Screen name="timetable" options={{ title: 'Timetable' }} />
       <Stack.Screen
         name="onboarding"
         options={{
@@ -26563,6 +29698,112 @@ const styles = StyleSheet.create({
 
 
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\ExploreGridCard.jsx ---
+
+// One card in the two-column grid on Explore.
+
+import {
+  Image,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { ICONS } from '@/constants/icons';
+import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
+
+const PLACEHOLDER_COLORS = [
+  '#dbeafe',
+  '#e0f2fe',
+  '#dcfce7',
+  '#fef9c3',
+  '#fee2e2',
+  '#fae8ff',
+  '#fce7f3',
+  '#e0e7ff',
+];
+
+function colorForName(name) {
+  let hash = 0;
+  for (let i = 0; i < (name || '').length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  }
+  return PLACEHOLDER_COLORS[Math.abs(hash) % PLACEHOLDER_COLORS.length];
+}
+
+export function ExploreGridCard({ place, onPress }) {
+  const photo = place.primary_photo_url;
+  const placeholderColor = colorForName(place.name);
+
+  return (
+    <TouchableOpacity
+      style={styles.card}
+      onPress={onPress}
+      activeOpacity={0.85}
+      accessibilityRole="button"
+      accessibilityLabel={place.name}
+    >
+      {photo ? (
+        <Image source={{ uri: photo }} style={styles.photo} resizeMode="cover" />
+      ) : (
+        <View style={[styles.photo, styles.placeholder, { backgroundColor: placeholderColor }]}>
+          <MaterialIcons
+            name={ICONS[place.categoryIconKey] || ICONS.place}
+            size={32}
+            color={COLORS.textMuted}
+          />
+        </View>
+      )}
+      <View style={styles.caption}>
+        <Text style={styles.name} numberOfLines={2}>
+          {place.name}
+        </Text>
+        {place.name_sw ? (
+          <Text style={styles.nameSw} numberOfLines={1}>
+            {place.name_sw}
+          </Text>
+        ) : null}
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+const styles = StyleSheet.create({
+  card: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.md,
+    overflow: 'hidden',
+  },
+  photo: {
+    width: '100%',
+    height: 110,
+    backgroundColor: COLORS.borderSubtle,
+  },
+  placeholder: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  caption: {
+    padding: SPACING.sm + 2,
+    minHeight: 52,
+  },
+  name: {
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+    color: COLORS.text,
+  },
+  nameSw: {
+    fontSize: FONT_SIZE.small - 1,
+    color: COLORS.textMuted,
+    marginTop: 2,
+  },
+});
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\FeatureCard.jsx ---
 
 // A large tappable card with an icon, title, and description.
@@ -26633,6 +29874,175 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
     lineHeight: 18,
+  },
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\FeaturedStrip.jsx ---
+
+// The featured strip at the top of Explore. Horizontally scrollable
+// cards for the places marked is_landmark.
+//
+// If a place has a primary photo, it's shown. Otherwise a coloured
+// placeholder is shown with the category icon. Same for the grid
+// cards — consistent look across both.
+
+import {
+  Dimensions,
+  Image,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { ICONS } from '@/constants/icons';
+import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
+
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
+const CARD_WIDTH = Math.round(SCREEN_WIDTH * 0.72);
+const CARD_HEIGHT = 180;
+
+// A small palette for placeholder tiles. Chosen so the tile looks
+// intentional rather than broken. The colour is picked by hashing
+// the place name, so the same place always gets the same colour
+// across renders and sessions.
+const PLACEHOLDER_COLORS = [
+  '#dbeafe',
+  '#e0f2fe',
+  '#dcfce7',
+  '#fef9c3',
+  '#fee2e2',
+  '#fae8ff',
+  '#fce7f3',
+  '#e0e7ff',
+];
+
+function colorForName(name) {
+  let hash = 0;
+  for (let i = 0; i < (name || '').length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  }
+  return PLACEHOLDER_COLORS[Math.abs(hash) % PLACEHOLDER_COLORS.length];
+}
+
+export function FeaturedStrip({ places, onPress }) {
+  if (!places || places.length === 0) return null;
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.sectionTitle}>{t('explore.featuredTitle')}</Text>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.scrollContent}
+        style={styles.scroll}
+      >
+        {places.map((place) => (
+          <FeaturedCard
+            key={place.id}
+            place={place}
+            onPress={() => onPress(place)}
+          />
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+function FeaturedCard({ place, onPress }) {
+  const photo = place.primary_photo_url;
+  const placeholderColor = colorForName(place.name);
+
+  return (
+    <TouchableOpacity
+      style={styles.card}
+      onPress={onPress}
+      activeOpacity={0.85}
+      accessibilityRole="button"
+      accessibilityLabel={place.name}
+    >
+      {photo ? (
+        <Image source={{ uri: photo }} style={styles.photo} resizeMode="cover" />
+      ) : (
+        <View style={[styles.photo, styles.placeholder, { backgroundColor: placeholderColor }]}>
+          <MaterialIcons
+            name={ICONS[place.categoryIconKey] || ICONS.place}
+            size={48}
+            color={COLORS.textMuted}
+          />
+        </View>
+      )}
+      <View style={styles.caption}>
+        <Text style={styles.name} numberOfLines={1}>
+          {place.name}
+        </Text>
+        {place.category ? (
+          <Text style={styles.category} numberOfLines={1}>
+            {prettifyCategory(place.category)}
+          </Text>
+        ) : null}
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+function prettifyCategory(category) {
+  if (!category) return '';
+  const value = category.includes('=') ? category.split('=')[1] : category;
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+const styles = StyleSheet.create({
+  container: {
+    marginTop: SPACING.md,
+  },
+  sectionTitle: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    paddingHorizontal: SPACING.md,
+    marginBottom: SPACING.sm,
+  },
+  scroll: { flexGrow: 0 },
+  scrollContent: {
+    paddingHorizontal: SPACING.md,
+    gap: SPACING.md,
+  },
+  card: {
+    width: CARD_WIDTH,
+    height: CARD_HEIGHT + 52,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.md,
+    overflow: 'hidden',
+  },
+  photo: {
+    width: '100%',
+    height: CARD_HEIGHT,
+    backgroundColor: COLORS.borderSubtle,
+  },
+  placeholder: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  caption: {
+    padding: SPACING.sm + 2,
+  },
+  name: {
+    fontSize: FONT_SIZE.body + 1,
+    fontWeight: '700',
+    color: COLORS.text,
+  },
+  category: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    marginTop: 2,
   },
 });
 
@@ -26768,6 +30178,83 @@ const styles = StyleSheet.create({
   metaItem: {
     color: COLORS.textMuted,
   },
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\IntentChips.jsx ---
+
+// A horizontal row of intent chips for Explore. Tapping one filters
+// the grid by that intent. Tapping the active one clears it.
+
+import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
+
+import { INTENTS } from '@/constants/intents';
+import { t } from '@/i18n';
+import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+export function IntentChips({ selected, onSelect }) {
+  return (
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={styles.scrollContent}
+      style={styles.scroll}
+    >
+      {INTENTS.map((intent) => {
+        const isSelected = selected === intent.key;
+        return (
+          <TouchableOpacity
+            key={intent.key}
+            style={[styles.chip, isSelected && styles.chipSelected]}
+            onPress={() => onSelect(isSelected ? null : intent.key)}
+            accessibilityRole="button"
+            accessibilityState={{ selected: isSelected }}
+            accessibilityLabel={t(intent.labelKey)}
+          >
+            <Text
+              style={[styles.label, isSelected && styles.labelSelected]}
+              numberOfLines={1}
+            >
+              {t(intent.labelKey)}
+            </Text>
+          </TouchableOpacity>
+        );
+      })}
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  scroll: {
+    marginTop: SPACING.xs,
+    marginBottom: SPACING.sm,
+    maxHeight: TOUCH.minHeight + 8,
+    flexGrow: 0,
+  },
+  scrollContent: {
+    paddingHorizontal: SPACING.md,
+    gap: SPACING.sm,
+    alignItems: 'center',
+  },
+  chip: {
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.pill,
+    paddingHorizontal: 12,
+    height: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chipSelected: {
+    backgroundColor: '#0d9488',
+    borderColor: '#0d9488',
+  },
+  label: {
+    fontSize: 14,
+    color: COLORS.text,
+    fontWeight: '500',
+  },
+  labelSelected: { color: '#ffffff' },
 });
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\MapView.jsx ---
@@ -26994,6 +30481,148 @@ const styles = StyleSheet.create({
     backgroundColor: '#2563eb',
     borderWidth: 2,
     borderColor: '#ffffff',
+  },
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\NextClassBanner.jsx ---
+
+// The banner that appears at the top of Home when a class is coming
+// up in the next 90 minutes. Hidden entirely when there's no class.
+
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+function formatStartsIn(seconds) {
+  if (seconds < 60) {
+    return t('timetable.banner.startingNow');
+  }
+  const minutes = Math.round(seconds / 60);
+  return t('timetable.banner.startsIn', { minutes });
+}
+
+export function NextClassBanner({ entry, startsInSeconds, onNavigate, onViewTimetable }) {
+  if (!entry) return null;
+
+  const venueLabel = entry.venue_name || entry.venue_code || null;
+  const hasVenuePlace = entry.venue_place_id != null;
+
+  return (
+    <View style={styles.banner}>
+      <View style={styles.topRow}>
+        <MaterialIcons name="schedule" size={20} color="#78350f" />
+        <Text style={styles.when}>
+          {formatStartsIn(startsInSeconds)}
+        </Text>
+      </View>
+
+      <Text style={styles.module} numberOfLines={2}>
+        {entry.module_code}
+        {entry.module_name ? ` · ${entry.module_name}` : ''}
+      </Text>
+
+      <Text style={styles.detail} numberOfLines={1}>
+        {entry.start_time}–{entry.end_time}
+        {venueLabel ? ` · ${venueLabel}` : ''}
+      </Text>
+
+      <View style={styles.actions}>
+        {hasVenuePlace ? (
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={() => onNavigate(entry)}
+            accessibilityRole="button"
+          >
+            <Text style={styles.primaryButtonText}>
+              {t('timetable.banner.takeMeThere')}
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+
+        <TouchableOpacity
+          style={styles.secondaryButton}
+          onPress={onViewTimetable}
+          accessibilityRole="button"
+        >
+          <Text style={styles.secondaryButtonText}>
+            {t('timetable.banner.viewTimetable')}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  banner: {
+    marginHorizontal: SPACING.md,
+    marginTop: SPACING.sm,
+    marginBottom: SPACING.sm,
+    padding: SPACING.md,
+    borderRadius: RADIUS.md,
+    backgroundColor: '#fef3c7',
+    borderWidth: 1,
+    borderColor: '#f59e0b',
+  },
+  topRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 6,
+  },
+  when: {
+    fontSize: FONT_SIZE.small,
+    fontWeight: '700',
+    color: '#78350f',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  module: {
+    fontSize: FONT_SIZE.body + 1,
+    fontWeight: '700',
+    color: '#111827',
+    marginBottom: 4,
+  },
+  detail: {
+    fontSize: FONT_SIZE.small,
+    color: '#374151',
+    marginBottom: 10,
+  },
+  actions: {
+    flexDirection: 'row',
+    gap: SPACING.sm,
+  },
+  primaryButton: {
+    flex: 1,
+    backgroundColor: '#b45309',
+    borderRadius: RADIUS.sm,
+    paddingVertical: 10,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  primaryButtonText: {
+    color: '#ffffff',
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+  },
+  secondaryButton: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+    borderRadius: RADIUS.sm,
+    paddingVertical: 10,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#f59e0b',
+  },
+  secondaryButtonText: {
+    color: '#78350f',
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
   },
 });
 
@@ -27328,6 +30957,339 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.small,
     color: COLORS.textFaint,
     marginTop: 4,
+  },
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\ProgramYearPicker.jsx ---
+
+// A two-step picker: choose a program, then choose a year.
+//
+// Used in two places:
+//   - Onboarding, as a slide the student can fill in or skip.
+//   - The timetable screen, inline, if no selection is stored yet.
+//
+// The picker doesn't save anything itself. It calls `onSelect` with
+// the chosen program_year_id. The caller decides what to do with it.
+//
+// The program list can be long (many programs across many colleges
+// and departments), so there's a search box above it. The year list
+// is short — one program has a handful of year levels — so it stays
+// unfiltered.
+
+import { useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+
+import { t } from '@/i18n';
+import { listPrograms, listYearsForProgram } from '@/services/timetable';
+import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
+
+export function ProgramYearPicker({ onSelect, selectedProgramYearId = null }) {
+  const [programs, setPrograms] = useState([]);
+  const [years, setYears] = useState([]);
+  const [selectedProgramId, setSelectedProgramId] = useState(null);
+  const [selectedYearId, setSelectedYearId] = useState(selectedProgramYearId);
+
+  const [programSearch, setProgramSearch] = useState('');
+
+  const [loadingPrograms, setLoadingPrograms] = useState(true);
+  const [loadingYears, setLoadingYears] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Load programs once.
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingPrograms(true);
+    setError(null);
+    listPrograms()
+      .then((data) => {
+        if (!cancelled) setPrograms(data);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message || t('common.error'));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingPrograms(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load years when the program changes.
+  useEffect(() => {
+    if (!selectedProgramId) {
+      setYears([]);
+      return;
+    }
+    let cancelled = false;
+    setLoadingYears(true);
+    listYearsForProgram(selectedProgramId)
+      .then((data) => {
+        if (!cancelled) setYears(data);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message || t('common.error'));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingYears(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProgramId]);
+
+  // Filter the program list by the search string. Case-insensitive
+  // substring match on name, code, and department. If the search is
+  // empty, all programs show.
+  const filteredPrograms = useMemo(() => {
+    const q = programSearch.trim().toLowerCase();
+    if (!q) return programs;
+    return programs.filter((p) => {
+      const haystack = [
+        p.name || '',
+        p.code || '',
+        p.department || '',
+      ]
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [programs, programSearch]);
+
+  function chooseProgram(id) {
+    setSelectedProgramId(id);
+    setSelectedYearId(null);
+  }
+
+  function chooseYear(id) {
+    setSelectedYearId(id);
+    if (onSelect) onSelect(id);
+  }
+
+  if (loadingPrograms) {
+    return (
+      <View style={styles.state}>
+        <ActivityIndicator color={COLORS.textMuted} />
+        <Text style={styles.stateText}>{t('timetable.picker.loading')}</Text>
+      </View>
+    );
+  }
+
+  if (error) {
+    return (
+      <View style={styles.state}>
+        <Text style={styles.errorText}>{error}</Text>
+      </View>
+    );
+  }
+
+  if (programs.length === 0) {
+    return (
+      <View style={styles.state}>
+        <Text style={styles.stateText}>{t('timetable.picker.empty')}</Text>
+      </View>
+    );
+  }
+
+  return (
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      keyboardShouldPersistTaps="handled"
+      nestedScrollEnabled
+    >
+      <Text style={styles.stepLabel}>{t('timetable.picker.stepProgram')}</Text>
+
+      <TextInput
+        style={styles.searchInput}
+        value={programSearch}
+        onChangeText={setProgramSearch}
+        placeholder={t('timetable.picker.searchPlaceholder')}
+        placeholderTextColor={COLORS.textFaint}
+        autoCapitalize="none"
+        autoCorrect={false}
+        returnKeyType="search"
+      />
+
+      <View style={styles.list}>
+        {filteredPrograms.length === 0 ? (
+          <Text style={styles.noMatchText}>
+            {t('timetable.picker.noMatch')}
+          </Text>
+        ) : (
+          filteredPrograms.map((p) => {
+            const isSelected = selectedProgramId === p.id;
+            return (
+              <TouchableOpacity
+                key={p.id}
+                style={[styles.option, isSelected && styles.optionSelected]}
+                onPress={() => chooseProgram(p.id)}
+                accessibilityRole="button"
+                accessibilityState={{ selected: isSelected }}
+              >
+                <Text
+                  style={[
+                    styles.optionText,
+                    isSelected && styles.optionTextSelected,
+                  ]}
+                  numberOfLines={2}
+                >
+                  {p.name}
+                </Text>
+                {p.department ? (
+                  <Text
+                    style={[
+                      styles.optionSubtext,
+                      isSelected && styles.optionSubtextSelected,
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {p.department}
+                  </Text>
+                ) : null}
+              </TouchableOpacity>
+            );
+          })
+        )}
+      </View>
+
+      {selectedProgramId ? (
+        <>
+          <Text style={[styles.stepLabel, styles.stepLabelSpaced]}>
+            {t('timetable.picker.stepYear')}
+          </Text>
+          {loadingYears ? (
+            <ActivityIndicator color={COLORS.textMuted} />
+          ) : years.length === 0 ? (
+            <Text style={styles.stateText}>{t('timetable.picker.noYears')}</Text>
+          ) : (
+            <View style={styles.list}>
+              {years.map((y) => {
+                const isSelected = selectedYearId === y.id;
+                const label =
+                  y.display_name ||
+                  t('timetable.picker.yearLabel', { n: y.year_number });
+                return (
+                  <TouchableOpacity
+                    key={y.id}
+                    style={[styles.option, isSelected && styles.optionSelected]}
+                    onPress={() => chooseYear(y.id)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: isSelected }}
+                  >
+                    <Text
+                      style={[
+                        styles.optionText,
+                        isSelected && styles.optionTextSelected,
+                      ]}
+                    >
+                      {label}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.optionSubtext,
+                        isSelected && styles.optionSubtextSelected,
+                      ]}
+                    >
+                      {y.academic_year} · S{y.semester}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+        </>
+      ) : null}
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  content: { paddingBottom: SPACING.lg },
+  stepLabel: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: SPACING.sm,
+  },
+  stepLabelSpaced: {
+    marginTop: SPACING.lg,
+  },
+  searchInput: {
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.sm,
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 10,
+    fontSize: FONT_SIZE.body,
+    color: COLORS.text,
+    marginBottom: SPACING.sm,
+  },
+  list: {
+    gap: SPACING.sm,
+  },
+  noMatchText: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    paddingVertical: SPACING.md,
+    textAlign: 'center',
+  },
+  option: {
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.sm,
+    backgroundColor: COLORS.background,
+  },
+  optionSelected: {
+    backgroundColor: COLORS.primaryDark,
+    borderColor: COLORS.primaryDark,
+  },
+  optionText: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.text,
+    fontWeight: '500',
+  },
+  optionTextSelected: {
+    color: '#ffffff',
+  },
+  optionSubtext: {
+    fontSize: FONT_SIZE.small - 1,
+    color: COLORS.textMuted,
+    marginTop: 2,
+  },
+  optionSubtextSelected: {
+    color: '#cbd5e1',
+  },
+  state: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: SPACING.lg,
+  },
+  stateText: {
+    color: COLORS.textMuted,
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
+    marginTop: SPACING.sm,
+  },
+  errorText: {
+    color: COLORS.danger,
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
   },
 });
 
@@ -28001,6 +31963,129 @@ const styles = StyleSheet.create({
   },
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\TimetableRow.jsx ---
+
+// One row in the timetable list. Left column is the time, right
+// column is the module. If the venue matches a place, the row is
+// tappable and opens that place's detail screen.
+
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { TIMETABLE_COLORS } from '@/constants/timetable';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+export function TimetableRow({ entry, onPress }) {
+  const hasVenuePlace = entry.venue_place_id != null;
+  const venueLabel = entry.venue_name || entry.venue_code || null;
+
+  const content = (
+    <View style={styles.row}>
+      {/* Time column */}
+      <View style={styles.timeCol}>
+        <Text style={styles.startTime}>{entry.start_time}</Text>
+        <Text style={styles.endTime}>{entry.end_time}</Text>
+      </View>
+
+      {/* Body */}
+      <View style={styles.body}>
+        <Text style={styles.moduleCode}>{entry.module_code}</Text>
+        {entry.module_name ? (
+          <Text style={styles.moduleName} numberOfLines={2}>
+            {entry.module_name}
+          </Text>
+        ) : null}
+        {entry.lecturer_name ? (
+          <Text style={styles.lecturer} numberOfLines={1}>
+            {entry.lecturer_name}
+          </Text>
+        ) : null}
+        {venueLabel ? (
+          <Text style={styles.venue} numberOfLines={1}>
+            {venueLabel}
+          </Text>
+        ) : null}
+      </View>
+
+      {/* Arrow if the row is tappable */}
+      {hasVenuePlace ? (
+        <MaterialIcons
+          name="chevron-right"
+          size={22}
+          color={COLORS.textMuted}
+          style={styles.chevron}
+        />
+      ) : null}
+    </View>
+  );
+
+  if (hasVenuePlace) {
+    return (
+      <TouchableOpacity
+        onPress={() => onPress(entry)}
+        accessibilityRole="button"
+        accessibilityLabel={`${entry.module_code}, ${entry.start_time}. Tap for venue.`}
+      >
+        {content}
+      </TouchableOpacity>
+    );
+  }
+
+  return content;
+}
+
+const styles = StyleSheet.create({
+  row: {
+    flexDirection: 'row',
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 12,
+    minHeight: TOUCH.minHeight,
+    borderBottomWidth: 1,
+    borderBottomColor: TIMETABLE_COLORS.rowBorder,
+    alignItems: 'flex-start',
+  },
+  timeCol: {
+    width: 60,
+    marginRight: SPACING.sm,
+  },
+  startTime: {
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+    color: TIMETABLE_COLORS.timeColumn,
+  },
+  endTime: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textFaint,
+    marginTop: 2,
+  },
+  body: { flex: 1 },
+  moduleCode: {
+    fontSize: FONT_SIZE.body + 1,
+    fontWeight: '700',
+    color: TIMETABLE_COLORS.moduleCode,
+  },
+  moduleName: {
+    fontSize: FONT_SIZE.small,
+    color: TIMETABLE_COLORS.moduleName,
+    marginTop: 2,
+  },
+  lecturer: {
+    fontSize: FONT_SIZE.small - 1,
+    color: TIMETABLE_COLORS.lecturer,
+    marginTop: 4,
+  },
+  venue: {
+    fontSize: FONT_SIZE.small,
+    color: TIMETABLE_COLORS.venue,
+    fontWeight: '600',
+    marginTop: 4,
+  },
+  chevron: {
+    alignSelf: 'center',
+    marginLeft: SPACING.sm,
+  },
+});
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\WifiBanner.jsx ---
 
 // The Wi-Fi proximity banner.
@@ -28318,6 +32403,38 @@ export const ICONS = {
   photo: 'photo-camera',
 };
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\intents.js ---
+
+// Intent definitions for the Explore screen.
+//
+// "Intents" describe what a student wants to *do*, as opposed to
+// what a place *is* (that's category). A place can serve multiple
+// intents; an intent can span multiple categories.
+//
+// These are display-only. The DB stores whatever an admin types
+// into a place's `intents` field, as a semicolon-separated string.
+// When a chip is tapped, we send its `key` to the backend, which
+// does a substring match against the intents field.
+//
+// So the actual matching is: does the place's intents string
+// contain this key? "eat" matches "eat; study; wifi" — because
+// "eat" is a substring of that string. Keep intents short and
+// distinct so this stays reliable.
+//
+// If you later want a structured, enforced vocabulary, this is the
+// file to change. For now it's advisory.
+
+export const INTENTS = [
+  { key: 'eat',     labelKey: 'intents.eat'     },
+  { key: 'study',   labelKey: 'intents.study'   },
+  { key: 'print',   labelKey: 'intents.print'   },
+  { key: 'wifi',    labelKey: 'intents.wifi'    },
+  { key: 'sports',  labelKey: 'intents.sports'  },
+  { key: 'meet',    labelKey: 'intents.meet'    },
+  { key: 'toilet',  labelKey: 'intents.toilet'  },
+  { key: 'prayer',  labelKey: 'intents.prayer'  },
+];
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\profiles.js ---
 
 
@@ -28395,6 +32512,63 @@ export const FONT_SIZE = {
 // Multiplier applied when the user has enabled large text.
 export const LARGE_TEXT_MULTIPLIER = 1.3;
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\timetable.js ---
+
+// Shared constants for the timetable feature.
+
+// Day-of-week names, indexed 0–6 to match the backend's storage.
+// Monday is 0, matching the Python model.
+export const DAY_NAMES = [
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+  'Sunday',
+];
+
+// The days shown on the timetable screen tabs. Monday–Friday only.
+export const WEEKDAYS = [0, 1, 2, 3, 4];
+
+// i18n keys for each day, so the labels can be translated.
+export const DAY_LABEL_KEYS = {
+  0: 'timetable.days.monday',
+  1: 'timetable.days.tuesday',
+  2: 'timetable.days.wednesday',
+  3: 'timetable.days.thursday',
+  4: 'timetable.days.friday',
+  5: 'timetable.days.saturday',
+  6: 'timetable.days.sunday',
+};
+
+// Short labels for the day tab bar, since the full names are long.
+export const DAY_SHORT_LABEL_KEYS = {
+  0: 'timetable.days.mon',
+  1: 'timetable.days.tue',
+  2: 'timetable.days.wed',
+  3: 'timetable.days.thu',
+  4: 'timetable.days.fri',
+  5: 'timetable.days.sat',
+  6: 'timetable.days.sun',
+};
+
+// Colours for the timetable screen, kept separate from the main theme
+// so we can tweak them without touching the rest of the app.
+export const TIMETABLE_COLORS = {
+  tabActive: '#1e3a8a',
+  tabInactive: '#f3f4f6',
+  tabActiveText: '#ffffff',
+  tabInactiveText: '#374151',
+  rowBorder: '#f3f4f6',
+  timeColumn: '#4b5563',
+  moduleCode: '#111827',
+  moduleName: '#4b5563',
+  lecturer: '#6b7280',
+  venue: '#2563eb',
+  crossCutting: '#b45309',
+};
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\context\RouteContext.jsx ---
 
 
@@ -28426,6 +32600,9 @@ const DEFAULT_SETTINGS = {
   hapticsEnabled: true,
   reduceMotion: false,
   hasSeenOnboarding: false,
+  // The selected program-year for the timetable. Null until the
+  // student picks one (or if they skipped). Local only — no login.
+  programYearId: null,
 };
 
 const SettingsContext = createContext({
@@ -28449,8 +32626,6 @@ export function SettingsProvider({ children }) {
         setLoaded(true);
       })
       .catch(() => {
-        // Storage failed. Use defaults and mark as loaded so the
-        // app doesn't hang waiting.
         if (cancelled) return;
         setLoaded(true);
       });
@@ -28464,7 +32639,6 @@ export function SettingsProvider({ children }) {
       const next = { ...prev, [key]: value };
       setJSON(STORAGE_KEY, next);
 
-      // Language is special: it has a side effect on the i18n module.
       if (key === 'language') {
         setI18nLanguage(value);
       }
@@ -28927,6 +33101,48 @@ export function useStartingPoint() {
   };
 }
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\hooks\useTimetableSelection.js ---
+
+// Reads and writes the student's program/year selection.
+//
+// The selection is a single integer — the program_year_id — stored
+// in the same settings blob as language, units, and the rest. This
+// hook is a thin wrapper that also exposes a change callback so
+// screens can react to it.
+//
+// Nothing about this requires a login. The selection is device-local
+// and invisible to the server beyond the program_year_id sent in
+// API calls.
+
+import { useCallback } from 'react';
+
+import { useSettings } from '@/context/SettingsContext';
+
+export function useTimetableSelection() {
+  const { settings, updateSetting } = useSettings();
+
+  const programYearId = settings.programYearId ?? null;
+  const hasSelection = programYearId != null;
+
+  const setSelection = useCallback(
+    (newProgramYearId) => {
+      updateSetting('programYearId', newProgramYearId);
+    },
+    [updateSetting]
+  );
+
+  const clearSelection = useCallback(() => {
+    updateSetting('programYearId', null);
+  }, [updateSetting]);
+
+  return {
+    programYearId,
+    hasSelection,
+    setSelection,
+    clearSelection,
+  };
+}
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\hooks\useWalkingProgress.js ---
 
 // A React hook that combines location tracking with progress
@@ -29233,7 +33449,8 @@ export function useWalkingProgress(route) {
     "title": "Explore",
     "categoriesTitle": "Browse by category",
     "allPlacesTitle": "All places",
-    "allPlacesCount": "{count} places"
+    "allPlacesCount": "{count} places",
+    "featuredTitle": "Featured places"
   },
   "onboarding": {
     "welcome": "Welcome",
@@ -29244,7 +33461,9 @@ export function useWalkingProgress(route) {
     "walkBody": "Live directions, spoken turn-by-turn, and a compass arrow pointing the way.",
     "getStarted": "Get started",
     "skip": "Skip",
-    "next": "Next"
+    "next": "Next",
+    "timetableTitle": "Your timetable",
+    "timetableBody": "Pick your program and year to see your classes and get directions to each venue."
   },
   "report": {
     "title": "Report a problem",
@@ -29299,7 +33518,55 @@ export function useWalkingProgress(route) {
     "offices": "Offices",
     "hostels": "Hostels",
     "library": "Library"
+  },
+  "timetable": {
+  "title": "Timetable",
+  "noClasses": "No classes on this day.",
+  "periodsCount": "{count} period(s)",
+  "days": {
+    "monday": "Monday",
+    "tuesday": "Tuesday",
+    "wednesday": "Wednesday",
+    "thursday": "Thursday",
+    "friday": "Friday",
+    "saturday": "Saturday",
+    "sunday": "Sunday",
+    "mon": "Mon",
+    "tue": "Tue",
+    "wed": "Wed",
+    "thu": "Thu",
+    "fri": "Fri",
+    "sat": "Sat",
+    "sun": "Sun"
+  },
+  "picker": {
+    "intro": "Choose your program and year to see your timetable.",
+    "stepProgram": "Step 1 — Choose your program",
+    "stepYear": "Step 2 — Choose your year",
+    "loading": "Loading programs…",
+    "empty": "No programs available yet. Check back later.",
+    "noYears": "No years available for this program.",
+    "yearLabel": "Year {n}",
+    "searchPlaceholder": "Search programs…",
+    "noMatch": "No programs match your search."
+  },
+  "banner": {
+    "startingNow": "Starting now",
+    "startsIn": "In {minutes} min",
+    "takeMeThere": "Take me there",
+    "viewTimetable": "View timetable"
   }
+},
+"intents": {
+  "eat": "Food",
+  "study": "Study",
+  "print": "Print",
+  "wifi": "Wi-Fi",
+  "sports": "Sports",
+  "meet": "Meet up",
+  "toilet": "Toilets",
+  "prayer": "Prayer"
+}
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\i18n\index.js ---
@@ -29490,7 +33757,8 @@ export function ttsLanguageForCurrentLang() {
     "title": "Vinjari",
     "categoriesTitle": "Vinjari kwa aina",
     "allPlacesTitle": "Mahali pote",
-    "allPlacesCount": "Mahali {count}"
+    "allPlacesCount": "Mahali {count}",
+    "featuredTitle": "Maeneo maarufu"
   },
   "onboarding": {
     "welcome": "Karibu",
@@ -29501,7 +33769,9 @@ export function ttsLanguageForCurrentLang() {
     "walkBody": "Maelekezo ya moja kwa moja, yanayosemwa kwa sauti, na mshale wa dira unaoelekeza njia.",
     "getStarted": "Anza",
     "skip": "Ruka",
-    "next": "Endelea"
+    "next": "Endelea",
+    "timetableTitle": "Ratiba yako",
+    "timetableBody": "Chagua programu na mwaka wako ili kuona vipindi vyako na kupata maelekezo kwa kila ukumbi."
   },
   "report": {
     "title": "Ripoti tatizo",
@@ -29556,7 +33826,55 @@ export function ttsLanguageForCurrentLang() {
     "offices": "Ofisi",
     "hostels": "Hosteli",
     "library": "Maktaba"
+  },
+  "timetable": {
+  "title": "Ratiba",
+  "noClasses": "Hakuna vipindi siku hii.",
+  "periodsCount": "Vipindi {count}",
+  "days": {
+    "monday": "Jumatatu",
+    "tuesday": "Jumanne",
+    "wednesday": "Jumatano",
+    "thursday": "Alhamisi",
+    "friday": "Ijumaa",
+    "saturday": "Jumamosi",
+    "sunday": "Jumapili",
+    "mon": "Jtat",
+    "tue": "Jnan",
+    "wed": "Jtan",
+    "thu": "Alh",
+    "fri": "Ijm",
+    "sat": "Jmos",
+    "sun": "Jpil"
+  },
+  "picker": {
+    "intro": "Chagua programu na mwaka wako ili kuona ratiba yako.",
+    "stepProgram": "Hatua 1 — Chagua programu yako",
+    "stepYear": "Hatua 2 — Chagua mwaka wako",
+    "loading": "Inapakia programu…",
+    "empty": "Hakuna programu bado. Angalia tena baadaye.",
+    "noYears": "Hakuna miaka inayopatikana kwa programu hii.",
+    "yearLabel": "Mwaka {n}",
+    "searchPlaceholder": "Tafuta programu…",
+    "noMatch": "Hakuna programu inayolingana na utafutaji wako."
+  },
+  "banner": {
+    "startingNow": "Inaanza sasa",
+    "startsIn": "Baada ya dakika {minutes}",
+    "takeMeThere": "Nipeleke hapo",
+    "viewTimetable": "Ona ratiba"
   }
+},
+"intents": {
+  "eat": "Chakula",
+  "study": "Kusoma",
+  "print": "Kuchapisha",
+  "wifi": "Wi-Fi",
+  "sports": "Michezo",
+  "meet": "Kukutana",
+  "toilet": "Vyoo",
+  "prayer": "Kuomba"
+}
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\jest.setup.js ---
@@ -46413,7 +50731,7 @@ global.fetch = jest.fn(() =>
 import { API_BASE_URL, API_TIMEOUT_MS } from '@/constants/config';
 import { getDeviceId } from '@/services/session';
 
-async function request(path, options = {}) {
+export async function request(path, options = {}) {
   const url = API_BASE_URL + path;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
@@ -46476,10 +50794,11 @@ export async function searchPlaces(q, { limit = 20 } = {}) {
   return request(`/api/places/search?${params.toString()}`);
 }
 
-export async function listPlaces({ q, category, lat, lon, radius_m, limit } = {}) {
+export async function listPlaces({ q, category, intent, lat, lon, radius_m, limit } = {}) {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (category) params.set('category', category);
+  if (intent) params.set('intent', intent);
   if (lat != null) params.set('lat', String(lat));
   if (lon != null) params.set('lon', String(lon));
   if (radius_m != null) params.set('radius_m', String(radius_m));
@@ -47194,6 +51513,47 @@ export async function removeItem(key) {
   } catch {
     // Ignore.
   }
+}
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\timetable.js ---
+
+// API client for the timetable endpoints. Every call goes through
+// services/api.js's `request` function so the device ID header and
+// timeout handling are consistent with the rest of the app.
+
+import { request } from '@/services/api';
+
+/**
+ * Every program, alphabetical. Used by the onboarding picker.
+ */
+export async function listPrograms() {
+  return request('/api/timetable/programs');
+}
+
+/**
+ * Year-levels available for one program.
+ */
+export async function listYearsForProgram(programId) {
+  return request(`/api/timetable/programs/${programId}/years`);
+}
+
+/**
+ * Every entry for one program-year, ordered by day and time.
+ * Returns { program_year_id, entries: [...] }.
+ */
+export async function getWeek(programYearId) {
+  return request(`/api/timetable/schedule?program_year_id=${programYearId}`);
+}
+
+/**
+ * The next class within the next 90 minutes, if any.
+ * Returns { has_class, entry, starts_in_seconds }.
+ *
+ * Currently unused — the mobile app computes "next class" locally
+ * from the cached week, so this is here for future use or debugging.
+ */
+export async function getNextClass(programYearId) {
+  return request(`/api/timetable/next?program_year_id=${programYearId}`);
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\tts.js ---
