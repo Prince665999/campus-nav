@@ -26441,7 +26441,7 @@ export default function ChatScreen() {
             accessibilityRole="button"
             accessibilityLabel={t('chat.send')}
           >
-            <Text style={styles.sendText}>↑</Text>
+            <Text style={styles.sendText}>GO</Text>
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
@@ -32286,7 +32286,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
+const DEFAULT_API_BASE_URL = 'https://cited-softball-footage-infringement.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -33180,6 +33180,13 @@ export function useWalkingProgress(route) {
 
   const detectorRef = useRef(createOffRouteDetector());
 
+  // The segment index of the last successful snap. Used to constrain
+  // the next snap's search to segments near where we were. On a
+  // campus with looping paths, an unconstrained search can jump to
+  // the wrong segment; at corners, the previous segment's endpoint
+  // can pin the dot. Both are fixed by preferring nearby segments.
+  const lastSegmentIndexRef = useRef(null);
+
   // Track the last time a good fix was accepted. Used by the stale
   // fallback and by the "searching for GPS" indicator.
   const lastGoodFixAtRef = useRef(Date.now());
@@ -33220,6 +33227,7 @@ export function useWalkingProgress(route) {
     if (!hasGeometry) return;
 
     detectorRef.current.reset();
+    lastSegmentIndexRef.current = null;
     lastGoodFixAtRef.current = Date.now();
     setGpsStale(false);
 
@@ -33243,8 +33251,17 @@ export function useWalkingProgress(route) {
         const geom = geometryRef.current;
         let snapped = null;
         if (geom) {
-          snapped = snapToRoute({ lat: loc.lat, lon: loc.lon }, geom);
+          // Forward-constrained snap. The `nearIndex` hint is the
+          // segment index from the last successful snap. If it's
+          // null (first fix, or the route changed) the snap does a
+          // full search.
+          snapped = snapToRoute(
+            { lat: loc.lat, lon: loc.lon },
+            geom,
+            { nearIndex: lastSegmentIndexRef.current }
+          );
           if (snapped) {
+            lastSegmentIndexRef.current = snapped.segmentIndex;
             const trustedForOffRoute =
               loc.accuracyM != null &&
               loc.accuracyM <= OFF_ROUTE_MAX_ACCURACY_M;
@@ -33257,7 +33274,7 @@ export function useWalkingProgress(route) {
 
         if (!shouldDisplay) {
           // Not a good enough fix to move the dot, but we've already
-          // updated off-route detection above. Now check whether we
+          // updated off-route detection above. Check whether we
           // should tell the student the GPS is degraded.
           const secondsSinceGoodFix =
             (now - lastGoodFixAtRef.current) / 1000;
@@ -33300,9 +33317,11 @@ export function useWalkingProgress(route) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionGranted, hasGeometry]);
 
-  // Reset the detector when the route object changes.
+  // Reset the detector and segment hint when the route object
+  // changes. A new route means the old segment index is meaningless.
   useEffect(() => {
     detectorRef.current.reset();
+    lastSegmentIndexRef.current = null;
     setOffRoute(false);
   }, [route]);
 
@@ -33322,6 +33341,7 @@ export function useWalkingProgress(route) {
 
   const resetOffRoute = useCallback(() => {
     detectorRef.current.reset();
+    lastSegmentIndexRef.current = null;
     setOffRoute(false);
   }, []);
 
@@ -33337,8 +33357,6 @@ export function useWalkingProgress(route) {
     progress,
     resetOffRoute,
     // True when no good GPS fix has arrived for DISPLAY_STALE_INDICATOR_S.
-    // The dot may still be moving on a stale fallback fix; this just
-    // means the fix is older than we'd like.
     gpsStale,
   };
 }
@@ -51817,7 +51835,6 @@ export function pointSegmentInfo(p, a, b) {
   const closestY = ay + t * dy;
   const distance = Math.hypot(px - closestX, py - closestY);
 
-  // Cross product z-component: positive means p is left of a->b.
   const crossZ = dx * (py - ay) - dy * (px - ax);
   const side = crossZ > 0 ? 'left' : 'right';
 
@@ -51827,14 +51844,38 @@ export function pointSegmentInfo(p, a, b) {
 // Snap a raw GPS point onto a route.
 //
 // The route is an array of { lat, lon }. Returns the closest point
-// on the route as { lat, lon, distanceFromStartM, offRouteM },
-// where distanceFromStartM is how far along the walk the snapped
-// point sits, and offRouteM is how far the raw point was from the
-// route.
+// on the route as { lat, lon, distanceFromStartM, offRouteM,
+// segmentIndex }.
 //
-// This is what removes GPS jitter. The raw fix jumps around; the
-// snapped point moves smoothly along the route.
-export function snapToRoute(point, routeGeometry) {
+// Forward-constrained search
+// --------------------------
+// On a campus, footpaths loop back on themselves — a spur, a path
+// that returns near its own start, a loop around a building. If the
+// search always looks at the whole route, a segment that's
+// geometrically close to the student but far along the route can
+// "win" the distance comparison and cause the dot to leap. And at
+// corners, two segments share a vertex, so the perpendicular
+// projection onto the segment the student just left clamps to that
+// vertex and pins the dot there for several metres.
+//
+// To prevent both, we constrain the search to a window of segments
+// around the last-known index. Pass `nearIndex` from the previous
+// snap. If the best match inside the window is worse than
+// `fallbackThresholdM` (or `nearIndex` is null), we re-run the
+// search over the whole route. So the worst case is exactly the
+// old behaviour; the common case is faster and more correct.
+//
+// Defaults:
+//   nearIndex           — null (full search)
+//   window              — 6 segments on either side of nearIndex
+//   fallbackThresholdM  — 60 metres
+export function snapToRoute(point, routeGeometry, options = {}) {
+  const {
+    nearIndex = null,
+    window = 6,
+    fallbackThresholdM = 60,
+  } = options;
+
   if (!routeGeometry || routeGeometry.length === 0) {
     return null;
   }
@@ -51846,6 +51887,7 @@ export function snapToRoute(point, routeGeometry) {
       lon: only.lon,
       distanceFromStartM: 0,
       offRouteM: haversineM(point.lat, point.lon, only.lat, only.lon),
+      segmentIndex: 0,
     };
   }
 
@@ -51862,35 +51904,63 @@ export function snapToRoute(point, routeGeometry) {
     segmentLengths.push(len);
   }
 
-  let best = null;
+  // Cumulative distance to the start of each segment, so we can
+  // compute distanceFromStartM in O(1) once we know the winning
+  // segment and its t.
+  const cumDist = [0];
+  for (let i = 0; i < segmentLengths.length; i++) {
+    cumDist.push(cumDist[i] + segmentLengths[i]);
+  }
 
-  for (let i = 0; i < routeGeometry.length - 1; i++) {
-    const a = [routeGeometry[i].lat, routeGeometry[i].lon];
-    const b = [routeGeometry[i + 1].lat, routeGeometry[i + 1].lon];
-    const info = pointSegmentInfo([point.lat, point.lon], a, b);
+  // The per-segment search. `startSeg` and `endSeg` are inclusive
+  // segment indices; the loop runs from startSeg to endSeg.
+  function searchRange(startSeg, endSeg) {
+    let bestLocal = null;
+    let bestLocalIndex = -1;
 
-    if (best === null || info.distance < best.distance) {
-      // Distance from start = sum of prior segments + fraction along this one.
-      let distanceFromStart = 0;
-      for (let j = 0; j < i; j++) {
-        distanceFromStart += segmentLengths[j];
+    for (let i = startSeg; i <= endSeg; i++) {
+      const a = [routeGeometry[i].lat, routeGeometry[i].lon];
+      const b = [routeGeometry[i + 1].lat, routeGeometry[i + 1].lon];
+      const info = pointSegmentInfo([point.lat, point.lon], a, b);
+
+      if (bestLocal === null || info.distance < bestLocal.distance) {
+        const distanceFromStart = cumDist[i] + info.t * segmentLengths[i];
+        const snappedLat = a[0] + (b[0] - a[0]) * info.t;
+        const snappedLon = a[1] + (b[1] - a[1]) * info.t;
+
+        bestLocal = {
+          lat: snappedLat,
+          lon: snappedLon,
+          distanceFromStartM: distanceFromStart,
+          offRouteM: info.distance,
+          segmentIndex: i,
+        };
+        bestLocalIndex = i;
       }
-      distanceFromStart += info.t * segmentLengths[i];
+    }
 
-      // Interpolate the snapped lat/lon.
-      const snappedLat = a[0] + (b[0] - a[0]) * info.t;
-      const snappedLon = a[1] + (b[1] - a[1]) * info.t;
+    return bestLocal;
+  }
 
-      best = {
-        lat: snappedLat,
-        lon: snappedLon,
-        distanceFromStartM: distanceFromStart,
-        offRouteM: info.distance,
-      };
+  const lastSegment = routeGeometry.length - 2; // last valid segment index
+
+  // If we have a previous index, try the window first.
+  if (nearIndex != null) {
+    const startSeg = Math.max(0, nearIndex - window);
+    const endSeg = Math.min(lastSegment, nearIndex + window);
+
+    const windowBest = searchRange(startSeg, endSeg);
+
+    // If the window found a good enough match, use it. Otherwise fall
+    // through to a full search — the snap has drifted and we need to
+    // re-find ourselves.
+    if (windowBest !== null && windowBest.offRouteM <= fallbackThresholdM) {
+      return windowBest;
     }
   }
 
-  return best;
+  // Full search — first fix, no nearIndex, or the window failed.
+  return searchRange(0, lastSegment);
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\media.js ---
