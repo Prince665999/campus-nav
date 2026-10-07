@@ -20,6 +20,9 @@ class PlaceSummary(BaseModel):
     category: str | None = None
     category_icon_key: str | None = None
     intents: str | None = None
+    kind: str = "outdoor"
+    level: str | None = None
+    room_name: str | None = None
     location: LatLon
     is_landmark: bool = False
     primary_photo_url: str | None = None
@@ -43,6 +46,9 @@ class PlaceDetail(BaseModel):
     description: str | None = None
     category: str | None = None
     intents: str | None = None
+    kind: str = "outdoor"
+    level: str | None = None
+    room_name: str | None = None
     ref: str | None = None
     location: LatLon
     wheelchair: str | None = None
@@ -58,6 +64,7 @@ class PlaceListParams(BaseModel):
     q: str | None = None
     category: str | None = None
     intent: str | None = None
+    kind: str | None = None
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)

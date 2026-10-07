@@ -15,6 +15,9 @@ load_dotenv(_BACKEND_DIR / ".env")
 DATA_DIR = _BACKEND_DIR / "data"
 
 MAP_OSM_PATH = Path(os.environ.get("MAP_OSM_PATH", DATA_DIR / "map.osm"))
+INDOOR_OSM_PATH = Path(
+    os.environ.get("INDOOR_OSM_PATH", DATA_DIR / "final.osm")
+)
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "campus.db"))
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 
@@ -52,7 +55,7 @@ INGEST_REPLACE = os.environ.get("INGEST_REPLACE", "false").lower() == "true"
 # Media
 # ---------------------------------------------------------------------------
 
-MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://192.168.100.148:8000")
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://localhost:8000")
 MEDIA_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 
 MEDIA_VARIANTS = [
@@ -66,33 +69,24 @@ MEDIA_VARIANTS = [
 # Knowledge base
 # ---------------------------------------------------------------------------
 
-# Where ChromaDB stores its data. A folder on disk, not a server.
 CHROMA_DIR = Path(os.environ.get("CHROMA_DIR", DATA_DIR / "chroma"))
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
-# The collection name in Chroma. All knowledge chunks live here.
 CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "campus_knowledge")
 
-# The embedding model. all-MiniLM-L6-v2 is 80 MB, runs on CPU, and
-# produces 384-dimension vectors. Good enough for a campus knowledge
-# base and free.
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
-# Where uploaded knowledge documents live before processing.
 KNOWLEDGE_UPLOAD_DIR = Path(
     os.environ.get("KNOWLEDGE_UPLOAD_DIR", DATA_DIR / "knowledge")
 )
 KNOWLEDGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Maximum size of an uploaded document, in bytes. 25 MB.
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(
     os.environ.get("KNOWLEDGE_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
 )
 
-# Chunk size in words (not tokens — a simple approximation).
 KNOWLEDGE_CHUNK_WORDS = int(os.environ.get("KNOWLEDGE_CHUNK_WORDS", 300))
 
-# How many chunks to retrieve per query.
 KNOWLEDGE_TOP_K = int(os.environ.get("KNOWLEDGE_TOP_K", 5))
 
 

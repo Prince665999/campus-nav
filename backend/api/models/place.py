@@ -6,6 +6,14 @@ a gate, a specific room. This is what routing can start from and end at.
 
 Points come from OSM nodes with a `name` tag. Areas (polygons) live in
 a separate table because they are walked past, not routed to.
+
+Two kinds of place:
+  - outdoor: from map.osm (named OSM nodes)
+  - indoor:  from final.osm (door nodes inside buildings)
+
+Indoor places carry `level` and `room_name`. Outdoor places leave them
+null. The `kind` column lets search filter and lets the mobile UI style
+each type differently.
 """
 
 from sqlalchemy import Float, Index, String, Text, func
@@ -39,9 +47,20 @@ class Place(Base, TimestampMixin):
 
     # Free-text list of intents this place serves, semicolon-separated.
     # Examples: "eat; study; wifi", "print; study".
-    # Used by the Explore screen to filter places by what a student
-    # wants to *do*, as opposed to what the place *is* (category).
     intents: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Where this place lives: "outdoor" or "indoor".
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="outdoor", index=True
+    )
+
+    # For indoor places: the level the door is on, e.g. "0", "1", "-1".
+    # Nullable for outdoor places, which don't have levels.
+    level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # For indoor places: the room this door serves, if any. Free text,
+    # read from the room polygon's name or ref. Nullable.
+    room_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Coordinates. Kept as separate lat/lon columns for ease of read;
     # Phase 13 adds a proper geometry column alongside these.
@@ -66,7 +85,8 @@ class Place(Base, TimestampMixin):
         Index("ix_places_name_lower", func.lower(name)),
         Index("ix_places_category", category),
         Index("ix_places_osm_id", osm_id),
+        Index("ix_places_kind", kind),
     )
 
     def __repr__(self):
-        return f"<Place id={self.id} name={self.name!r}>"
+        return f"<Place id={self.id} name={self.name!r} kind={self.kind!r}>"

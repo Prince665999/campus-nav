@@ -20,28 +20,41 @@ def list_places(
     q: str | None = Query(None, description="Substring match on name"),
     category: str | None = Query(None),
     intent: str | None = Query(None, description="Substring match on intents"),
+    kind: str | None = Query(
+        None, description="Filter by kind: 'outdoor' or 'indoor'"
+    ),
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
     radius_m: float = Query(500, gt=0, le=5000),
     limit: int = Query(50, gt=0, le=200),
     session: Session = Depends(db_session),
 ):
-    """List places, optionally filtered by query, category, intent, or
-    proximity."""
+    """List places, optionally filtered by query, category, intent,
+    kind, or proximity."""
     return place_service.search_places(
-        session, q=q, category=category, intent=intent, lat=lat, lon=lon,
-        radius_m=radius_m, limit=limit,
+        session,
+        q=q,
+        category=category,
+        intent=intent,
+        kind=kind,
+        lat=lat,
+        lon=lon,
+        radius_m=radius_m,
+        limit=limit,
     )
 
 
 @router.get("/search", response_model=list[PlaceSummary])
 def search_places(
     q: str = Query(..., min_length=1),
+    kind: str | None = Query(None),
     limit: int = Query(20, gt=0, le=100),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
-    return place_service.search_places(session, q=q, limit=limit)
+    return place_service.search_places(
+        session, q=q, kind=kind, limit=limit
+    )
 
 
 @router.get("/{place_id}", response_model=PlaceDetail)

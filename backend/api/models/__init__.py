@@ -6,6 +6,8 @@ from .admin_user import AdminUser
 from .area import Area
 from .base import Base, TimestampMixin
 from .favorite import Favorite
+from .indoor_area import IndoorArea
+from .indoor_path_edge import IndoorPathEdge
 from .knowledge_document import KnowledgeDocument
 from .media import Media
 from .path_edge import PathEdge
@@ -23,6 +25,8 @@ __all__ = [
     "Place",
     "Area",
     "PathEdge",
+    "IndoorArea",
+    "IndoorPathEdge",
     "Media",
     "RecentDestination",
     "Favorite",

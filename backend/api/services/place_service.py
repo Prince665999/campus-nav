@@ -62,6 +62,9 @@ def _to_summary(session, place: Place) -> PlaceSummary:
         category=place.category,
         category_icon_key=_icon_key_for_category(place.category),
         intents=place.intents,
+        kind=place.kind,
+        level=place.level,
+        room_name=place.room_name,
         location=LatLon(lat=place.lat, lon=place.lon),
         is_landmark=place.is_landmark,
         primary_photo_url=_primary_photo_for(session, place.id),
@@ -77,6 +80,9 @@ def _to_detail(session, place: Place) -> PlaceDetail:
         description=place.description,
         category=place.category,
         intents=place.intents,
+        kind=place.kind,
+        level=place.level,
+        room_name=place.room_name,
         ref=place.ref,
         location=LatLon(lat=place.lat, lon=place.lon),
         wheelchair=place.wheelchair,
@@ -92,6 +98,7 @@ def search_places(
     q: str | None = None,
     category: str | None = None,
     intent: str | None = None,
+    kind: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
     radius_m: float = 500,
@@ -103,6 +110,7 @@ def search_places(
     - q: case-insensitive substring against name, name_sw, alt_names
     - category: exact match against the category column
     - intent: case-insensitive substring against the intents column
+    - kind: "outdoor" or "indoor"
     - lat/lon/radius_m: proximity filter
     """
     query = session.query(Place)
@@ -125,6 +133,9 @@ def search_places(
         query = query.filter(
             func.lower(func.coalesce(Place.intents, "")).like(needle)
         )
+
+    if kind:
+        query = query.filter(Place.kind == kind)
 
     if lat is not None and lon is not None:
         import math
