@@ -11105,6 +11105,137 @@ def downgrade():
 
     op.drop_column("places", "intents")
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\migrations\versions\0006_place_kind_level_room.py ---
+
+"""Add kind, level, room_name to places.
+
+Revision ID: 0006
+Revises: 0005
+
+Adds three columns to `places`:
+  - kind: "outdoor" (default) or "indoor"
+  - level: for indoor places, the floor; null for outdoor
+  - room_name: for indoor places, the room this door serves
+
+Existing rows get kind="outdoor" and null for the other two.
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0006"
+down_revision = "0005"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.add_column(
+        "places",
+        sa.Column("kind", sa.String(16), nullable=False, server_default="outdoor"),
+    )
+    op.add_column("places", sa.Column("level", sa.String(16), nullable=True))
+    op.add_column("places", sa.Column("room_name", sa.String(255), nullable=True))
+    op.create_index("ix_places_kind", "places", ["kind"])
+
+    # Existing rows already get "outdoor" from the server_default.
+    # Nothing else to do.
+
+
+def downgrade():
+    op.drop_index("ix_places_kind", table_name="places")
+    op.drop_column("places", "room_name")
+    op.drop_column("places", "level")
+    op.drop_column("places", "kind")
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\migrations\versions\0007_indoor_areas_and_edges.py ---
+
+"""Add indoor_areas and indoor_path_edges tables.
+
+Revision ID: 0007
+Revises: 0006
+
+Two new tables, parallel to the outdoor `areas` and `path_edges`
+tables. Not read during routing (the indoor engine reads final.osm
+directly), but stored for admin visibility and future health checks.
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0007"
+down_revision = "0006"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    # --- indoor_areas ---
+    op.create_table(
+        "indoor_areas",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("osm_type", sa.String(16), nullable=False),
+        sa.Column("osm_id", sa.String(32), nullable=False, unique=True),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("ref", sa.String(64), nullable=True),
+        sa.Column("level", sa.String(16), nullable=True),
+        sa.Column("geometry_wkt", sa.Text(), nullable=False),
+        sa.Column("door_node_id", sa.String(32), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index(
+        "ix_indoor_areas_name_lower",
+        "indoor_areas",
+        [sa.text("lower(name)")],
+    )
+    op.create_index("ix_indoor_areas_level", "indoor_areas", ["level"])
+    op.create_index("ix_indoor_areas_osm_id", "indoor_areas", ["osm_id"])
+    op.create_index(
+        "ix_indoor_areas_door_node_id", "indoor_areas", ["door_node_id"]
+    )
+
+    # --- indoor_path_edges ---
+    op.create_table(
+        "indoor_path_edges",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("node_a_osm", sa.String(32), nullable=False),
+        sa.Column("node_b_osm", sa.String(32), nullable=False),
+        sa.Column("length_m", sa.Float(), nullable=False),
+        sa.Column("highway", sa.String(32), nullable=True),
+        sa.Column("level", sa.String(32), nullable=True),
+        sa.Column("kind", sa.String(16), nullable=False, server_default="walk"),
+        sa.Column(
+            "corridor", sa.Boolean(), nullable=False, server_default="0"
+        ),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index(
+        "ix_indoor_path_edges_node_a_osm", "indoor_path_edges", ["node_a_osm"]
+    )
+    op.create_index(
+        "ix_indoor_path_edges_node_b_osm", "indoor_path_edges", ["node_b_osm"]
+    )
+    op.create_index(
+        "ix_indoor_path_edges_level", "indoor_path_edges", ["level"]
+    )
+    op.create_index(
+        "ix_indoor_path_edges_kind", "indoor_path_edges", ["kind"]
+    )
+    op.create_index(
+        "ix_indoor_path_edges_pair",
+        "indoor_path_edges",
+        ["node_a_osm", "node_b_osm"],
+        unique=True,
+    )
+
+
+def downgrade():
+    op.drop_table("indoor_path_edges")
+    op.drop_table("indoor_areas")
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\session.py ---
 
 """
@@ -11783,6 +11914,137 @@ class Favorite(Base, TimestampMixin):
 
 
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\indoor_area.py ---
+
+"""
+indoor_area.py
+
+A room or named area inside a building, as a polygon.
+
+These are NOT routable — the routing endpoints are door nodes. Areas
+exist so the mobile app can draw floor plans, and so an admin can
+search for "Room 302" and see the room's geometry.
+
+The `door_node_id` links the room to the door node(s) that serve it.
+If a room has multiple doors, only the primary one is stored here;
+the ingest can be extended later if that matters.
+"""
+
+from sqlalchemy import Index, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .base import Base, TimestampMixin
+
+
+class IndoorArea(Base, TimestampMixin):
+    __tablename__ = "indoor_areas"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # OSM identity of the polygon way
+    osm_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "way"
+    osm_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # The floor the room is on, e.g. "0", "1", "-1".
+    level: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+
+    # WKT "POLYGON((lon lat, ...))"
+    geometry_wkt: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # The door node that opens into this room, if any. Matches
+    # Place.osm_id for the corresponding indoor Place row.
+    door_node_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+
+    __table_args__ = (
+        Index("ix_indoor_areas_name_lower", name),
+        Index("ix_indoor_areas_level", level),
+        Index("ix_indoor_areas_osm_id", osm_id),
+    )
+
+    def __repr__(self):
+        return f"<IndoorArea id={self.id} name={self.name!r} level={self.level!r}>"
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\indoor_path_edge.py ---
+
+"""
+indoor_path_edge.py
+
+One row per edge in the indoor routing graph — a segment between two
+indoor nodes (doors, corridor junctions, stair endpoints) that a
+student can walk along.
+
+Edges come from indoor ways tagged highway=footway, highway=corridor,
+or highway=steps. The `kind` column distinguishes walking edges from
+stairs.
+
+Not read during routing — the indoor engine reads final.osm directly
+and builds its graph in memory. This table exists so admins can
+inspect indoor path data the same way they inspect outdoor path data,
+and so future health checks have something to query.
+"""
+
+from sqlalchemy import Boolean, Float, Index, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .base import Base, TimestampMixin
+
+
+class IndoorPathEdge(Base, TimestampMixin):
+    __tablename__ = "indoor_path_edges"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # OSM node ids at each end of the edge.
+    node_a_osm: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    node_b_osm: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+
+    # Physical length, computed once at ingest.
+    length_m: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # The way's highway tag: "footway", "corridor", "path", or "steps".
+    highway: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # The level this edge is on. For stairs, "0;1" means it connects
+    # those two levels. For corridors, a single value like "0".
+    level: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+
+    # "walk" for ordinary edges, "stairs" for steps. Matches the
+    # `kind` field the frozen indoor engine uses at routing time.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="walk", index=True
+    )
+
+    # Whether the way this edge belongs to is tagged corridor=yes.
+    # Used by the narration to decide whether to say "the corridor".
+    corridor: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Optional description, if the way has a description tag.
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_indoor_path_edges_pair",
+            "node_a_osm",
+            "node_b_osm",
+            unique=True,
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<IndoorPathEdge {self.node_a_osm}--{self.node_b_osm} "
+            f"{self.length_m:.1f}m {self.kind}>"
+        )
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\knowledge_document.py ---
 
 """
@@ -11965,6 +12227,14 @@ a gate, a specific room. This is what routing can start from and end at.
 
 Points come from OSM nodes with a `name` tag. Areas (polygons) live in
 a separate table because they are walked past, not routed to.
+
+Two kinds of place:
+  - outdoor: from map.osm (named OSM nodes)
+  - indoor:  from final.osm (door nodes inside buildings)
+
+Indoor places carry `level` and `room_name`. Outdoor places leave them
+null. The `kind` column lets search filter and lets the mobile UI style
+each type differently.
 """
 
 from sqlalchemy import Float, Index, String, Text, func
@@ -11998,9 +12268,20 @@ class Place(Base, TimestampMixin):
 
     # Free-text list of intents this place serves, semicolon-separated.
     # Examples: "eat; study; wifi", "print; study".
-    # Used by the Explore screen to filter places by what a student
-    # wants to *do*, as opposed to what the place *is* (category).
     intents: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Where this place lives: "outdoor" or "indoor".
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="outdoor", index=True
+    )
+
+    # For indoor places: the level the door is on, e.g. "0", "1", "-1".
+    # Nullable for outdoor places, which don't have levels.
+    level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # For indoor places: the room this door serves, if any. Free text,
+    # read from the room polygon's name or ref. Nullable.
+    room_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Coordinates. Kept as separate lat/lon columns for ease of read;
     # Phase 13 adds a proper geometry column alongside these.
@@ -12025,10 +12306,11 @@ class Place(Base, TimestampMixin):
         Index("ix_places_name_lower", func.lower(name)),
         Index("ix_places_category", category),
         Index("ix_places_osm_id", osm_id),
+        Index("ix_places_kind", kind),
     )
 
     def __repr__(self):
-        return f"<Place id={self.id} name={self.name!r}>"
+        return f"<Place id={self.id} name={self.name!r} kind={self.kind!r}>"
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\program.py ---
 
@@ -12497,6 +12779,8 @@ from .admin_user import AdminUser
 from .area import Area
 from .base import Base, TimestampMixin
 from .favorite import Favorite
+from .indoor_area import IndoorArea
+from .indoor_path_edge import IndoorPathEdge
 from .knowledge_document import KnowledgeDocument
 from .media import Media
 from .path_edge import PathEdge
@@ -12514,6 +12798,8 @@ __all__ = [
     "Place",
     "Area",
     "PathEdge",
+    "IndoorArea",
+    "IndoorPathEdge",
     "Media",
     "RecentDestination",
     "Favorite",
@@ -14404,28 +14690,41 @@ def list_places(
     q: str | None = Query(None, description="Substring match on name"),
     category: str | None = Query(None),
     intent: str | None = Query(None, description="Substring match on intents"),
+    kind: str | None = Query(
+        None, description="Filter by kind: 'outdoor' or 'indoor'"
+    ),
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
     radius_m: float = Query(500, gt=0, le=5000),
     limit: int = Query(50, gt=0, le=200),
     session: Session = Depends(db_session),
 ):
-    """List places, optionally filtered by query, category, intent, or
-    proximity."""
+    """List places, optionally filtered by query, category, intent,
+    kind, or proximity."""
     return place_service.search_places(
-        session, q=q, category=category, intent=intent, lat=lat, lon=lon,
-        radius_m=radius_m, limit=limit,
+        session,
+        q=q,
+        category=category,
+        intent=intent,
+        kind=kind,
+        lat=lat,
+        lon=lon,
+        radius_m=radius_m,
+        limit=limit,
     )
 
 
 @router.get("/search", response_model=list[PlaceSummary])
 def search_places(
     q: str = Query(..., min_length=1),
+    kind: str | None = Query(None),
     limit: int = Query(20, gt=0, le=100),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
-    return place_service.search_places(session, q=q, limit=limit)
+    return place_service.search_places(
+        session, q=q, kind=kind, limit=limit
+    )
 
 
 @router.get("/{place_id}", response_model=PlaceDetail)
@@ -15275,6 +15574,9 @@ class PlaceSummary(BaseModel):
     category: str | None = None
     category_icon_key: str | None = None
     intents: str | None = None
+    kind: str = "outdoor"
+    level: str | None = None
+    room_name: str | None = None
     location: LatLon
     is_landmark: bool = False
     primary_photo_url: str | None = None
@@ -15298,6 +15600,9 @@ class PlaceDetail(BaseModel):
     description: str | None = None
     category: str | None = None
     intents: str | None = None
+    kind: str = "outdoor"
+    level: str | None = None
+    room_name: str | None = None
     ref: str | None = None
     location: LatLon
     wheelchair: str | None = None
@@ -15313,6 +15618,7 @@ class PlaceListParams(BaseModel):
     q: str | None = None
     category: str | None = None
     intent: str | None = None
+    kind: str | None = None
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)
@@ -16648,6 +16954,407 @@ def reset():
         _edge_tags = None
         _areas = None
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\indoor_graph_builder.py ---
+
+"""
+indoor_graph_builder.py
+
+Builds an enriched routing graph that contains both indoor and
+outdoor nodes, so a single A* run can route across the two worlds.
+
+Reads:
+  - final.osm (indoor) via the frozen indoor engine.
+  - map.osm   (outdoor) via the outdoor engine.
+
+Produces (in memory):
+  - nodes: dict of node_id -> {"lat", "lon", "tags"}
+    Indoor node ids are as-is from final.osm.
+    Outdoor node ids are prefixed with "o" so they can never collide
+    with indoor ids.
+  - graph: dict of node_id -> [(neighbor_id, distance_m, edge_info)]
+    Combines the indoor graph from the frozen engine with outdoor
+    walkable edges and synthetic "connector" edges between indoor
+    entrances and nearby outdoor nodes.
+  - door_node_ids, corridor_of_door, stair_ways: taken straight from
+    the frozen indoor engine's build_graph.
+  - entrance_to_outdoor: dict mapping indoor entrance node id ->
+    outdoor node id (the link the builder created).
+
+Cached in memory after first build. Call reset() to force a rebuild
+(used by tests and by admin actions that change the maps).
+"""
+
+import logging
+import threading
+from pathlib import Path
+
+from backend.api.settings import INDOOR_OSM_PATH, MAP_OSM_PATH
+from backend.core import campus_graph as outdoor_graph
+from backend.core.indoor import campus_graph as indoor_graph
+
+logger = logging.getLogger(__name__)
+
+_lock = threading.Lock()
+
+# The enriched graph is a tuple of everything the composer and the
+# indoor engine need.
+_built = None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def get_indoor_graph():
+    """
+    Return the enriched indoor+outdoor graph bundle. Builds on first
+    call, caches forever after.
+
+    Returns a dict with keys:
+      nodes, graph, edge_tags, door_node_ids, entrance_node_ids,
+      corridor_of_door, rooms, stair_ways,
+      entrance_to_outdoor (dict of indoor_entrance_id -> outdoor_node_id),
+      outdoor_node_ids (set),
+      indoor_node_ids (set)
+    """
+    global _built
+    if _built is not None:
+        return _built
+
+    with _lock:
+        if _built is not None:
+            return _built
+        _built = _build()
+        return _built
+
+
+def reset():
+    """Force the next get_indoor_graph() to rebuild."""
+    global _built
+    with _lock:
+        _built = None
+
+
+def is_indoor_node(node_id, bundle=None) -> bool:
+    """True if the node id came from the indoor map (no 'o' prefix)."""
+    if bundle is None:
+        bundle = get_indoor_graph()
+    if not isinstance(node_id, str):
+        node_id = str(node_id)
+    return node_id in bundle["indoor_node_ids"]
+
+
+def is_outdoor_node(node_id, bundle=None) -> bool:
+    """True if the node id came from the outdoor map ('o' prefix)."""
+    if bundle is None:
+        bundle = get_indoor_graph()
+    if not isinstance(node_id, str):
+        node_id = str(node_id)
+    return node_id in bundle["outdoor_node_ids"]
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+def _build():
+    """Read both maps, merge, link. Returns the bundle dict."""
+    indoor_path = Path(INDOOR_OSM_PATH)
+    outdoor_path = Path(MAP_OSM_PATH)
+
+    if not indoor_path.exists():
+        raise FileNotFoundError(f"indoor map not found at {indoor_path}")
+    if not outdoor_path.exists():
+        raise FileNotFoundError(f"outdoor map not found at {outdoor_path}")
+
+    logger.info("Building indoor graph from %s", indoor_path)
+    indoor_nodes, indoor_ways = indoor_graph.parse_osm(str(indoor_path))
+    (
+        graph,
+        edge_tags,
+        door_node_ids,
+        entrance_node_ids,
+        corridor_of_door,
+        rooms,
+        stair_ways,
+    ) = indoor_graph.build_graph(indoor_nodes, indoor_ways)
+
+    # The frozen engine's `nodes` dict is what we'll extend with
+    # outdoor nodes. Keep the indoor node tags as they are.
+    nodes = indoor_nodes
+
+    logger.info("Reading outdoor map %s", outdoor_path)
+    outdoor_nodes_raw, outdoor_ways = outdoor_graph.parse_osm(str(outdoor_path))
+    outdoor_walkable_ids, outdoor_edges = _extract_outdoor_walkable(
+        outdoor_nodes_raw, outdoor_ways
+    )
+
+    # Add outdoor nodes to the merged `nodes` dict, prefixed with "o".
+    for oid in outdoor_walkable_ids:
+        node = outdoor_nodes_raw[oid]
+        nodes["o" + oid] = {
+            "lat": node["lat"],
+            "lon": node["lon"],
+            "tags": node["tags"],
+        }
+
+    # Add outdoor edges to the merged graph, prefixed on both ends.
+    for a, b, distance, tags in outdoor_edges:
+        edge_info = {
+            "kind": "walk",
+            "level": "0",
+            "way_tags": tags,
+            "outdoor": True,
+        }
+        graph.setdefault("o" + a, []).append(("o" + b, distance, edge_info))
+        graph.setdefault("o" + b, []).append(("o" + a, distance, edge_info))
+        edge_tags[frozenset(("o" + a, "o" + b))] = tags
+
+    # Link indoor entrances to nearest outdoor nodes.
+    entrance_to_outdoor = _link_entrances(
+        indoor_ways, nodes, graph, edge_tags, outdoor_walkable_ids,
+        outdoor_nodes_raw,
+    )
+
+    # Distinguish indoor from outdoor nodes by the "o" prefix. Any
+    # node in `nodes` whose id does not start with "o" is indoor.
+    indoor_node_ids = {nid for nid in nodes if not nid.startswith("o")}
+    outdoor_node_ids = {"o" + oid for oid in outdoor_walkable_ids}
+
+    logger.info(
+        "Indoor graph built: %d total nodes, %d outdoor nodes, %d entrances linked",
+        len(nodes),
+        len(outdoor_walkable_ids),
+        len(entrance_to_outdoor),
+    )
+
+    return {
+        "nodes": nodes,
+        "graph": graph,
+        "edge_tags": edge_tags,
+        "door_node_ids": door_node_ids,
+        "entrance_node_ids": entrance_node_ids,
+        "corridor_of_door": corridor_of_door,
+        "rooms": rooms,
+        "stair_ways": stair_ways,
+        "entrance_to_outdoor": entrance_to_outdoor,
+        "outdoor_node_ids": outdoor_node_ids,
+        "indoor_node_ids": indoor_node_ids,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Outdoor extraction
+# ---------------------------------------------------------------------------
+
+# Highway types we treat as walkable outdoors. Matches the outdoor
+# engine's own set (footway, path, pedestrian, etc.).
+_OUTDOOR_WALKABLE_HIGHWAYS = {
+    "footway",
+    "path",
+    "pedestrian",
+    "steps",
+    "track",
+    "living_street",
+    "service",
+}
+
+# Highway types we deliberately skip even if they're not in the skip
+# list, because they're not walkable.
+_OUTDOOR_SKIP_HIGHWAYS = {
+    "motorway",
+    "motorway_link",
+    "trunk",
+    "trunk_link",
+    "primary",
+    "primary_link",
+    "secondary",
+    "secondary_link",
+    "tertiary",
+    "tertiary_link",
+    "construction",
+    "proposed",
+    "raceway",
+}
+
+
+def _extract_outdoor_walkable(nodes, ways):
+    """
+    Walk the outdoor ways, keep only walkable ones, and return:
+      walkable_node_ids: set of OSM ids that appear on a walkable way
+      edges: list of (a, b, distance_m, tags)
+    """
+    walkable_ids = set()
+    edges = []
+
+    for way in ways:
+        tags = way.get("tags", {})
+        hw = tags.get("highway")
+        if not hw:
+            continue
+        if hw in _OUTDOOR_SKIP_HIGHWAYS:
+            continue
+        if hw not in _OUTDOOR_WALKABLE_HIGHWAYS:
+            continue
+        if tags.get("foot") == "no":
+            continue
+        if tags.get("access") in ("private", "no"):
+            continue
+
+        refs = way.get("refs", [])
+        for i in range(len(refs) - 1):
+            a, b = refs[i], refs[i + 1]
+            if a not in nodes or b not in nodes:
+                continue
+            distance = outdoor_graph.haversine_m(
+                nodes[a]["lat"], nodes[a]["lon"],
+                nodes[b]["lat"], nodes[b]["lon"],
+            )
+            edges.append((a, b, distance, tags))
+            walkable_ids.add(a)
+            walkable_ids.add(b)
+
+    return walkable_ids, edges
+
+
+# ---------------------------------------------------------------------------
+# Entrance linking
+# ---------------------------------------------------------------------------
+
+# A connector's outdoor end must be within this many metres of an
+# outdoor walkable node for the link to be made. If it's further,
+# something is misaligned and we skip rather than guess.
+CONNECTOR_SNAP_TOLERANCE_M = 5.0
+
+
+def _link_entrances(
+    indoor_ways, nodes, graph, edge_tags, outdoor_walkable_ids, outdoor_nodes_raw
+):
+    """
+    Walk the indoor ways looking for `indoor=connector`. For each:
+
+      - One end is an entrance node (has an `entrance` tag).
+      - The other end is a placeholder sitting at (or near) an outdoor
+        node's coordinates.
+
+    Snap the outdoor end to the nearest outdoor walkable node within
+    CONNECTOR_SNAP_TOLERANCE_M and add a synthetic edge between the
+    entrance node and that outdoor node.
+
+    Returns a dict: indoor_entrance_id -> outdoor_node_id (prefixed "o").
+    """
+    entrance_to_outdoor = {}
+
+    for way in indoor_ways:
+        tags = way.get("tags", {})
+        if tags.get("indoor") != "connector":
+            continue
+
+        refs = way.get("refs", [])
+        if len(refs) < 2:
+            continue
+
+        # Look at both ends. Whichever is tagged as an entrance is
+        # the indoor side; the other is the outdoor attachment point.
+        a, b = refs[0], refs[-1]
+
+        a_is_entrance = (
+            a in nodes and bool(nodes[a]["tags"].get("entrance"))
+        )
+        b_is_entrance = (
+            b in nodes and bool(nodes[b]["tags"].get("entrance"))
+        )
+
+        if a_is_entrance and not b_is_entrance:
+            entrance_id, attach_id = a, b
+        elif b_is_entrance and not a_is_entrance:
+            entrance_id, attach_id = b, a
+        else:
+            # Neither or both tagged. Skip with a warning — the data
+            # needs attention.
+            logger.warning(
+                "Connector way %s has %s entrance-tagged ends; skipping",
+                way.get("id"),
+                "two" if a_is_entrance else "no",
+            )
+            continue
+
+        if attach_id not in nodes:
+            logger.warning(
+                "Connector way %s references missing node %s",
+                way.get("id"), attach_id,
+            )
+            continue
+
+        attach = nodes[attach_id]
+        nearest = _nearest_outdoor_node(
+            attach["lat"], attach["lon"],
+            outdoor_walkable_ids, outdoor_nodes_raw,
+            CONNECTOR_SNAP_TOLERANCE_M,
+        )
+
+        if nearest is None:
+            logger.warning(
+                "Connector way %s: no outdoor node within %.0fm of "
+                "(%.5f, %.5f). Is the connector's far end positioned "
+                "correctly?",
+                way.get("id"),
+                CONNECTOR_SNAP_TOLERANCE_M,
+                attach["lat"], attach["lon"],
+            )
+            continue
+
+        outdoor_node_id = "o" + nearest
+        distance = outdoor_graph.haversine_m(
+            attach["lat"], attach["lon"],
+            outdoor_nodes_raw[nearest]["lat"],
+            outdoor_nodes_raw[nearest]["lon"],
+        )
+
+        # Synthetic edge in both directions.
+        edge_info_out = {
+            "kind": "walk",
+            "level": "0",
+            "way_tags": {"highway": "footway", "indoor": "connector"},
+            "connector": True,
+        }
+        edge_info_in = dict(edge_info_out)
+
+        graph.setdefault(entrance_id, []).append(
+            (outdoor_node_id, distance, edge_info_out)
+        )
+        graph.setdefault(outdoor_node_id, []).append(
+            (entrance_id, distance, edge_info_in)
+        )
+        edge_tags[frozenset((entrance_id, outdoor_node_id))] = (
+            edge_info_out["way_tags"]
+        )
+
+        entrance_to_outdoor[entrance_id] = outdoor_node_id
+        logger.info(
+            "Linked entrance %s -> outdoor node %s (%.1fm)",
+            entrance_id, nearest, distance,
+        )
+
+    return entrance_to_outdoor
+
+
+def _nearest_outdoor_node(lat, lon, candidates, outdoor_nodes_raw, max_distance_m):
+    """Return the nearest candidate OSM id within max_distance_m, or None."""
+    best_id = None
+    best_dist = float("inf")
+    for oid in candidates:
+        node = outdoor_nodes_raw.get(oid)
+        if node is None:
+            continue
+        d = outdoor_graph.haversine_m(lat, lon, node["lat"], node["lon"])
+        if d < best_dist:
+            best_dist = d
+            best_id = oid
+    if best_id is None or best_dist > max_distance_m:
+        return None
+    return best_id
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\knowledge_service.py ---
 
 """
@@ -17922,6 +18629,9 @@ def _to_summary(session, place: Place) -> PlaceSummary:
         category=place.category,
         category_icon_key=_icon_key_for_category(place.category),
         intents=place.intents,
+        kind=place.kind,
+        level=place.level,
+        room_name=place.room_name,
         location=LatLon(lat=place.lat, lon=place.lon),
         is_landmark=place.is_landmark,
         primary_photo_url=_primary_photo_for(session, place.id),
@@ -17937,6 +18647,9 @@ def _to_detail(session, place: Place) -> PlaceDetail:
         description=place.description,
         category=place.category,
         intents=place.intents,
+        kind=place.kind,
+        level=place.level,
+        room_name=place.room_name,
         ref=place.ref,
         location=LatLon(lat=place.lat, lon=place.lon),
         wheelchair=place.wheelchair,
@@ -17952,6 +18665,7 @@ def search_places(
     q: str | None = None,
     category: str | None = None,
     intent: str | None = None,
+    kind: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
     radius_m: float = 500,
@@ -17963,6 +18677,7 @@ def search_places(
     - q: case-insensitive substring against name, name_sw, alt_names
     - category: exact match against the category column
     - intent: case-insensitive substring against the intents column
+    - kind: "outdoor" or "indoor"
     - lat/lon/radius_m: proximity filter
     """
     query = session.query(Place)
@@ -17985,6 +18700,9 @@ def search_places(
         query = query.filter(
             func.lower(func.coalesce(Place.intents, "")).like(needle)
         )
+
+    if kind:
+        query = query.filter(Place.kind == kind)
 
     if lat is not None and lon is not None:
         import math
@@ -18289,6 +19007,219 @@ def update_status(session: Session, report_id: int, status: str) -> bool:
         return False
     report.status = status
     return True
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\route_composer.py ---
+
+"""
+route_composer.py
+
+Decides which engine handles a route request.
+
+  - Both endpoints outdoor    →  outdoor engine (existing
+                                  routing_service, keeps the current
+                                  narration quality).
+  - Any endpoint indoor       →  indoor engine on the enriched graph.
+
+The mobile app sends `from_place_id` and `to_place_id`. Both are
+rows in the `places` table. We look up each place's `kind`, and
+dispatch accordingly.
+
+For indoor endpoints, the place's `osm_id` is the door node id
+in the enriched graph. For outdoor endpoints, the place's `osm_id`
+is the outdoor node id — but the enriched graph uses `"o"` prefixes
+for outdoor nodes, so we prefix when handing the id to the indoor
+engine.
+
+Nothing here touches the frozen files. This is the only place in the
+codebase that knows both engines exist.
+"""
+
+import logging
+
+from sqlalchemy.orm import Session
+
+from backend.api.models.place import Place
+
+from . import indoor_graph_builder
+
+logger = logging.getLogger(__name__)
+
+
+class RouteCompositionError(Exception):
+    """Raised when the request can't be routed by either engine."""
+
+
+# ---------------------------------------------------------------------------
+# Endpoint resolution
+# ---------------------------------------------------------------------------
+
+def _lookup_place(session: Session, place_id: int) -> Place:
+    place = session.query(Place).filter_by(id=place_id).one_or_none()
+    if place is None:
+        raise RouteCompositionError(f"Place {place_id} not found")
+    return place
+
+
+def _classify_endpoint(place: Place) -> dict:
+    """
+    Return a dict describing how to hand this endpoint to the engine:
+
+      { "engine": "outdoor"|"indoor",
+        "place_id": int,
+        "kind": "outdoor"|"indoor",
+        "node_id": str,         # node id in the enriched graph
+        "name": str }
+    """
+    kind = (place.kind or "outdoor").lower()
+    if kind == "indoor":
+        # Indoor door node. Its osm_id IS the node id in the
+        # enriched graph (no prefix, because it came from final.osm).
+        return {
+            "engine": "indoor",
+            "place_id": place.id,
+            "kind": "indoor",
+            "node_id": place.osm_id,
+            "name": place.name,
+        }
+    else:
+        # Outdoor place. The enriched graph stores outdoor nodes
+        # with an "o" prefix, so we prefix here. The outdoor engine
+        # still uses the raw OSM id, so we keep that separately for
+        # the outdoor path.
+        return {
+            "engine": "outdoor",
+            "place_id": place.id,
+            "kind": "outdoor",
+            "node_id": "o" + place.osm_id,
+            "osm_id": place.osm_id,
+            "name": place.name,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Composer
+# ---------------------------------------------------------------------------
+
+def compose_route(
+    session: Session,
+    from_place_id: int,
+    to_place_id: int,
+):
+    """
+    Return an indoor-engine route for now. The outdoor path is added
+    in Phase 5c once this is wired into `/api/route`.
+
+    This function exists so we can test the indoor engine on the
+    enriched graph independently of the API. When both endpoints are
+    outdoor, the caller (Phase 5c) will use the outdoor engine instead;
+    this function still handles the "at least one indoor" case.
+    """
+    from_place = _lookup_place(session, from_place_id)
+    to_place = _lookup_place(session, to_place_id)
+
+    from_ep = _classify_endpoint(from_place)
+    to_ep = _classify_endpoint(to_place)
+
+    # If neither endpoint is indoor, we still route via the indoor
+    # engine here — the caller decides whether to prefer the outdoor
+    # engine. This keeps the composer honest: it can always produce a
+    # route, regardless of endpoint kinds.
+    return _route_via_indoor_engine(from_ep, to_ep)
+
+
+def _route_via_indoor_engine(from_ep, to_ep):
+    """
+    Route from_ep["node_id"] to to_ep["node_id"] on the enriched graph.
+
+    Post-processes the frozen engine's steps to fix one cosmetic
+    issue: the frozen engine prepends "Starting from X on the ground
+    floor" to the first step, which reads wrong when X is an outdoor
+    place. If the start node is outdoor, we strip the floor suffix.
+    """
+    bundle = indoor_graph_builder.get_indoor_graph()
+
+    nodes = bundle["nodes"]
+    graph = bundle["graph"]
+    door_node_ids = bundle["door_node_ids"]
+    corridor_of_door = bundle["corridor_of_door"]
+    indoor_node_ids = bundle["indoor_node_ids"]
+
+    from_id = from_ep["node_id"]
+    to_id = to_ep["node_id"]
+
+    if from_id not in graph:
+        raise RouteCompositionError(
+            f"'{from_ep['name']}' is not connected to the walkable network."
+        )
+    if to_id not in graph:
+        raise RouteCompositionError(
+            f"'{to_ep['name']}' is not connected to the walkable network."
+        )
+
+    # Import lazily — these are the frozen indoor engine's functions.
+    from backend.core.indoor.campus_graph import (
+        a_star,
+        generate_turn_by_turn,
+        total_distance_m,
+    )
+
+    path, distance = a_star(graph, nodes, from_id, to_id)
+    if not path:
+        raise RouteCompositionError(
+            "No route found between those two points."
+        )
+
+    steps = generate_turn_by_turn(
+        path, nodes, graph, door_node_ids, corridor_of_door
+    )
+    total = total_distance_m(path, nodes)
+
+    # Cosmetic fix: strip the floor suffix from the opening line if
+    # the walk starts outdoors.
+    start_is_outdoor = from_id not in indoor_node_ids
+    steps = _fix_opening_line(
+        steps,
+        start_is_outdoor=start_is_outdoor,
+        start_name=from_ep["name"],
+    )
+
+    geometry = [
+        {"lat": nodes[nid]["lat"], "lon": nodes[nid]["lon"]}
+        for nid in path
+    ]
+
+    return {
+        "engine": "indoor",
+        "distance_m": total,
+        "steps": steps,
+        "geometry": geometry,
+        "from_name": from_ep["name"],
+        "to_name": to_ep["name"],
+    }
+
+
+def _fix_opening_line(steps, start_is_outdoor, start_name):
+    """
+    The frozen indoor engine produces an opening line like
+    "Starting from X on the ground floor". When X is an outdoor
+    place, "on the ground floor" doesn't apply. Strip it.
+
+    Only the first step is touched. Everything else is returned
+    unchanged, because the rest of the steps come from the outdoor
+    half and are already worded correctly by the frozen engine (the
+    outdoor walkways aren't tagged corridor=yes, so the engine treats
+    them as connecting paths and doesn't use corridor language).
+    """
+    if not start_is_outdoor:
+        return steps
+    if not steps:
+        return steps
+
+    opening = f"Starting from {start_name}" if start_name else "From your current position"
+
+    fixed = list(steps)
+    fixed[0] = {**fixed[0], "instruction": opening}
+    return fixed
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\routing_service.py ---
 
@@ -18966,6 +19897,9 @@ load_dotenv(_BACKEND_DIR / ".env")
 DATA_DIR = _BACKEND_DIR / "data"
 
 MAP_OSM_PATH = Path(os.environ.get("MAP_OSM_PATH", DATA_DIR / "map.osm"))
+INDOOR_OSM_PATH = Path(
+    os.environ.get("INDOOR_OSM_PATH", DATA_DIR / "final.osm")
+)
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "campus.db"))
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 
@@ -19003,7 +19937,7 @@ INGEST_REPLACE = os.environ.get("INGEST_REPLACE", "false").lower() == "true"
 # Media
 # ---------------------------------------------------------------------------
 
-MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://192.168.100.148:8000")
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "http://localhost:8000")
 MEDIA_MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 
 MEDIA_VARIANTS = [
@@ -19017,33 +19951,24 @@ MEDIA_VARIANTS = [
 # Knowledge base
 # ---------------------------------------------------------------------------
 
-# Where ChromaDB stores its data. A folder on disk, not a server.
 CHROMA_DIR = Path(os.environ.get("CHROMA_DIR", DATA_DIR / "chroma"))
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
-# The collection name in Chroma. All knowledge chunks live here.
 CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "campus_knowledge")
 
-# The embedding model. all-MiniLM-L6-v2 is 80 MB, runs on CPU, and
-# produces 384-dimension vectors. Good enough for a campus knowledge
-# base and free.
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
-# Where uploaded knowledge documents live before processing.
 KNOWLEDGE_UPLOAD_DIR = Path(
     os.environ.get("KNOWLEDGE_UPLOAD_DIR", DATA_DIR / "knowledge")
 )
 KNOWLEDGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Maximum size of an uploaded document, in bytes. 25 MB.
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(
     os.environ.get("KNOWLEDGE_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
 )
 
-# Chunk size in words (not tokens — a simple approximation).
 KNOWLEDGE_CHUNK_WORDS = int(os.environ.get("KNOWLEDGE_CHUNK_WORDS", 300))
 
-# How many chunks to retrieve per query.
 KNOWLEDGE_TOP_K = int(os.environ.get("KNOWLEDGE_TOP_K", 5))
 
 
@@ -20614,6 +21539,2027 @@ def total_distance_m(path, nodes):
         a, b = nodes[path[i]], nodes[path[i + 1]]
         total += haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
     return total
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\indoor\ai_navigator.py ---
+
+"""
+ai_navigator.py  –  AI-Narrated Indoor Navigation
+
+Same routing as turn_by_turn.py, but gathers the raw indoor
+turn-by-turn steps plus contextual info (nearby doors, rooms,
+corridor names) and asks an LLM to narrate the walk like a
+helpful friend who knows the building well.
+
+What the program works out (the AI only phrases it):
+- DOOR COUNTING: "the fourth door on your left". Only door NODES are
+  counted (never room areas), only on the left/right of the corridor you are
+  walking, and only when the stretch looks reliably mapped. The number is
+  computed in Python (campus_graph.analyze_route_doors) because language
+  models are unreliable at counting.
+- LANDMARKS: only doors that really sit beside the corridor you walk
+  (tight distance, same floor, attached to that corridor), at most two are
+  mentioned.
+- FEWER, LONGER SENTENCES: the raw steps are merged into "moves"
+  ("Turn left, then walk about 10 metres along the corridor") before the AI
+  sees them, so the narration isn't a list of two-word lines.
+
+The AI is instructed to:
+- Sound natural and conversational (like a person, not a GPS)
+- Never invent rooms, corridors, doors or landmarks not in the data
+- Never skip turns, stairs, or important navigation steps
+- Only mention rooms/doors on the same floor
+- Say "in front of you" when a destination door is straight ahead
+- Use the door count exactly as given, or give no number at all
+
+This file only changes the AI narration. turn_by_turn.py and the raw steps
+from generate_turn_by_turn() are unchanged.
+
+Setup:
+    pip install requests
+    Get a free API key from https://console.groq.com
+    Set it as an environment variable:
+
+        Windows (PowerShell):  $env:GROQ_API_KEY="your_key_here"
+        Mac/Linux:              export GROQ_API_KEY="your_key_here"
+
+    Or create a .env file in this directory:
+        GROQ_API_KEY=your_key_here
+
+Usage:
+    python ai_navigator.py map.osm
+"""
+
+import os
+import re
+import sys
+import json
+import requests
+
+from campus_graph import (
+    parse_osm, build_graph, named_nodes, find_named_node,
+    a_star, generate_turn_by_turn, total_distance_m, level_label,
+    node_display_name, is_door, is_entrance,
+    haversine_m, point_segment_info,
+    analyze_route_doors, alongside_doors, door_line_info,
+    DOOR_WINDOW_EXT_M,
+)
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# Landmarks must be right beside the corridor: in this map a door's stub is
+# 1–3 m long, so 3.5 m keeps real neighbours and drops rooms behind walls.
+LANDMARK_RADIUS_M = 3.5
+MIN_LANDMARK_GAP_M = 10     # don't mention rooms closer than this apart
+MAX_ANCHOR_LANDMARKS = 2    # the AI may name at most this many doors
+
+# Narration merging
+MAX_MOVES_PER_SENTENCE = 2  # a tiny move may be joined with the next one, never more
+MAX_ACTIONS_PER_SENTENCE = 3   # ...and a sentence never holds more than this many actions (turn / walk / stairs)
+CANCEL_DOUBLE_TURN_AROUNDS = True   # two "Turn around" in a row undo each other
+
+_ORDINALS = {1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+             6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth"}
+_NUMBER_WORDS = {0: "no", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+                 6: "six", 7: "seven", 8: "eight", 9: "nine"}
+
+
+def load_env_file():
+    """Load .env file if present (simple key=value pairs)."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    val = val.strip().strip('"').strip("'")
+                    os.environ.setdefault(key.strip(), val)
+
+
+# ───────────────────────────── Landmarks (tight) ─────────────────────────────
+
+def _landmark_label(name, loc, generic):
+    if generic:
+        return "an unlabelled door"
+    return f"{name} ({loc})" if loc else name
+
+
+def _space_out(landmarks):
+    """Keep landmarks at least MIN_LANDMARK_GAP_M apart along the route."""
+    ordered = sorted(landmarks, key=lambda e: e["meters_from_start"])
+    spaced = []
+    last_m = -MIN_LANDMARK_GAP_M  # allow the first one
+    for lm in ordered:
+        if lm["meters_from_start"] - last_m >= MIN_LANDMARK_GAP_M:
+            spaced.append(lm)
+            last_m = lm["meters_from_start"]
+    return spaced
+
+
+def _landmarks_from_analysis(analysis):
+    """Landmarks = named (or described) door nodes found BESIDE the corridor stretches."""
+    found = []
+    for e in alongside_doors(analysis):
+        if e["generic"] and not e["description"]:
+            continue  # skip generic "doorN" names unless they carry a description
+        found.append({
+            "name": _landmark_label(e["name"], e.get("loc_name", ""), e["generic"]),
+            "side": e["side"],
+            "meters_from_start": e["route_m"],
+            "distance_from_path": e["perp_m"],
+            "level": e["level"],
+            "description": e["description"],
+        })
+    return found
+
+
+def _landmarks_geometric(path, nodes, door_nodes):
+    """
+    Fallback when no graph is available: same tight rules, geometry only.
+    A door counts only if it is beside a segment (inside its length, not past its
+    ends), within LANDMARK_RADIUS_M of it, and on the same floor.
+    """
+    route_set = set(path)
+    found = {}
+    cumulative = 0.0
+    for i in range(len(path) - 1):
+        a_id, b_id = path[i], path[i + 1]
+        a = (nodes[a_id]["lat"], nodes[a_id]["lon"])
+        b = (nodes[b_id]["lat"], nodes[b_id]["lon"])
+        seg_length = haversine_m(a[0], a[1], b[0], b[1])
+        seg_level = nodes[a_id]["tags"].get("level", "0").split(";")[0]
+
+        for nid in door_nodes:
+            if nid in route_set:
+                continue
+            tags = nodes[nid]["tags"]
+            name = tags.get("name", "").strip()
+            desc = tags.get("description", "").strip()
+            is_generic = (not name) or (name.startswith("door") and name[4:].isdigit())
+            if is_generic and not desc:
+                continue
+            if tags.get("level", "0").split(";")[0] != seg_level:
+                continue  # SAME FLOOR ONLY
+
+            li = door_line_info((nodes[nid]["lat"], nodes[nid]["lon"]), a, b)
+            if li is None:
+                continue
+            perp, along, length, side = li
+            if perp > LANDMARK_RADIUS_M:
+                continue
+            if along < -DOOR_WINDOW_EXT_M or along > length + DOOR_WINDOW_EXT_M:
+                continue  # round a corner / past the end of this segment
+            entry = {
+                "name": _landmark_label(name, tags.get("loc_name", "").strip(), is_generic),
+                "side": side,
+                "meters_from_start": cumulative + max(0.0, min(along, length)),
+                "distance_from_path": perp,
+                "level": seg_level,
+                "description": desc,
+            }
+            if nid not in found or perp < found[nid]["distance_from_path"]:
+                found[nid] = entry
+        cumulative += seg_length
+    return list(found.values())
+
+
+def landmarks_along_route(path, nodes, door_nodes, graph=None, door_facts=None):
+    """
+    Returns an ORDERED list of notable doors/rooms right beside the route, with
+    side (left/right) and distance from the start.
+
+    Filters:
+    - Only door NODES beside the corridor you walk (within LANDMARK_RADIUS_M,
+      inside the stretch's length, attached to that corridor) — no rooms behind walls
+    - Skips generic "doorN" names (unless they have a description)
+    - Only the SAME FLOOR as the route segment
+    - Spaces out mentions: at most one every MIN_LANDMARK_GAP_M metres
+
+    Pass `graph` (and optionally `door_facts` from route_door_facts) to use the
+    corridor-aware version. Without a graph it falls back to geometry only.
+    """
+    analysis = door_facts
+    if analysis is None and graph is not None:
+        analysis = route_door_facts(path, nodes, graph, door_nodes)
+    if analysis and analysis.get("available"):
+        return _space_out(_landmarks_from_analysis(analysis))
+    return _space_out(_landmarks_geometric(path, nodes, door_nodes))
+
+
+def corridor_notes(path, nodes, corridor_of_door, graph):
+    """
+    Track when you enter/exit different corridors.
+    Returns a list of notes like "entering the main corridor".
+    """
+    notes = []
+    last_corridor = None
+
+    for nid in path:
+        cname = corridor_of_door.get(nid)
+        if cname and cname != last_corridor:
+            notes.append(f"entering {cname}")
+            last_corridor = cname
+
+    # ── Descriptions (description=* tags added in JOSM) ──
+    # Nodes on the route: start, destination, and anything in between.
+    cumulative = 0.0
+    way_seen = set()
+    for i, nid in enumerate(path):
+        tags = nodes[nid]["tags"]
+        desc = tags.get("description", "").strip()
+        if desc:
+            who = node_display_name(tags)
+            if i == 0:
+                notes.append(f"description of the starting point{' ' + who if who else ''}: {desc}")
+            elif i == len(path) - 1:
+                notes.append(f"description of the destination{' ' + who if who else ''}: {desc}")
+            else:
+                notes.append(
+                    f"description of {who or 'a point on the route'} "
+                    f"(~{cumulative:.0f}m into the route): {desc}"
+                )
+
+        # Ways (paths / corridors / stairs) used by the route
+        if i < len(path) - 1:
+            nxt = path[i + 1]
+            for nb, d, info in graph.get(nid, []):
+                if nb == nxt:
+                    wtags = info.get("way_tags", {})
+                    wdesc = wtags.get("description", "").strip()
+                    if wdesc and id(wtags) not in way_seen:
+                        way_seen.add(id(wtags))
+                        if info["kind"] == "stairs":
+                            kind = "stairs"
+                        elif str(wtags.get("corridor", "")).strip().lower() in ("yes", "true", "1"):
+                            kind = "corridor"
+                        else:
+                            kind = "connecting path"
+                        wname = wtags.get("name", "").strip()
+                        label = f"{kind} '{wname}'" if wname else kind
+                        notes.append(
+                            f"description of the {label} "
+                            f"(from ~{cumulative:.0f}m into the route): {wdesc}"
+                        )
+                    break
+            cumulative += haversine_m(
+                nodes[nid]["lat"], nodes[nid]["lon"],
+                nodes[nxt]["lat"], nodes[nxt]["lon"],
+            )
+
+    return notes
+
+
+# ───────────────────────────── Door-count facts ─────────────────────────────
+
+def route_door_facts(path, nodes, graph, door_nodes):
+    """
+    Door facts for this route (see campus_graph.analyze_route_doors).
+    Never raises: if anything goes wrong the narration simply has no door counts.
+    """
+    try:
+        return analyze_route_doors(path, nodes, graph, door_nodes)
+    except Exception as e:  # pragma: no cover - safety net
+        print(f"[door counting skipped] {e}")
+        return None
+
+
+def door_count_summary(door_facts):
+    """One-line, human-readable status (handy for the console / debugging)."""
+    if not door_facts:
+        return "Door count: not available (analysis failed)"
+    if not door_facts.get("available"):
+        return f"Door count: not used — {door_facts.get('reason') or 'not available'}"
+    dc = door_facts.get("destination") or {}
+    if dc.get("reliable"):
+        n, side = dc["ordinal"], dc["side"]
+        return f"Door count: destination is the {_ORDINALS.get(n, str(n))} door on your {side}"
+    return f"Door count: not used — {dc.get('reason') or 'not available'}"
+
+
+COUNT_MARKER = "   <<< DOOR COUNT HERE (say it before this move's turn)"
+
+
+def _count_is_usable(door_facts):
+    dc = (door_facts or {}).get("destination") if door_facts else None
+    return bool(door_facts and door_facts.get("available") and dc and dc.get("reliable"))
+
+
+def _door_count_block(door_facts):
+    """The DOOR COUNT section of the prompt (facts computed by Python, never by the AI)."""
+    dc = (door_facts or {}).get("destination") if door_facts else None
+    if not door_facts or not door_facts.get("available") or not dc or not dc.get("reliable"):
+        return ("  NOT AVAILABLE for this route. Do NOT give any door numbers and do NOT say "
+                "\"the first/second/third door\". Describe the arrival exactly as the step "
+                "list does.")
+
+    side = dc["side"]
+    n = dc["ordinal"]
+    passed = dc["passed"]
+    ord_word = _ORDINALS.get(n, f"number {n}")
+    lines = [
+        f"  - The destination is the {ord_word.upper()} door on your {side.upper()}, counting "
+        f"along the LAST stretch of corridor (from where you turn into that corridor up to "
+        f"the point where you turn off towards the destination).",
+    ]
+    if passed:
+        k = len(passed)
+        lines.append(
+            f"  - So you walk past {_NUMBER_WORDS.get(k, str(k)).upper()} door{'s' if k > 1 else ''} "
+            f"on your {side} first, and the next one on your {side} is the destination."
+        )
+        named = [p for p in passed if p["name"]]
+        if named:
+            lines.append("  - Of the doors you pass, these have names you may use as anchors:")
+            for p in named:
+                lines.append(f"      * {p['name']} is the {_ORDINALS.get(p['ordinal'], str(p['ordinal']))} door on your {side}")
+    else:
+        lines.append(f"  - No other doors on your {side} come before it: it is the first one.")
+    lines.append(f"  - Count ONLY doors on your {side}. Ignore every door on the other side.")
+    lines.append(f"  - Say it in the move marked \"{COUNT_MARKER.strip()}\" (the last stretch of corridor), "
+                 f"while the person is STILL WALKING ALONG THE CORRIDOR, before they make the final turn. "
+                 f"For example: \"walk past three doors on your left — the fourth one is the room you "
+                 f"want, so turn left there\".")
+    lines.append("  - NEVER say the count (or \"the first/second/... door on your left\") after that turn "
+                 "or in the arrival sentence. Once they have turned they are facing the door, so there "
+                 "just say it is right in front of them, exactly as the arrival step says.")
+    return "\n".join(lines)
+
+
+# ───────────────────────────── Fewer, longer sentences ─────────────────────────────
+
+_TURN_ONLY = re.compile(r"^turn (left|right|around)( slightly)?$", re.I)
+
+
+def _lower_first(text):
+    return text[:1].lower() + text[1:]
+
+
+def _is_walk_step(text):
+    return text.lower().startswith(("walk ", "continue ", "keep walking"))
+
+
+def _is_short_walk(text):
+    return text.lower().startswith("walk a short distance")
+
+
+def _is_arrival(text):
+    return text.lower().startswith("you have arrived")
+
+
+def _actions(text):
+    """How many actions a move holds ("Walk 10 m, then turn left" = 2)."""
+    return text.count(", then ") + 1
+
+
+def merge_steps_for_narration(steps):
+    """
+    Turn the raw step list (20+ tiny lines) into fewer, longer "moves" for the AI.
+    Only used for the AI prompt — the raw steps themselves are never changed.
+
+        "Turn left" + "Walk about 10 metres along the corridor"
+            →  "Turn left, then walk about 10 metres along the corridor"
+        a tiny move (turn + "Walk a short distance") is joined with the move after it
+        "Turn around" followed straight by another "Turn around" cancels out (you end up
+            facing the same way)
+    The raw steps already join a walk with the turn that follows it
+    ("Walk about 10 metres along the corridor, then turn left").
+
+    Returns a list of strings.
+    """
+    texts = [s["instruction"].strip() for s in steps if s.get("instruction")]
+
+    # 1) back-to-back "Turn around" pairs undo each other
+    if CANCEL_DOUBLE_TURN_AROUNDS:
+        cleaned = []
+        for t in texts:
+            if t.lower() == "turn around" and cleaned:
+                prev = cleaned[-1]
+                if prev.lower() == "turn around":
+                    cleaned.pop()
+                    continue
+                if prev.lower().endswith(", then turn around"):
+                    cleaned[-1] = prev[: -len(", then turn around")]
+                    continue
+            cleaned.append(t)
+        texts = cleaned
+
+    # 2) a lone turn (or "At the top of the stairs, ...") takes the walk that follows it
+    moves = []
+    i = 0
+    while i < len(texts):
+        t = texts[i]
+        low = t.lower()
+        nxt = texts[i + 1] if i + 1 < len(texts) else None
+        is_turn = bool(_TURN_ONLY.match(t))
+        is_stairs_exit = low.startswith(("at the top of the stairs", "at the bottom of the stairs"))
+        if ((is_turn or is_stairs_exit) and nxt is not None and _is_walk_step(nxt)
+                and _actions(t) + _actions(nxt) <= MAX_ACTIONS_PER_SENTENCE):
+            moves.append({"text": f"{t}, then {_lower_first(nxt)}", "short": _is_short_walk(nxt)})
+            i += 2
+            continue
+        moves.append({"text": t, "short": _is_short_walk(t)})
+        i += 1
+
+    # 3) a tiny move is joined with the move after it (never more than MAX_MOVES_PER_SENTENCE)
+    merged = []
+    i = 0
+    while i < len(moves):
+        group = [moves[i]["text"]]
+        j = i
+        while (
+            moves[j]["short"]
+            and j + 1 < len(moves)
+            and len(group) < MAX_MOVES_PER_SENTENCE
+            and not _is_arrival(moves[j + 1]["text"])
+            and sum(_actions(x) for x in group) + _actions(moves[j + 1]["text"]) <= MAX_ACTIONS_PER_SENTENCE
+        ):
+            j += 1
+            group.append(_lower_first(moves[j]["text"]))
+        merged.append(", then ".join(group))
+        i = j + 1
+    return merged
+
+
+# ───────────────────────────── Prompt ─────────────────────────────
+
+def build_prompt(start_name, end_name, start_level, end_level, distance_m, steps, landmarks, notes,
+                 door_facts=None):
+    """
+    Build the LLM prompt for natural indoor navigation narration.
+
+    door_facts: the result of route_door_facts(...). Optional — without it the
+    narration simply has no door counts (everything else still works).
+    """
+    moves = merge_steps_for_narration(steps)
+    marked = None
+    if _count_is_usable(door_facts):
+        # The door count belongs to the walk along the last corridor, i.e. the move that
+        # holds the FINAL turn (the turn off the corridor towards the destination door).
+        for i in range(len(moves) - 1, -1, -1):
+            if not _is_arrival(moves[i]) and re.search(r"\bturn\b", moves[i], re.I):
+                marked = i
+                break
+    move_lines = "\n".join(
+        f"  {i+1}. {m}" + (COUNT_MARKER if i == marked else "")
+        for i, m in enumerate(moves)
+    )
+
+    if landmarks:
+        landmark_lines = "\n".join(
+            f"  - {lm['name']} (on the {lm['side']}, ~{lm['meters_from_start']:.0f}m into the route, {level_label(lm['level'])})"
+            + (f" — description: {lm['description']}" if lm.get("description") else "")
+            for lm in landmarks
+        )
+    else:
+        landmark_lines = "  (no notable landmarks near this route)"
+
+    if notes:
+        notes_lines = "\n".join(f"  - {n}" for n in notes)
+    else:
+        notes_lines = "  (no special corridor notes)"
+
+    door_count_lines = _door_count_block(door_facts if marked is not None else None)
+
+    # Floor context (background only — the stairs are mentioned where they happen)
+    if start_level != end_level:
+        floor_context = f"\nThis route goes from {level_label(start_level)} to {level_label(end_level)}."
+    else:
+        floor_context = f"\nThis is all on {level_label(start_level)}."
+
+    prompt = f"""You are a friendly person inside a university building, giving another person
+walking directions from "{start_name}" to "{end_name}".
+{floor_context}
+
+═══════════════════════════════════════════════════
+  STRICT RULES — YOU MUST FOLLOW ALL OF THESE
+═══════════════════════════════════════════════════
+
+1. NEVER use compass directions (north, south, east, west). People inside
+   a building don't know which way is north. Use ONLY: left, right, straight,
+   behind you.
+
+2. NEVER INVENT or HALLUCINATE rooms, corridors, doors, or landmarks that
+   are NOT in the data below. If a room is not listed, do NOT mention it.
+   If a corridor is not listed, do NOT name it.
+
+3. NEVER SKIP any turn, stair change, or important navigation step. Each
+   numbered move below may contain several actions (a turn, a walk, stairs).
+   Every action must appear in your sentence, in the same order. Missing a
+   turn means the person gets lost.
+
+4. Only use the word "corridor" where the moves below use it.
+   Some paths are just connecting paths, not the real corridor. If the
+   moves say "step out into the corridor", say that and IMMEDIATELY give
+   the turn direction. Do NOT add filler like "walk a few steps" between
+   exiting a door and turning. Just say: "Step out into the corridor, then
+   turn left." If they say "step out of the room" or "until you reach the
+   corridor", keep that wording and do not call the connecting path a corridor.
+
+5. When arriving at the destination door:
+   - If the moves say "in front of you", say it is "right in front
+     of you" or "just ahead".
+   - If the moves say "on your left/right", use those exact words.
+   - Do NOT change left to right or vice versa.
+
+6. Doors: the ONLY doors you may mention are (a) the landmarks listed below and
+   (b) the doors described in the DOOR COUNT section. Don't say "you'll see doors
+   on either side" or similar unless the data supports it.
+
+7. Landmarks: name at most TWO doors in total (one or two) — counting both the
+   landmark list and any named doors in the DOOR COUNT section — only to help the
+   person stay oriented, at roughly the right point in the walk, using the side
+   (left/right) EXACTLY as given. Never name more than two.
+
+8. Level -1 is "the basement", level 0 is "the ground floor",
+   level 1 is "the first floor". NEVER say "level 0" or "level -1".
+
+9. Keep it warm, natural, and concise — like a fellow student who knows
+   the building well is walking with them. Use phrases like "you'll see",
+   "keep going", "just past", "right there".
+
+10. FEWER, LONGER SENTENCES. Write exactly ONE flowing sentence for each numbered
+   move (the moves are already merged for you), plus the arrival. A move is never
+   split into several short sentences, and you never write a sentence that is only
+   a turn ("Turn left.") or only a distance ("Walk 10 metres."). A turn and the walk
+   that follows it go together: "Turn right and walk about 10 metres along the
+   corridor." Put each sentence on its own line. No bullets, no numbering, no
+   headings. If the last move is tiny and the arrival follows it, put them in the
+   same sentence.
+
+11. DOOR COUNTING. The DOOR COUNT section below was computed by the program.
+   Copy its numbers EXACTLY. Never count doors yourself, never change a number,
+   never add a count of your own, and only count doors on the side given. If the
+   section says NOT AVAILABLE, give no door numbers at all. The count is said
+   while the person is still in the corridor, BEFORE the final turn — never after
+   it (after the turn the door is right in front of them). The "<<<" marker is
+   for you only; never print it.
+
+12. KEEP IT PLAIN. Do NOT add any of these: warnings about a turn before it
+   happens ("keep going until you reach..., then turn" — the door count in rule 11
+   is the one exception), an announcement of floor
+   changes before the stairs step ("first we'll go up..."), "you'll know it by..."
+   hints, "if you reach X you've gone too far" warnings, or step counts instead
+   of metres. Mention the stairs only in the move where they happen.
+
+13. DISTANCES. Say every distance exactly as the moves give it: "about 12 metres"
+   stays "about 12 metres". Where a move says "a short distance", say "a short
+   distance" — never invent a number of metres for it.
+
+14. Descriptions: where the landmark data or the path notes include a
+   "description", you may use it to help the person recognise the place or
+   path (for example the destination door). Use ONLY what the description
+   says — never add details of your own.
+
+═══════════════════════════════════════════════════
+  RAW NAVIGATION DATA (about {distance_m:.0f} metres total)
+═══════════════════════════════════════════════════
+
+Moves (one sentence each, IN ORDER):
+{move_lines}
+
+DOOR COUNT (computed by the program — copy exactly):
+{door_count_lines}
+
+Landmarks beside your route (IN ORDER, exact side — name at most two doors in total):
+{landmark_lines}
+
+Corridor/path notes (including any descriptions):
+{notes_lines}
+
+═══════════════════════════════════════════════════
+  YOUR TASK
+═══════════════════════════════════════════════════
+
+Rewrite the numbered moves above into natural, spoken-style directions: one
+flowing sentence per move, each on its own line. Follow ALL rules above. Do not
+add a greeting or sign-off — just give the directions as if you're explaining
+mid-conversation."""
+    return prompt
+
+
+def call_groq(prompt, api_key):
+    """Call the Groq API and return the response text."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.4,  # lower for more reliable, consistent output
+    }
+    response = requests.post(GROQ_URL, headers=headers, data=json.dumps(payload), timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def _format_location_list(nodes, door_nodes, graph):
+    """Group named locations by floor for a nice display."""
+    named = named_nodes(nodes)
+    by_level = {}
+    for nid, d in named.items():
+        if nid not in graph:
+            continue
+        lvl = d["tags"].get("level", "0").split(";")[0]
+        name = d["tags"].get("name", "")
+        loc = d["tags"].get("loc_name", "")
+        if name.startswith("door") and name[4:].isdigit():
+            continue
+        label = f"{name} ({loc})" if loc else name
+        by_level.setdefault(lvl, []).append(label)
+
+    for lvl in sorted(by_level):
+        floor = level_label(lvl)
+        print(f"\n  📍 {floor.replace('the ', '').title()}:")
+        for name in sorted(by_level[lvl]):
+            print(f"     • {name}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python ai_navigator.py map.osm")
+        sys.exit(1)
+
+    load_env_file()
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print("Missing GROQ_API_KEY environment variable.")
+        print('Set it, e.g. (PowerShell): $env:GROQ_API_KEY="your_key_here"')
+        print('Or create a .env file:    GROQ_API_KEY=your_key_here')
+        sys.exit(1)
+
+    osm_path = sys.argv[1]
+    print(f"Loading indoor map: {osm_path} ...")
+    nodes, ways = parse_osm(osm_path)
+    graph, edge_tags, door_nodes, entrance_nodes, corridor_of_door, rooms, stair_ways = build_graph(nodes, ways)
+
+    named = named_nodes(nodes)
+    routable_named = {nid: d for nid, d in named.items() if nid in graph}
+    print(f"Loaded {len(routable_named)} named locations.\n")
+
+    print("Available locations:")
+    _format_location_list(nodes, door_nodes, graph)
+
+    print()
+    start_query = input("Start from: ").strip()
+    end_query = input("Go to: ").strip()
+
+    start_id = find_named_node(nodes, start_query, graph)
+    end_id = find_named_node(nodes, end_query, graph)
+
+    if not start_id or not end_id:
+        print("Couldn't match one of those names to a location on the map.")
+        return
+    if start_id not in graph or end_id not in graph:
+        print("One of those locations isn't connected to a corridor yet.")
+        return
+
+    path, distance = a_star(graph, nodes, start_id, end_id)
+    if not path:
+        print("No route found — check the footways connect those two points.")
+        return
+
+    steps = generate_turn_by_turn(path, nodes, graph, door_nodes, corridor_of_door)
+    door_facts = route_door_facts(path, nodes, graph, door_nodes)
+    landmarks = landmarks_along_route(path, nodes, door_nodes, graph, door_facts)
+    notes = corridor_notes(path, nodes, corridor_of_door, graph)
+
+    start_name = node_display_name(nodes[start_id]["tags"]) or start_query
+    end_name = node_display_name(nodes[end_id]["tags"]) or end_query
+    start_level = nodes[start_id]["tags"].get("level", "0").split(";")[0]
+    end_level = nodes[end_id]["tags"].get("level", "0").split(";")[0]
+    total = total_distance_m(path, nodes)
+
+    prompt = build_prompt(
+        start_name, end_name, start_level, end_level, total,
+        steps, landmarks, notes, door_facts,
+    )
+
+    print(f"\n{'─' * 50}")
+    print(f"  Route: {start_name}  →  {end_name}")
+    print(f"  Distance: about {total:.0f} metres")
+    if start_level != end_level:
+        print(f"  Floors: {level_label(start_level)} → {level_label(end_level)}")
+    print(f"  {door_count_summary(door_facts)}")
+    print(f"{'─' * 50}")
+
+    print("\nAsking the AI to narrate your route...\n")
+    try:
+        narration = call_groq(prompt, api_key)
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed: {e}")
+        print("\nFalling back to step-by-step directions:\n")
+        for i, step in enumerate(steps, 1):
+            print(f"  {i}. {step['instruction']}")
+        return
+
+    print("─── Your route ───\n")
+    print(narration)
+    print()
+
+
+if __name__ == "__main__":
+    main()
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\indoor\campus_graph.py ---
+
+"""
+campus_graph.py  –  Indoor Navigation Engine
+
+Shared logic for indoor building navigation:
+- Parses an indoor .osm map (doors, footways, stairs, corridors, rooms)
+- Builds a routable graph where doors are the meaningful destinations
+- A* shortest path with stairs penalty
+- Turn-by-turn instruction generation using natural indoor language:
+    • "Walk along the corridor"  (not "head north")
+    • "Pass Room 102 on your left"  (not "pass 5 doors")
+    • "Take the stairs up to the first floor"  (not "go to level 1")
+    • "Room 108A is just in front of you"
+
+Design principles:
+- Directions sound like a person walking beside you, not a GPS.
+- Only mention rooms/doors that are on the SAME FLOOR as the walker.
+- Don't overwhelm: mention one notable landmark per stretch, not every door.
+- After exiting a door into a corridor, the next instruction is the turn — no
+  filler "walk a few steps" in between.
+- Arrival at a door that is straight ahead says "in front of you", not left/right.
+
+Both turn_by_turn.py and ai_navigator.py import this file.
+"""
+
+import xml.etree.ElementTree as ET
+import math
+import heapq
+import difflib
+
+EARTH_RADIUS_M = 6_371_000
+
+# Tags that mark a walkable way in our indoor map
+WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
+STAIRS_HIGHWAY = "steps"
+
+# Level number → human-friendly floor name
+LEVEL_NAMES = {
+    "-1": "the basement",
+    "0":  "the ground floor",
+    "1":  "the first floor",
+    "2":  "the second floor",
+    "3":  "the third floor",
+}
+
+
+def level_label(lvl_str):
+    """Turn a level string like '-1' into 'the basement'."""
+    return LEVEL_NAMES.get(lvl_str, f"level {lvl_str}")
+
+
+# ──────────────────────────── Geometry ────────────────────────────
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Distance in metres between two lat/lon points."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Initial compass bearing (0 = N, 90 = E …) from point 1 to point 2."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlam = math.radians(lon2 - lon1)
+    x = math.sin(dlam) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def latlon_to_xy(lat, lon, ref_lat):
+    """Flat local projection (metres) – fine for a single building."""
+    x = math.radians(lon) * EARTH_RADIUS_M * math.cos(math.radians(ref_lat))
+    y = math.radians(lat) * EARTH_RADIUS_M
+    return x, y
+
+
+def point_segment_info(p, a, b):
+    """
+    Returns (distance_m, t, side) for point p relative to segment a→b.
+    - distance_m: perpendicular distance in metres
+    - t: 0‥1 projection along the segment
+    - side: "left" or "right" of the walking direction
+    """
+    ref_lat = a[0]
+    px, py = latlon_to_xy(p[0], p[1], ref_lat)
+    ax, ay = latlon_to_xy(a[0], a[1], ref_lat)
+    bx, by = latlon_to_xy(b[0], b[1], ref_lat)
+
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return math.hypot(px - ax, py - ay), 0.0, "left"
+
+    t_raw = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0, min(1, t_raw))
+    closest_x, closest_y = ax + t * dx, ay + t * dy
+    dist = math.hypot(px - closest_x, py - closest_y)
+
+    cross_z = dx * (py - ay) - dy * (px - ax)
+    side = "left" if cross_z > 0 else "right"
+    return dist, t, side
+
+
+# ──────────────────────────── Parsing ────────────────────────────
+
+def parse_osm(osm_path):
+    """
+    Returns:
+        nodes  –  id → {"lat", "lon", "tags"}
+        ways   –  list of {"id", "tags", "refs"}
+    """
+    tree = ET.parse(osm_path)
+    root = tree.getroot()
+
+    nodes = {}
+    ways = []
+
+    for elem in root:
+        if elem.tag == "node":
+            nid = elem.get("id")
+            lat = float(elem.get("lat"))
+            lon = float(elem.get("lon"))
+            tags = {tag.get("k"): tag.get("v") for tag in elem.findall("tag")}
+            nodes[nid] = {"lat": lat, "lon": lon, "tags": tags}
+
+        elif elem.tag == "way":
+            tags = {tag.get("k"): tag.get("v") for tag in elem.findall("tag")}
+            refs = [nd.get("ref") for nd in elem.findall("nd")]
+            ways.append({"id": elem.get("id"), "tags": tags, "refs": refs})
+
+    return nodes, ways
+
+
+# ──────────────────────────── Graph Building ────────────────────────────
+
+def is_door(tags):
+    return bool(tags.get("door")) or tags.get("indoor") == "door"
+
+
+def is_entrance(tags):
+    return bool(tags.get("entrance"))
+
+
+def node_display_name(tags):
+    """Best human-readable label for a door / entrance node."""
+    name = tags.get("name", "")
+    loc = tags.get("loc_name", "")
+    if name and loc:
+        return f"{name} ({loc})"
+    return name or loc or ""
+
+
+def build_graph(nodes, ways):
+    """
+    Build a routable indoor graph.
+
+    Returns:
+        graph      – node_id → [(neighbor_id, distance_m, edge_info), ...]
+                     edge_info = {"kind": "walk"|"stairs", "level": str, "way_tags": dict}
+        edge_tags  – frozenset({a,b}) → tags dict  (for backward compat)
+        door_nodes – set of node ids that are doors
+        corridor_of_door – door_id → corridor_name (if the door sits on a corridor outline)
+        rooms      – list of {"name", "level", "door_node_id"} for rooms
+        stair_ways – list of {"way_id", "tags", "refs"} for stairways
+    """
+    graph = {}
+    edge_tags = {}
+    door_node_ids = set()
+    entrance_node_ids = set()
+
+    # Identify door and entrance nodes
+    for nid, d in nodes.items():
+        if is_door(d["tags"]):
+            door_node_ids.add(nid)
+        if is_entrance(d["tags"]):
+            entrance_node_ids.add(nid)
+
+    # Build adjacency from footways and stairs
+    stair_ways = []
+    for way in ways:
+        tags = way["tags"]
+        hw = tags.get("highway", "")
+
+        if hw in WALKABLE_HIGHWAY or hw == STAIRS_HIGHWAY:
+            refs = way["refs"]
+            is_stairs = (hw == STAIRS_HIGHWAY)
+            kind = "stairs" if is_stairs else "walk"
+            level = tags.get("level", "0")
+
+            if is_stairs:
+                stair_ways.append(way)
+
+            for i in range(len(refs) - 1):
+                a, b = refs[i], refs[i + 1]
+                if a not in nodes or b not in nodes:
+                    continue
+                d = haversine_m(
+                    nodes[a]["lat"], nodes[a]["lon"],
+                    nodes[b]["lat"], nodes[b]["lon"],
+                )
+                info = {"kind": kind, "level": level, "way_tags": tags}
+                graph.setdefault(a, []).append((b, d, info))
+                graph.setdefault(b, []).append((a, d, info))
+                edge_tags[frozenset((a, b))] = tags
+
+    # Map doors to corridors (via corridor outlines sharing nodes)
+    corridor_of_door = {}
+    for way in ways:
+        tags = way["tags"]
+        if tags.get("indoor") == "corridor":
+            cname = tags.get("name", "the corridor")
+            refs_set = set(way["refs"])
+            for r in refs_set:
+                if r in door_node_ids:
+                    corridor_of_door[r] = cname
+
+    # Map rooms: find room outlines that share a door node with a footway node
+    rooms = []
+    for way in ways:
+        tags = way["tags"]
+        if tags.get("indoor") == "room":
+            rname = tags.get("name", "")
+            rlevel = tags.get("level", "0").split(";")[0]
+            refs = way["refs"]
+            # find the door node(s) this room shares with the footway network
+            shared_doors = [r for r in refs if r in door_node_ids]
+            for d in shared_doors:
+                rooms.append({"name": rname, "level": rlevel, "door_node_id": d})
+            if not shared_doors and rname:
+                # Room has no door on the network — record with centroid position
+                pts = [nodes[r] for r in refs if r in nodes]
+                if pts:
+                    rooms.append({
+                        "name": rname, "level": rlevel, "door_node_id": None,
+                        "lat": sum(p["lat"] for p in pts) / len(pts),
+                        "lon": sum(p["lon"] for p in pts) / len(pts),
+                    })
+
+    return graph, edge_tags, door_node_ids, entrance_node_ids, corridor_of_door, rooms, stair_ways
+
+
+# ──────────────────────────── Named-node Helpers ────────────────────────────
+
+def named_nodes(nodes):
+    """dict of id → node data, only for nodes with a 'name' tag."""
+    return {nid: d for nid, d in nodes.items() if d["tags"].get("name")}
+
+
+def find_named_node(nodes, query, graph=None):
+    """
+    Fuzzy-match a typed name to the closest named node.
+    Also tries loc_name.
+    Returns node_id or None.
+    """
+    named = named_nodes(nodes)
+    # Build lookup: name → nid, loc_name → nid
+    lookup = {}
+    for nid, d in named.items():
+        n = d["tags"].get("name", "")
+        if n:
+            lookup[n] = nid
+        ln = d["tags"].get("loc_name", "")
+        if ln:
+            lookup[ln] = nid
+
+    q = query.strip().lower()
+
+    # exact match
+    for name, nid in lookup.items():
+        if q == name.lower():
+            return nid
+    # substring match
+    for name, nid in lookup.items():
+        if q in name.lower():
+            return nid
+    # fuzzy match
+    close = difflib.get_close_matches(query, lookup.keys(), n=1, cutoff=0.4)
+    if close:
+        return lookup[close[0]]
+    return None
+
+
+# ──────────────────────────── A* Pathfinding ────────────────────────────
+
+def a_star(graph, nodes, start_id, goal_id):
+    """
+    A* shortest path with stairs penalty.
+    Returns (path_as_list_of_node_ids, total_distance_m) or (None, None).
+    """
+    goal = nodes[goal_id]
+
+    def heuristic(nid):
+        n = nodes[nid]
+        return haversine_m(n["lat"], n["lon"], goal["lat"], goal["lon"])
+
+    # Priority queue: (f_score, node_id)
+    pq = [(heuristic(start_id), start_id)]
+    g_score = {start_id: 0}
+    came_from = {}  # nid → (prev_nid, edge_info)
+
+    while pq:
+        _, current = heapq.heappop(pq)
+
+        if current == goal_id:
+            path = [current]
+            while current in came_from:
+                current, _ = came_from[current]
+                path.append(current)
+            path.reverse()
+            return path, g_score[goal_id]
+
+        for neighbor, dist, info in graph.get(current, []):
+            # Stairs cost 3× to prefer staying on level when possible
+            cost = dist * (3 if info["kind"] == "stairs" else 1)
+            tentative_g = g_score[current] + cost
+
+            if tentative_g < g_score.get(neighbor, math.inf):
+                came_from[neighbor] = (current, info)
+                g_score[neighbor] = tentative_g
+                heapq.heappush(pq, (tentative_g + heuristic(neighbor), neighbor))
+
+    return None, None
+
+
+# ──────────────────────────── Turn helpers ────────────────────────────
+
+def turn_descriptor(angle_diff):
+    """
+    angle_diff: signed difference between outgoing and incoming bearing, -180..180
+    Returns a turn phrase or None if going straight.
+    """
+    a = angle_diff
+    if abs(a) < 25:
+        return None  # straight enough
+    if abs(a) > 150:
+        return "turn around"
+    if a > 0:
+        return "turn right" + (" slightly" if abs(a) < 55 else "")
+    else:
+        return "turn left" + (" slightly" if abs(a) < 55 else "")
+
+
+def _side_of_door(walk_bearing, door_node, prev_node, nodes):
+    """
+    Determine if a door is on the left, right, or straight ahead
+    relative to the walking direction.
+    Returns "left", "right", or "ahead".
+    """
+    door = nodes[door_node]
+    prev = nodes[prev_node]
+
+    # Bearing from prev toward the door
+    door_bearing = bearing_deg(prev["lat"], prev["lon"], door["lat"], door["lon"])
+    diff = (door_bearing - walk_bearing + 540) % 360 - 180
+
+    # If the door is within ~30° of straight ahead, it's "ahead"
+    if abs(diff) < 30:
+        return "ahead"
+
+    # Use cross product relative to walking direction for left/right
+    ref_lat = prev["lat"]
+    px, py = latlon_to_xy(door["lat"], door["lon"], ref_lat)
+    ax, ay = latlon_to_xy(prev["lat"], prev["lon"], ref_lat)
+    br = math.radians(walk_bearing)
+    dx, dy = math.sin(br), math.cos(br)
+    dpx, dpy = px - ax, py - ay
+    cross = dx * dpy - dy * dpx
+    return "right" if cross > 0 else "left"
+
+
+# ──────────────────────────── Turn-by-turn generation ────────────────────────────
+
+# Minimum distance (metres) between consecutive door/room mentions.
+# Prevents overwhelming the user with "pass X on your left, pass Y on your right"
+# every 2 metres. Only the most notable door in each stretch is mentioned.
+MIN_LANDMARK_SPACING_M = 8
+
+# A connecting path shorter than this that touches a real corridor (tagged
+# corridor=yes) is treated as part of the corridor: "step out into the corridor".
+# Longer connecting paths get "walk N metres until you reach the corridor".
+CORRIDOR_STUB_MAX_M = 5
+
+# Walks shorter than this are just "Walk a short distance"; from this length up the
+# instruction gives the metres ("Walk about 4 metres ...").
+SHORT_WALK_M = 3
+
+
+def _is_tagged_corridor(tags):
+    """True if a way carries corridor=yes (set in JOSM on the real corridors)."""
+    return str((tags or {}).get("corridor", "")).strip().lower() in ("yes", "true", "1")
+
+
+def _edge_info_between(graph, a_id, b_id):
+    for nb, d, info in graph.get(a_id, []):
+        if nb == b_id:
+            return info
+    return None
+
+
+def _classify_path_edges(path, nodes, graph):
+    """
+    For every edge of the path return:
+        True  – real corridor (way tagged corridor=yes)
+        False – ordinary connecting path
+        None  – stairs
+    A short connecting stub (< CORRIDOR_STUB_MAX_M) that touches a real
+    corridor is promoted to True, so a door that opens straight onto the
+    corridor still reads "step out into the corridor".
+    If NO way in the whole map is tagged corridor=yes, every walkable edge is
+    treated as a corridor (the old behaviour), so untagged maps keep working.
+    """
+    legacy = not any(
+        _is_tagged_corridor(info["way_tags"])
+        for edges in graph.values() for (_, _, info) in edges
+        if info["kind"] != "stairs"
+    )
+
+    kinds, lengths = [], []
+    for i in range(len(path) - 1):
+        a, b = nodes[path[i]], nodes[path[i + 1]]
+        lengths.append(haversine_m(a["lat"], a["lon"], b["lat"], b["lon"]))
+        info = _edge_info_between(graph, path[i], path[i + 1])
+        if info is not None and info["kind"] == "stairs":
+            kinds.append(None)
+        elif legacy:
+            kinds.append(True)
+        else:
+            kinds.append(bool(info) and _is_tagged_corridor(info["way_tags"]))
+
+    n = len(kinds)
+    i = 0
+    while i < n:
+        if kinds[i] is False:
+            j = i
+            while j < n and kinds[j] is False:
+                j += 1
+            run_len = sum(lengths[i:j])
+            touches = (i > 0 and kinds[i - 1] is True) or (j < n and kinds[j] is True)
+            if run_len < CORRIDOR_STUB_MAX_M and touches:
+                for k in range(i, j):
+                    kinds[k] = True
+            i = j
+        else:
+            i += 1
+    return kinds
+
+
+def _level_after_stairs(path, idx, graph, nodes, fallback):
+    """
+    Floor you arrive on after a flight of stairs: the level of the first
+    non-stairs edge after position idx, or the destination's level.
+    (The stairs way's own level tag, e.g. -1;0;1, lists every floor it touches,
+    so it can't tell us which one this route ends up on.)
+    """
+    for j in range(idx, len(path) - 1):
+        info = _edge_info_between(graph, path[j], path[j + 1])
+        if info is not None and info["kind"] != "stairs":
+            return info["level"].split(";")[0]
+    return nodes[path[-1]]["tags"].get("level", fallback).split(";")[0]
+
+
+def generate_turn_by_turn(path, nodes, graph, door_nodes, corridor_of_door):
+    """
+    Produce natural indoor walking instructions.
+
+    Design goals:
+    - Sound like a person giving directions, not a GPS.
+    - After "step out into the corridor" the next instruction is the turn,
+      NOT "walk a few steps" first.
+    - Only mention rooms/doors on the SAME FLOOR.
+    - Don't overwhelm: max one landmark mention per ~8 m stretch.
+    - Arrival at a door that is straight ahead says "in front of you".
+
+    Returns a list of step dicts: {"instruction": str, "node_id": str}
+    """
+    if len(path) < 2:
+        return [{"instruction": "You are already there.", "node_id": path[0] if path else ""}]
+
+    steps = []
+    current_level = nodes[path[0]]["tags"].get("level", "0").split(";")[0]
+    in_stairs = False
+    stairs_target_level = None
+    stairs_direction = None  # "up" or "down"
+    just_exited_door = False  # True right after the opening "step out into the corridor"
+
+    # Accumulate walk segments
+    walk_distance = 0.0
+    doors_passed = []  # doors we walked past (not the destination) since last instruction
+    last_landmark_distance = 0.0  # cumulative m since last landmark mention
+    prev_bearing = None
+
+    # Which edges are real corridors (True), connecting paths (False), stairs (None)
+    edge_kinds = _classify_path_edges(path, nodes, graph)
+    walk_is_corr = True  # kind of the walk currently being accumulated
+
+    def _flush_walk(next_action="", next_is_corr=False):
+        """Emit a walking instruction for the accumulated walk.
+        next_is_corr: True if the walk is about to join a real corridor."""
+        nonlocal walk_distance, doors_passed, prev_bearing, last_landmark_distance
+
+        if walk_distance < 0.5 and not doors_passed:
+            return  # nothing to flush
+
+        parts = []
+
+        if walk_distance >= 1:
+            # Under SHORT_WALK_M (3 m): "a short distance". From 3 m up: always say the metres.
+            if walk_distance < SHORT_WALK_M:
+                parts.append("Walk a short distance")
+            elif walk_is_corr:
+                if walk_distance < 25:
+                    parts.append(f"Walk about {walk_distance:.0f} metres along the corridor")
+                else:
+                    parts.append(f"Continue for about {walk_distance:.0f} metres")
+            else:
+                # Ordinary connecting path: never call it "the corridor"
+                if next_is_corr:
+                    parts.append(f"Walk about {walk_distance:.0f} metres until you reach the corridor")
+                elif walk_distance < 25:
+                    parts.append(f"Walk about {walk_distance:.0f} metres")
+                else:
+                    parts.append(f"Continue for about {walk_distance:.0f} metres")
+
+        if doors_passed:
+            # Filter to same floor only
+            same_floor = [
+                d for d in doors_passed
+                if d.get("level", current_level) == current_level
+            ]
+            if same_floor:
+                # Separate named (notable) from generic doors
+                named_passed = [
+                    d for d in same_floor
+                    if d["name"] and not d["name"].startswith("door")
+                ]
+                generic = [d for d in same_floor if d not in named_passed]
+
+                if named_passed:
+                    # Only mention one notable room per flush to avoid overload
+                    # Pick the first one (closest to where the walk started)
+                    best = named_passed[0]
+                    parts.append(f"passing {best['name']} on your {best['side']}")
+                elif len(generic) <= 3:
+                    left_doors = [d for d in generic if d.get("side") == "left"]
+                    right_doors = [d for d in generic if d.get("side") == "right"]
+                    if left_doors and right_doors:
+                        parts.append(
+                            f"passing {len(left_doors)} door{'s' if len(left_doors)>1 else ''} on your left "
+                            f"and {len(right_doors)} on your right"
+                        )
+                    elif left_doors:
+                        parts.append(f"passing {len(left_doors)} door{'s' if len(left_doors)>1 else ''} on your left")
+                    elif right_doors:
+                        parts.append(f"passing {len(right_doors)} door{'s' if len(right_doors)>1 else ''} on your right")
+                else:
+                    parts.append("passing several doors along the corridor" if walk_is_corr else "passing several doors")
+
+        if parts:
+            instruction = ". ".join(parts) if len(parts) > 1 and any(len(p) > 30 for p in parts) else ", ".join(parts)
+            instruction = instruction[0].upper() + instruction[1:]
+            steps.append({"instruction": instruction, "node_id": ""})
+
+        walk_distance = 0.0
+        doors_passed = []
+        last_landmark_distance = 0.0
+
+    def _add_turn(turn_text, node_id, steps_before):
+        """A turn that comes right after a walk instruction joins that line:
+        "Walk about 10 metres along the corridor, then turn left"
+        (one instruction instead of two). A turn with no walk before it stands alone."""
+        if len(steps) > steps_before:
+            steps[-1]["instruction"] += f", then {turn_text}"
+            steps[-1]["node_id"] = node_id
+        else:
+            steps.append({"instruction": turn_text.capitalize(), "node_id": node_id})
+
+    # ─── Walk through the path ───
+    for idx in range(len(path) - 1):
+        a_id, b_id = path[idx], path[idx + 1]
+        a_node, b_node = nodes[a_id], nodes[b_id]
+        seg_dist = haversine_m(a_node["lat"], a_node["lon"], b_node["lat"], b_node["lon"])
+        seg_bearing = bearing_deg(a_node["lat"], a_node["lon"], b_node["lat"], b_node["lon"])
+
+        a_tags = a_node["tags"]
+        b_tags = b_node["tags"]
+
+        # Determine the edge info (kind, level)
+        edge_info = None
+        for nb, d, info in graph.get(a_id, []):
+            if nb == b_id:
+                edge_info = info
+                break
+        if not edge_info:
+            edge_info = {"kind": "walk", "level": current_level}
+
+        is_stair_edge = edge_info["kind"] == "stairs"
+        seg_kind = edge_kinds[idx]  # True corridor / False connecting path / None stairs
+
+        # ── Handle stairs ──
+        if is_stair_edge:
+            if not in_stairs:
+                n_before = len(steps)
+                _flush_walk()
+                if prev_bearing is not None:
+                    diff = (seg_bearing - prev_bearing + 540) % 360 - 180
+                    t = turn_descriptor(diff)
+                    if t:
+                        _add_turn(t, a_id, n_before)
+
+                # Where do we actually come out? Look at the first walking edge
+                # after the stairs (the stairs way's own level tag may list
+                # every floor, e.g. -1;0;1, so it can't be used directly).
+                to_lvl = _level_after_stairs(path, idx, graph, nodes, current_level)
+                try:
+                    up = float(to_lvl) > float(current_level)
+                except ValueError:
+                    up = True
+                stairs_direction = "up" if up else "down"
+                stairs_target_level = to_lvl
+
+                steps.append({
+                    "instruction": f"Take the stairs {stairs_direction} to {level_label(stairs_target_level)}",
+                    "node_id": a_id,
+                })
+                in_stairs = True
+
+            prev_bearing = seg_bearing
+            just_exited_door = False
+            continue
+
+        # ── Exiting stairs ──
+        if in_stairs:
+            in_stairs = False
+            if stairs_target_level:
+                current_level = stairs_target_level
+            diff = (seg_bearing - prev_bearing + 540) % 360 - 180 if prev_bearing is not None else 0
+            t = turn_descriptor(diff)
+            at_label = "At the top" if stairs_direction == "up" else "At the bottom"
+            if t:
+                steps.append({
+                    "instruction": f"{at_label} of the stairs, {t}",
+                    "node_id": b_id,
+                })
+            else:
+                steps.append({
+                    "instruction": f"{at_label} of the stairs, continue straight",
+                    "node_id": b_id,
+                })
+            prev_bearing = seg_bearing
+            walk_distance = seg_dist
+            walk_is_corr = bool(seg_kind)
+            just_exited_door = False
+            continue
+
+        # ── Handle turns ──
+        if prev_bearing is not None:
+            diff = (seg_bearing - prev_bearing + 540) % 360 - 180
+            t = turn_descriptor(diff)
+            if t:
+                if just_exited_door:
+                    # Merge the turn directly with the door-exit instruction.
+                    # Instead of: "Step out into the corridor" → "Walk a few steps" → "Turn left"
+                    # We get:     "Step out into the corridor, then turn left"
+                    if steps:
+                        steps[-1]["instruction"] += f", then {t}"
+                    just_exited_door = False
+                    walk_distance = 0.0
+                    doors_passed = []
+                else:
+                    n_before = len(steps)
+                    _flush_walk(next_is_corr=bool(seg_kind))
+                    _add_turn(t, a_id, n_before)
+
+        # ── Corridor <-> connecting path change without a turn ──
+        if (walk_distance >= 0.5 or doors_passed) and bool(seg_kind) != walk_is_corr:
+            _flush_walk(next_is_corr=bool(seg_kind))
+        walk_is_corr = bool(seg_kind)
+
+        # ── Accumulate walk ──
+        walk_distance += seg_dist
+        last_landmark_distance += seg_dist
+        prev_bearing = seg_bearing
+        just_exited_door = False
+
+        # ── Check if b is a door we pass by (not the destination) ──
+        b_is_destination = (idx + 1 == len(path) - 1)
+
+        if not b_is_destination and is_door(b_tags):
+            # Only track doors on the SAME FLOOR
+            door_level = b_tags.get("level", current_level).split(";")[0]
+            if door_level == current_level:
+                dname = node_display_name(b_tags)
+                side = _side_of_door(seg_bearing, b_id, a_id, nodes)
+                # For "ahead" doors that we pass by, demote to left/right based on cross product
+                if side == "ahead":
+                    side = "right"  # fallback — rarely happens for pass-by doors
+
+                # Spacing: don't mention a door if we just mentioned one recently
+                if last_landmark_distance >= MIN_LANDMARK_SPACING_M or not doors_passed:
+                    doors_passed.append({
+                        "name": dname, "side": side, "node_id": b_id,
+                        "level": door_level,
+                    })
+                    last_landmark_distance = 0.0
+
+        # ── Entrance node (not start or end) ──
+        if not b_is_destination and is_entrance(b_tags):
+            _flush_walk()
+            ename = b_tags.get("name", "the entrance")
+            steps.append({"instruction": f"Go through {ename}", "node_id": b_id})
+
+    # ── Final destination ──
+    _flush_walk()
+    dest_id = path[-1]
+    dest_tags = nodes[dest_id]["tags"]
+    dest_name = node_display_name(dest_tags)
+    dest_level = dest_tags.get("level", current_level)
+
+    if is_door(dest_tags):
+        if len(path) >= 2:
+            prev_id = path[-2]
+            final_bearing = bearing_deg(
+                nodes[prev_id]["lat"], nodes[prev_id]["lon"],
+                nodes[dest_id]["lat"], nodes[dest_id]["lon"],
+            )
+            side = _side_of_door(final_bearing, dest_id, prev_id, nodes)
+
+            if side == "ahead":
+                # Door is straight ahead — most natural phrasing
+                if dest_name:
+                    steps.append({
+                        "instruction": f"You have arrived — {dest_name} is just in front of you",
+                        "node_id": dest_id,
+                    })
+                else:
+                    steps.append({
+                        "instruction": "You have arrived — the door is just in front of you",
+                        "node_id": dest_id,
+                    })
+            else:
+                if dest_name:
+                    steps.append({
+                        "instruction": f"You have arrived — {dest_name} is the door on your {side}",
+                        "node_id": dest_id,
+                    })
+                else:
+                    steps.append({
+                        "instruction": f"You have arrived — the door is on your {side}",
+                        "node_id": dest_id,
+                    })
+        else:
+            steps.append({
+                "instruction": f"You have arrived at {dest_name}" if dest_name else "You have arrived",
+                "node_id": dest_id,
+            })
+    elif is_entrance(dest_tags):
+        steps.append({
+            "instruction": f"You have arrived at {dest_name}" if dest_name else "You have arrived at the entrance",
+            "node_id": dest_id,
+        })
+    else:
+        steps.append({
+            "instruction": f"You have arrived at {dest_name}" if dest_name else "You have arrived",
+            "node_id": dest_id,
+        })
+
+    # ── Prepend starting instruction ──
+    start_id = path[0]
+    start_tags = nodes[start_id]["tags"]
+    start_name = node_display_name(start_tags)
+    start_level = start_tags.get("level", "0").split(";")[0]
+
+    first_bearing = bearing_deg(
+        nodes[path[0]]["lat"], nodes[path[0]]["lon"],
+        nodes[path[1]]["lat"], nodes[path[1]]["lon"],
+    )
+
+    opening = f"Starting from {start_name}" if start_name else "From your current position"
+    opening += f" on {level_label(start_level)}"
+
+    if is_door(start_tags):
+        first_kind = edge_kinds[0]
+        if first_kind is False:
+            # The first stretch is an ordinary connecting path, not the corridor
+            opening += " — step out of the room"
+        else:
+            opening += " — step out into the corridor"
+        just_exited_door = True  # signal to merge next turn
+
+    steps.insert(0, {"instruction": opening, "node_id": start_id})
+
+    # ── Post-process: merge door-exit + immediate turn ──
+    # If step[0] is the door-exit and step[1] is a short walk (< 5m) followed
+    # by step[2] being a turn, collapse steps 1+2 into the door-exit step.
+    opening_merged = False
+    if len(steps) >= 2 and just_exited_door:
+        second = steps[1]["instruction"]
+        k = second.lower().rfind(", then turn")
+        if second.lower().startswith(("walk a short", "walk a few")) and k != -1 and k + len(", then ") < len(second):
+            # "Walk a short distance, then turn left" folds into the opening line
+            steps[0]["instruction"] += ", then " + second[k + len(", then "):]
+            del steps[1]
+            opening_merged = True
+    if len(steps) >= 3 and just_exited_door and not opening_merged:
+        second = steps[1]["instruction"].lower()
+        third = steps[2]["instruction"].lower()
+        is_tiny_walk = second.startswith("walk a short") or second.startswith("walk a few")
+        is_turn = third.startswith("turn ")
+        if is_tiny_walk and is_turn:
+            # Merge: remove the filler walk and append the turn to the opening
+            turn_phrase = steps[2]["instruction"][0].lower() + steps[2]["instruction"][1:]
+            steps[0]["instruction"] += f", then {turn_phrase}"
+            del steps[1]  # remove "walk a short distance"
+            del steps[1]  # remove the turn (was at index 2, now at 1)
+
+    return steps
+
+
+def total_distance_m(path, nodes):
+    """Total walking distance along a path, in metres."""
+    total = 0
+    for i in range(len(path) - 1):
+        a, b = nodes[path[i]], nodes[path[i + 1]]
+        total += haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
+    return total
+
+
+
+# ─────────────────── Door counting (used by the AI narration only) ───────────────────
+#
+# generate_turn_by_turn() above is NOT touched by anything in this section.
+#
+# How this map is drawn: every door is a one-node stub (about 1–3 m long) hanging off a
+# corridor way (a footway tagged corridor=yes). A route therefore never walks *through*
+# the doors it passes — it walks beside them. To say "the fourth door on your left" we
+# work per STRAIGHT STRETCH of corridor (the part between two turns, split with the same
+# 25° rule the turn-by-turn uses) and keep only door NODES that are:
+#   • on the same floor,
+#   • alongside the stretch (inside its length, within DOOR_ALONGSIDE_MAX_M of the line),
+#   • attached to that corridor (their stub joins one of the stretch's nodes).
+# Rooms (areas) are never counted — only door nodes.
+#
+# A count is only trusted ("reliable") when the stretch looks cleanly mapped; otherwise
+# the caller falls back to the normal wording and no number is given.
+
+DOOR_ALONGSIDE_MAX_M = 3.5    # a door must be this close to the corridor line to count as "beside" it
+DOOR_WINDOW_EXT_M = 1.6       # slack at the ends of each edge so a gentle bend can't drop a door
+DOOR_END_AMBIGUITY_M = 1.5    # a same-side door this close to a corner / the destination makes a count unsafe
+DOOR_DUPLICATE_M = 1.5        # two door nodes closer than this on one side may be one double door
+DOOR_STUB_MAX_M = 4.0         # the destination's connecting stub must be this short (door on the corridor wall)
+DOOR_COUNT_MAX = 7            # beyond this nobody counts doors by eye
+DOOR_SIDE_MIN_ANGLE = 35      # the stub must leave the corridor at least this far off "straight on"
+DOOR_SIDE_MAX_ANGLE = 145     # ...and not double back
+
+
+def _is_generic_door_name(name):
+    """True for blank names and auto-names like 'door12'."""
+    name = (name or "").strip()
+    return (not name) or (name.startswith("door") and name[4:].isdigit())
+
+
+def _door_level(nodes, nid):
+    return nodes[nid]["tags"].get("level", "0").split(";")[0]
+
+
+def door_line_info(p, a, b):
+    """
+    Position of point p relative to the (infinite) line a→b.
+    Returns (perp_m, along_m, length_m, side) or None for a zero-length edge.
+      perp_m   – perpendicular distance to the line
+      along_m  – metres from a, measured along a→b (NOT clamped; can be <0 or >length)
+      side     – "left" / "right" of the walking direction a→b
+    """
+    ref_lat = a[0]
+    px, py = latlon_to_xy(p[0], p[1], ref_lat)
+    ax, ay = latlon_to_xy(a[0], a[1], ref_lat)
+    bx, by = latlon_to_xy(b[0], b[1], ref_lat)
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return None
+    along = ((px - ax) * dx + (py - ay) * dy) / length
+    cross = dx * (py - ay) - dy * (px - ax)
+    return abs(cross) / length, along, length, ("left" if cross > 0 else "right")
+
+
+def _map_has_tagged_corridors(graph):
+    """True if at least one walkable way carries corridor=yes."""
+    for edges in graph.values():
+        for (_, _, info) in edges:
+            if info["kind"] != "stairs" and _is_tagged_corridor(info["way_tags"]):
+                return True
+    return False
+
+
+def analyze_route_doors(path, nodes, graph, door_nodes):
+    """
+    Door facts for one route, for the AI narration.
+
+    Returns a dict:
+      available    – False if counting can't be done at all (reason says why)
+      reason       – short explanation when not available
+      stretches    – list of straight corridor stretches, each:
+                       {level, start_m, length_m, node_ids,
+                        doors: [{node_id, name, generic, description, side,
+                                 along_m, perp_m, attached}]}   (sorted by along_m)
+      destination  – count facts for the last door (see _destination_count)
+    """
+    out = {"available": False, "reason": "", "stretches": [], "destination": None}
+    if len(path) < 2:
+        out["reason"] = "route has no movement"
+        return out
+    if not _map_has_tagged_corridors(graph):
+        out["reason"] = "the map has no corridor=yes ways, so corridors can't be told from connecting paths"
+        return out
+
+    m = len(path) - 1
+    route_set = set(path)
+
+    def _leaf_door(nid):
+        return nid in door_nodes and len(graph.get(nid, ())) <= 1
+
+    # ---- per-edge facts -------------------------------------------------
+    lens, brgs, infos, corr = [], [], [], []
+    for i in range(m):
+        a_id, b_id = path[i], path[i + 1]
+        a, b = nodes[a_id], nodes[b_id]
+        lens.append(haversine_m(a["lat"], a["lon"], b["lat"], b["lon"]))
+        brgs.append(bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"]))
+        info = _edge_info_between(graph, a_id, b_id)
+        infos.append(info)
+        corr.append(
+            info is not None
+            and info["kind"] != "stairs"
+            and _is_tagged_corridor(info["way_tags"])
+            and not _leaf_door(a_id)
+            and not _leaf_door(b_id)
+        )
+    cum = [0.0]
+    for L in lens:
+        cum.append(cum[-1] + L)
+
+    # ---- split into straight stretches (same 25° rule as the turn-by-turn) ----
+    spans = []
+    cur = None
+    for i in range(m):
+        if not corr[i]:
+            if cur:
+                spans.append(cur)
+                cur = None
+            continue
+        lvl = infos[i]["level"].split(";")[0]
+        if cur is not None:
+            diff = (brgs[i] - brgs[i - 1] + 540) % 360 - 180
+            if cur["last"] == i - 1 and cur["level"] == lvl and turn_descriptor(diff) is None:
+                cur["last"] = i
+                continue
+            spans.append(cur)
+        cur = {"first": i, "last": i, "level": lvl}
+    if cur:
+        spans.append(cur)
+
+    # ---- doors beside each stretch ----------------------------------------
+    doors_by_level = {}
+    for d in door_nodes:
+        if d in route_set or d not in nodes:
+            continue
+        doors_by_level.setdefault(_door_level(nodes, d), []).append(d)
+
+    for sp in spans:
+        first, last = sp["first"], sp["last"]
+        node_ids = path[first:last + 2]
+        node_set = set(node_ids)
+        edge_cum = []
+        run = 0.0
+        for k in range(first, last + 1):
+            edge_cum.append(run)
+            run += lens[k]
+        stretch_len = run
+
+        found = []
+        for d in doors_by_level.get(sp["level"], []):
+            tags = nodes[d]["tags"]
+            p = (nodes[d]["lat"], nodes[d]["lon"])
+            best = None
+            for j, k in enumerate(range(first, last + 1)):
+                a = (nodes[path[k]]["lat"], nodes[path[k]]["lon"])
+                b = (nodes[path[k + 1]]["lat"], nodes[path[k + 1]]["lon"])
+                li = door_line_info(p, a, b)
+                if li is None:
+                    continue
+                perp, along, L, side = li
+                if perp > DOOR_ALONGSIDE_MAX_M:
+                    continue
+                if along < -DOOR_WINDOW_EXT_M or along > L + DOOR_WINDOW_EXT_M:
+                    continue
+                if best is None or perp < best[0]:
+                    best = (perp, edge_cum[j] + along, side)
+            if best is None:
+                continue
+            name = tags.get("name", "").strip()
+            found.append({
+                "node_id": d,
+                "name": name,
+                "generic": _is_generic_door_name(name),
+                "description": tags.get("description", "").strip(),
+                "loc_name": tags.get("loc_name", "").strip(),
+                "side": best[2],
+                "along_m": best[1],
+                "perp_m": best[0],
+                "attached": any(nb in node_set for nb, _, _ in graph.get(d, ())),
+            })
+        found.sort(key=lambda x: x["along_m"])
+        out["stretches"].append({
+            "level": sp["level"],
+            "start_m": cum[first],
+            "length_m": stretch_len,
+            "first_edge": first,
+            "last_edge": last,
+            "node_ids": node_ids,
+            "doors": found,
+        })
+
+    out["available"] = True
+    out["destination"] = _destination_count(path, nodes, graph, door_nodes, out["stretches"], corr, lens, brgs)
+    return out
+
+
+def _destination_count(path, nodes, graph, door_nodes, stretches, corr, lens, brgs):
+    """
+    "The destination is the Nth door on your <side>" — computed, never guessed.
+
+    Counts only door NODES on the destination's side, beside the LAST straight
+    corridor stretch, before the junction where you turn off to the destination.
+    `reliable` is True only when the stretch passes every safety check.
+    """
+    m = len(path) - 1
+    dest = path[-1]
+    res = {"available": False, "reliable": False, "reason": "", "side": None,
+           "ordinal": None, "passed": [], "stretch_length_m": None}
+
+    if dest not in door_nodes:
+        res["reason"] = "destination is not a door node"
+        return res
+    last_corr = max((i for i in range(m) if corr[i]), default=None)
+    if last_corr is None:
+        res["reason"] = "route never walks a tagged corridor"
+        return res
+    j_idx = last_corr + 1
+    if j_idx >= m:
+        res["reason"] = "destination door sits on the corridor line itself"
+        return res
+    if not stretches or stretches[-1]["last_edge"] != last_corr:
+        res["reason"] = "final corridor stretch not found"
+        return res
+    stub_len = sum(lens[j_idx:m])
+    if stub_len > DOOR_STUB_MAX_M:
+        res["reason"] = f"destination is {stub_len:.0f} m off the corridor (not a door on the corridor wall)"
+        return res
+
+    for k in range(j_idx + 1, m):
+        if turn_descriptor((brgs[k] - brgs[k - 1] + 540) % 360 - 180) is not None:
+            res["reason"] = "the little path to the destination door bends"
+            return res
+
+    diff = (brgs[j_idx] - brgs[last_corr] + 540) % 360 - 180
+    if abs(diff) < DOOR_SIDE_MIN_ANGLE or abs(diff) > DOOR_SIDE_MAX_ANGLE:
+        res["reason"] = "destination door is not clearly to one side of the corridor"
+        return res
+    side = "right" if diff > 0 else "left"
+
+    # Cross-check the side against where the door actually sits.
+    a = (nodes[path[last_corr]]["lat"], nodes[path[last_corr]]["lon"])
+    j = (nodes[path[j_idx]]["lat"], nodes[path[j_idx]]["lon"])
+    dpos = (nodes[dest]["lat"], nodes[dest]["lon"])
+    li = door_line_info(dpos, a, j)
+    if li is None or li[3] != side:
+        res["reason"] = "turn direction and door position disagree"
+        return res
+
+    st = stretches[-1]
+    L = st["length_m"]
+    if L < SHORT_WALK_M:
+        # the walk before the final turn would be "a short distance" — nothing worth counting
+        res["reason"] = "the last stretch of corridor is too short to count doors along"
+        return res
+    same = [d for d in st["doors"] if d["side"] == side]
+    problems = []
+    for d in same:
+        label = d["name"] or "a door"
+        if not d["attached"]:
+            problems.append(f"{label} is beside the corridor but not connected to it in the map")
+        if d["along_m"] < DOOR_END_AMBIGUITY_M:
+            problems.append(f"{label} is right at the corner where this stretch starts")
+        if abs(d["along_m"] - L) <= DOOR_END_AMBIGUITY_M:
+            problems.append(f"{label} is right next to the destination door")
+    # near-duplicate door nodes on the destination's side (double doors / stray nodes)
+    pts = [(d["name"] or "a door", nodes[d["node_id"]]) for d in same] + [("the destination", nodes[dest])]
+    for x in range(len(pts)):
+        for y in range(x + 1, len(pts)):
+            if haversine_m(pts[x][1]["lat"], pts[x][1]["lon"], pts[y][1]["lat"], pts[y][1]["lon"]) < DOOR_DUPLICATE_M:
+                problems.append(f"{pts[x][0]} and {pts[y][0]} are almost on top of each other")
+
+    passed = [d for d in same if d["along_m"] < L - DOOR_END_AMBIGUITY_M]
+    res.update({
+        "available": True,
+        "side": side,
+        "ordinal": len(passed) + 1,
+        "stretch_length_m": L,
+        "passed": [
+            {"ordinal": k + 1, "name": ("" if d["generic"] else d["name"]), "node_id": d["node_id"]}
+            for k, d in enumerate(passed)
+        ],
+    })
+    if problems:
+        res["reason"] = "; ".join(problems[:2])
+        return res
+    if res["ordinal"] > DOOR_COUNT_MAX:
+        res["reason"] = f"{res['ordinal']} doors is too many to count by eye"
+        return res
+    res["reliable"] = True
+    return res
+
+
+def alongside_doors(analysis):
+    """
+    Every door node found beside the route's corridor stretches (attached ones only),
+    de-duplicated and ordered by distance from the start of the route.
+    Each entry: the door dict from analyze_route_doors plus route_m and level.
+    """
+    best = {}
+    for st in analysis.get("stretches", []):
+        for d in st["doors"]:
+            if not d["attached"]:
+                continue
+            e = dict(d)
+            e["route_m"] = st["start_m"] + max(0.0, min(d["along_m"], st["length_m"]))
+            e["level"] = st["level"]
+            if d["node_id"] not in best or e["perp_m"] < best[d["node_id"]]["perp_m"]:
+                best[d["node_id"]] = e
+    return sorted(best.values(), key=lambda e: e["route_m"])
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\indoor\turn_by_turn.py ---
+
+"""
+turn_by_turn.py  –  Indoor Navigation (No AI)
+
+Plain A* routing for indoor building navigation.
+Type two locations (room names, door names, codes) and get
+natural turn-by-turn directions through the building's corridors.
+
+Usage:
+    python turn_by_turn.py map.osm
+"""
+
+import sys
+from campus_graph import (
+    parse_osm, build_graph, named_nodes, find_named_node,
+    a_star, generate_turn_by_turn, total_distance_m, level_label,
+    node_display_name, is_door,
+)
+
+
+def _format_location_list(nodes, door_nodes, graph):
+    """Group named locations by floor for a nice display."""
+    named = named_nodes(nodes)
+
+    # Group by level
+    by_level = {}
+    for nid, d in named.items():
+        # Only show nodes that are on the network
+        if nid not in graph:
+            continue
+        lvl = d["tags"].get("level", "0").split(";")[0]
+        name = d["tags"].get("name", "")
+        loc = d["tags"].get("loc_name", "")
+        # Skip generic "door1", "door2" names — they're navigation plumbing
+        if name.startswith("door") and name[4:].isdigit():
+            continue
+        label = f"{name} ({loc})" if loc else name
+        by_level.setdefault(lvl, []).append(label)
+
+    for lvl in sorted(by_level):
+        floor = level_label(lvl)
+        print(f"\n  📍 {floor.replace('the ', '').title()}:")
+        for name in sorted(by_level[lvl]):
+            print(f"     • {name}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python turn_by_turn.py map.osm")
+        sys.exit(1)
+
+    osm_path = sys.argv[1]
+    print(f"Loading indoor map: {osm_path} ...")
+    nodes, ways = parse_osm(osm_path)
+    graph, edge_tags, door_nodes, entrance_nodes, corridor_of_door, rooms, stair_ways = build_graph(nodes, ways)
+
+    named = named_nodes(nodes)
+    routable_named = {nid: d for nid, d in named.items() if nid in graph}
+    print(f"Loaded {len(routable_named)} named locations across {len(set(d['tags'].get('level','0').split(';')[0] for d in routable_named.values()))} floors.\n")
+
+    if not routable_named:
+        print("No named nodes found on the footway network.")
+        print("Make sure your door/entrance nodes have a 'name' tag and sit on a footway.")
+        return
+
+    print("Available locations:")
+    _format_location_list(nodes, door_nodes, graph)
+
+    print()
+    start_query = input("Start from: ").strip()
+    end_query = input("Go to: ").strip()
+
+    start_id = find_named_node(nodes, start_query, graph)
+    end_id = find_named_node(nodes, end_query, graph)
+
+    if not start_id:
+        print(f"\n❌ Couldn't find a location matching '{start_query}'.")
+        return
+    if not end_id:
+        print(f"\n❌ Couldn't find a location matching '{end_query}'.")
+        return
+    if start_id not in graph:
+        print(f"\n❌ '{node_display_name(nodes[start_id]['tags'])}' isn't connected to any corridor.")
+        return
+    if end_id not in graph:
+        print(f"\n❌ '{node_display_name(nodes[end_id]['tags'])}' isn't connected to any corridor.")
+        return
+
+    start_name = node_display_name(nodes[start_id]["tags"]) or start_query
+    end_name = node_display_name(nodes[end_id]["tags"]) or end_query
+
+    path, distance = a_star(graph, nodes, start_id, end_id)
+
+    if not path:
+        print("\n❌ No route found between those two points.")
+        print("   Check that the footways connect them (use JOSM validator).")
+        return
+
+    total = total_distance_m(path, nodes)
+    start_level = nodes[start_id]["tags"].get("level", "0").split(";")[0]
+    end_level = nodes[end_id]["tags"].get("level", "0").split(";")[0]
+
+    print(f"\n{'─' * 50}")
+    print(f"  Route: {start_name}  →  {end_name}")
+    print(f"  Distance: about {total:.0f} metres")
+    if start_level != end_level:
+        print(f"  Floors: {level_label(start_level)} → {level_label(end_level)}")
+    else:
+        print(f"  Floor: {level_label(start_level)}")
+    print(f"{'─' * 50}\n")
+
+    steps = generate_turn_by_turn(path, nodes, graph, door_nodes, corridor_of_door)
+    for i, step in enumerate(steps, 1):
+        print(f"  {i}. {step['instruction']}")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\indoor\__init__.py ---
+
+"""
+backend/core/indoor/__init__.py
+
+Makes the three frozen indoor files importable the same way the
+outdoor ones are.
+
+The indoor frozen files import each other as top-level modules
+(`import campus_graph`), exactly like the outdoor trio does. For
+that to work, Python needs their folder on sys.path. That's what
+this file does — same pattern as the outdoor `backend/core/__init__.py`.
+
+Why a separate folder: the indoor files have the same names as the
+outdoor ones (`campus_graph.py`, `ai_navigator.py`, `turn_by_turn.py`),
+so they can't live side by side in `backend/core/`. This folder gives
+them their own namespace and their own sys.path entry.
+"""
+
+import sys
+from pathlib import Path
+
+# The folder holding the three indoor frozen files: backend/core/indoor/
+_INDOOR_DIR = Path(__file__).resolve().parent
+
+# Add it to sys.path so `import campus_graph` inside the indoor
+# ai_navigator.py resolves to backend/core/indoor/campus_graph.py,
+# NOT to the outdoor backend/core/campus_graph.py.
+if str(_INDOOR_DIR) not in sys.path:
+    sys.path.insert(0, str(_INDOOR_DIR))
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\narration.py ---
 
@@ -22222,9 +25168,14 @@ if str(_CORE_DIR) not in sys.path:
 ingest.py
 
 Reads map.osm once and writes:
-  - one row per named OSM node  → places
+  - one row per named OSM node  → places (kind="outdoor")
   - one row per named OSM way   → areas
   - one row per routable edge   → path_edges
+
+Then reads final.osm and writes:
+  - one row per door node       → places (kind="indoor")
+  - one row per room polygon    → indoor_areas
+  - one row per walkable edge   → indoor_path_edges
 
 Run:
     python -m backend.pipeline.ingest
@@ -22246,9 +25197,15 @@ from sqlalchemy import delete
 from backend.api.db.init_db import init_db
 from backend.api.db.session import session_scope
 from backend.api.models.area import Area
+from backend.api.models.indoor_area import IndoorArea
+from backend.api.models.indoor_path_edge import IndoorPathEdge
 from backend.api.models.path_edge import PathEdge
 from backend.api.models.place import Place
-from backend.api.settings import MAP_OSM_PATH, INGEST_REPLACE
+from backend.api.settings import (
+    INDOOR_OSM_PATH,
+    INGEST_REPLACE,
+    MAP_OSM_PATH,
+)
 from backend.core.campus_graph import (
     parse_osm,
     build_graph,
@@ -22263,8 +25220,6 @@ from backend.pipeline.validate_map import validate_map
 # Categories
 # ---------------------------------------------------------------------------
 
-# Which OSM tag becomes the row's `category`. Ordered: the first tag
-# present wins. This is what the mobile app's category chips filter on.
 _CATEGORY_TAGS = (
     "amenity",
     "office",
@@ -22285,7 +25240,7 @@ def _category_from_tags(tags):
 
 
 # ---------------------------------------------------------------------------
-# Ingestion
+# Outdoor ingestion
 # ---------------------------------------------------------------------------
 
 def ingest_places(nodes, session):
@@ -22297,17 +25252,15 @@ def ingest_places(nodes, session):
         existing = session.query(Place).filter_by(osm_id=node_id).one_or_none()
 
         if existing is None:
-            existing = Place(osm_type="node", osm_id=node_id)
+            existing = Place(
+                osm_type="node", osm_id=node_id, kind="outdoor"
+            )
             session.add(existing)
 
-        # OSM-sourced fields. These are safe to overwrite on re-import.
         existing.name = tags["name"]
         existing.lat = node["lat"]
         existing.lon = node["lon"]
 
-        # Fields that come from OSM but may also be hand-edited. Only
-        # overwrite when the OSM tag is present, so a manual edit in
-        # the admin app isn't clobbered on the next re-import.
         if tags.get("name:sw"):
             existing.name_sw = tags["name:sw"]
         if tags.get("alt_name"):
@@ -22315,9 +25268,6 @@ def ingest_places(nodes, session):
         if tags.get("description"):
             existing.description_ai = tags["description"]
 
-        # Everything below is set-once from OSM. Hand edits to these
-        # are rare; if you need them, use edit_place.py which will set
-        # them and reimport won't touch them because the tag is absent.
         existing.category = _category_from_tags(tags) or existing.category
         existing.ref = tags.get("ref", existing.ref)
         existing.wheelchair = tags.get("wheelchair", existing.wheelchair)
@@ -22344,10 +25294,7 @@ def ingest_areas(nodes, ways, session):
             existing = Area(osm_type="way", osm_id=area["id"])
             session.add(existing)
 
-        # WKT polygon: "POLYGON((lon lat, lon lat, ...))" — note lon
-        # first, which is the WKT convention.
         coords = ", ".join(f"{lon} {lat}" for lat, lon in area["vertices"])
-        # Close the ring if not already closed.
         first_lat, first_lon = area["vertices"][0]
         last_lat, last_lon = area["vertices"][-1]
         if (first_lat, first_lon) != (last_lat, last_lon):
@@ -22363,9 +25310,6 @@ def ingest_areas(nodes, ways, session):
             existing.description_ai = tags["description"]
         existing.category = _category_from_tags(tags) or existing.category
 
-        # landmark=yes means "worth mentioning in narration". Default is
-        # True for now (Phase 3 has no tagging guide enforcement yet);
-        # set it to False only when explicitly tagged landmark=no.
         existing.is_landmark = tags.get("landmark") != "no"
 
         written += 1
@@ -22373,15 +25317,12 @@ def ingest_areas(nodes, ways, session):
 
 
 def ingest_path_edges(nodes, ways, session):
-    """Write one row per edge in the routing graph. Returns count written."""
+    """Write one row per edge in the outdoor routing graph."""
     _graph, _footpath_edges, edge_tags = build_graph(nodes, ways)
     written = 0
     seen_pairs = set()
 
     for pair_key, tags in edge_tags.items():
-        # pair_key is a frozenset({a, b}). We need a canonical order so
-        # the unique index (node_a, node_b) doesn't create duplicates
-        # when the same edge is seen from both directions.
         a, b = sorted(pair_key)
         if (a, b) in seen_pairs:
             continue
@@ -22419,12 +25360,191 @@ def ingest_path_edges(nodes, ways, session):
 
 
 # ---------------------------------------------------------------------------
+# Indoor ingestion
+# ---------------------------------------------------------------------------
+
+# Same walkable set the frozen indoor engine uses.
+_INDOOR_WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
+_INDOOR_STAIRS_HIGHWAY = "steps"
+
+
+def _is_door(tags):
+    return bool(tags.get("door")) or tags.get("indoor") == "door"
+
+
+def ingest_indoor_places(nodes, ways, session):
+    """
+    Write one Place row per door node, one IndoorArea row per room
+    polygon, and one IndoorPathEdge row per walkable edge.
+
+    Returns a dict of counts: {"places": n, "areas": n, "edges": n}.
+    """
+    door_node_ids = {nid for nid, d in nodes.items() if _is_door(d["tags"])}
+
+    # ---- Places: one per door node ----
+    # Also build a door -> room-name map from the room polygons.
+    rooms_of_door: dict[str, list[str]] = {}
+    for way in ways:
+        tags = way["tags"]
+        if tags.get("indoor") != "room":
+            continue
+        rname = (tags.get("name") or tags.get("ref") or "").strip()
+        if not rname:
+            continue
+        for ref in way["refs"]:
+            if ref in door_node_ids:
+                rooms_of_door.setdefault(ref, []).append(rname)
+
+    places_written = 0
+    for nid in door_node_ids:
+        node = nodes[nid]
+        tags = node["tags"]
+
+        name = (tags.get("name") or tags.get("ref") or "").strip()
+        if not name:
+            name = f"door {nid}"
+
+        level = tags.get("level")
+        if level is not None:
+            level = str(level).split(";")[0]
+
+        room_names = rooms_of_door.get(nid, [])
+        room_name = "; ".join(sorted(set(room_names))) if room_names else None
+
+        existing = session.query(Place).filter_by(osm_id=nid).one_or_none()
+        if existing is None:
+            existing = Place(osm_type="node", osm_id=nid, kind="indoor")
+            session.add(existing)
+
+        existing.name = name
+        existing.lat = node["lat"]
+        existing.lon = node["lon"]
+        existing.kind = "indoor"
+        existing.level = level
+        existing.room_name = room_name
+        existing.ref = tags.get("ref") or existing.ref
+        existing.description_ai = tags.get("description") or existing.description_ai
+
+        places_written += 1
+
+    # ---- Indoor areas: one per room polygon ----
+    areas_written = 0
+    for way in ways:
+        tags = way["tags"]
+        if tags.get("indoor") != "room":
+            continue
+
+        rname = (tags.get("name") or tags.get("ref") or "").strip()
+        if not rname:
+            continue
+
+        refs = [r for r in way["refs"] if r in nodes]
+        if len(refs) < 3:
+            continue
+
+        # WKT polygon. Closes the ring if needed.
+        coords = ", ".join(
+            f"{nodes[r]['lon']} {nodes[r]['lat']}" for r in refs
+        )
+        first_lat = nodes[refs[0]]["lat"]
+        first_lon = nodes[refs[0]]["lon"]
+        last_lat = nodes[refs[-1]]["lat"]
+        last_lon = nodes[refs[-1]]["lon"]
+        if (first_lat, first_lon) != (last_lat, last_lon):
+            coords += f", {first_lon} {first_lat}"
+        wkt = f"POLYGON(({coords}))"
+
+        level = tags.get("level")
+        if level is not None:
+            level = str(level).split(";")[0]
+
+        # Door node: the first door shared between this polygon and
+        # the walkable network, if any.
+        shared_doors = [r for r in way["refs"] if r in door_node_ids]
+        door_node_id = shared_doors[0] if shared_doors else None
+
+        existing = (
+            session.query(IndoorArea)
+            .filter_by(osm_id=way["id"])
+            .one_or_none()
+        )
+        if existing is None:
+            existing = IndoorArea(osm_type="way", osm_id=way["id"])
+            session.add(existing)
+
+        existing.name = rname
+        existing.ref = tags.get("ref")
+        existing.level = level
+        existing.geometry_wkt = wkt
+        existing.door_node_id = door_node_id
+
+        areas_written += 1
+
+    # ---- Indoor path edges: one per walkable segment ----
+    edges_written = 0
+    seen_pairs = set()
+    for way in ways:
+        tags = way["tags"]
+        hw = tags.get("highway", "")
+        if hw not in _INDOOR_WALKABLE_HIGHWAY and hw != _INDOOR_STAIRS_HIGHWAY:
+            continue
+
+        kind = "stairs" if hw == _INDOOR_STAIRS_HIGHWAY else "walk"
+        level = tags.get("level")
+        corridor = str(tags.get("corridor", "")).strip().lower() in (
+            "yes", "true", "1"
+        )
+
+        refs = way["refs"]
+        for i in range(len(refs) - 1):
+            a, b = refs[i], refs[i + 1]
+            if a not in nodes or b not in nodes:
+                continue
+            pair = tuple(sorted((a, b)))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            length = haversine_m(
+                nodes[a]["lat"], nodes[a]["lon"],
+                nodes[b]["lat"], nodes[b]["lon"],
+            )
+
+            existing = (
+                session.query(IndoorPathEdge)
+                .filter_by(node_a_osm=pair[0], node_b_osm=pair[1])
+                .one_or_none()
+            )
+            if existing is None:
+                existing = IndoorPathEdge(
+                    node_a_osm=pair[0], node_b_osm=pair[1]
+                )
+                session.add(existing)
+
+            existing.length_m = length
+            existing.highway = hw
+            existing.level = level
+            existing.kind = kind
+            existing.corridor = corridor
+            existing.description = tags.get("description")
+
+            edges_written += 1
+
+    return {
+        "places": places_written,
+        "areas": areas_written,
+        "edges": edges_written,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_ingest(osm_path=None, replace=None):
-    """Run the full pipeline. Returns a dict of counts."""
+def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
+    """Run the full pipeline (outdoor + indoor). Returns a dict of counts."""
     osm_path = Path(osm_path or MAP_OSM_PATH)
+    indoor_osm_path = Path(indoor_osm_path or INDOOR_OSM_PATH)
     if replace is None:
         replace = INGEST_REPLACE
 
@@ -22446,12 +25566,14 @@ def run_ingest(osm_path=None, replace=None):
     with session_scope() as session:
         if replace:
             print("Clearing existing rows (INGEST_REPLACE=true) ...")
+            session.execute(delete(IndoorPathEdge))
+            session.execute(delete(IndoorArea))
             session.execute(delete(PathEdge))
             session.execute(delete(Area))
             session.execute(delete(Place))
 
         n_places = ingest_places(nodes, session)
-        print(f"  places: {n_places}")
+        print(f"  outdoor places: {n_places}")
 
         n_areas = ingest_areas(nodes, ways, session)
         print(f"  areas: {n_areas}")
@@ -22459,8 +25581,29 @@ def run_ingest(osm_path=None, replace=None):
         n_edges = ingest_path_edges(nodes, ways, session)
         print(f"  path edges: {n_edges}")
 
+        print(f"\nReading indoor map {indoor_osm_path} ...")
+        if not indoor_osm_path.exists():
+            print(f"  indoor map not found at {indoor_osm_path} — skipping")
+            n_indoor_places = n_indoor_areas = n_indoor_edges = 0
+        else:
+            indoor_nodes, indoor_ways = parse_osm(str(indoor_osm_path))
+            counts = ingest_indoor_places(indoor_nodes, indoor_ways, session)
+            n_indoor_places = counts["places"]
+            n_indoor_areas = counts["areas"]
+            n_indoor_edges = counts["edges"]
+            print(f"  indoor door places: {n_indoor_places}")
+            print(f"  indoor rooms: {n_indoor_areas}")
+            print(f"  indoor path edges: {n_indoor_edges}")
+
     print("\nIngest complete.")
-    return {"places": n_places, "areas": n_areas, "edges": n_edges}
+    return {
+        "places": n_places,
+        "areas": n_areas,
+        "edges": n_edges,
+        "indoor_places": n_indoor_places,
+        "indoor_areas": n_indoor_areas,
+        "indoor_edges": n_indoor_edges,
+    }
 
 
 if __name__ == "__main__":
@@ -22929,6 +26072,134 @@ def _main():
 
 if __name__ == "__main__":
     _main()
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\scripts\add_indoor_tables.py ---
+
+"""
+One-off script to add indoor_areas and indoor_path_edges tables.
+Safe to run twice.
+"""
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.api.settings import DATABASE_PATH
+
+conn = sqlite3.connect(str(DATABASE_PATH))
+
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS indoor_areas (
+    id INTEGER PRIMARY KEY,
+    osm_type TEXT NOT NULL,
+    osm_id TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    ref TEXT,
+    level TEXT,
+    geometry_wkt TEXT NOT NULL,
+    door_node_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_indoor_areas_name_lower ON indoor_areas(lower(name));
+CREATE INDEX IF NOT EXISTS ix_indoor_areas_level ON indoor_areas(level);
+CREATE INDEX IF NOT EXISTS ix_indoor_areas_osm_id ON indoor_areas(osm_id);
+CREATE INDEX IF NOT EXISTS ix_indoor_areas_door_node_id ON indoor_areas(door_node_id);
+
+CREATE TABLE IF NOT EXISTS indoor_path_edges (
+    id INTEGER PRIMARY KEY,
+    node_a_osm TEXT NOT NULL,
+    node_b_osm TEXT NOT NULL,
+    length_m REAL NOT NULL,
+    highway TEXT,
+    level TEXT,
+    kind TEXT NOT NULL DEFAULT 'walk',
+    corridor INTEGER NOT NULL DEFAULT 0,
+    description TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_indoor_path_edges_node_a_osm ON indoor_path_edges(node_a_osm);
+CREATE INDEX IF NOT EXISTS ix_indoor_path_edges_node_b_osm ON indoor_path_edges(node_b_osm);
+CREATE INDEX IF NOT EXISTS ix_indoor_path_edges_level ON indoor_path_edges(level);
+CREATE INDEX IF NOT EXISTS ix_indoor_path_edges_kind ON indoor_path_edges(kind);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_indoor_path_edges_pair ON indoor_path_edges(node_a_osm, node_b_osm);
+""")
+
+conn.commit()
+conn.close()
+print("Done.")
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\scripts\add_place_kind_columns.py ---
+
+import sqlite3
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.api.settings import DATABASE_PATH
+
+conn = sqlite3.connect(str(DATABASE_PATH))
+cols = {r[1] for r in conn.execute("PRAGMA table_info(places)").fetchall()}
+
+if "kind" not in cols:
+    conn.execute("ALTER TABLE places ADD COLUMN kind TEXT NOT NULL DEFAULT 'outdoor'")
+if "level" not in cols:
+    conn.execute("ALTER TABLE places ADD COLUMN level TEXT")
+if "room_name" not in cols:
+    conn.execute("ALTER TABLE places ADD COLUMN room_name TEXT")
+conn.execute("CREATE INDEX IF NOT EXISTS ix_places_kind ON places(kind)")
+conn.commit()
+print("Done.")
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\scripts\test_composer.py ---
+
+"""
+Quick test for the route composer. Picks one indoor and one outdoor
+place and prints the route.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from backend.api.db.session import session_scope
+from backend.api.models.place import Place
+from backend.api.services import route_composer
+
+
+def main():
+    with session_scope() as session:
+        outdoor = session.query(Place).filter_by(kind="outdoor").first()
+        indoor = session.query(Place).filter_by(kind="indoor").first()
+
+        if outdoor is None:
+            print("No outdoor place found. Run ingest first.")
+            return
+        if indoor is None:
+            print("No indoor place found. Run ingest first.")
+            return
+
+        print(f"Outdoor: {outdoor.name} (id={outdoor.id})")
+        print(f"Indoor:  {indoor.name} (id={indoor.id}, room={indoor.room_name})")
+        print()
+
+        try:
+            route = route_composer.compose_route(session, outdoor.id, indoor.id)
+        except route_composer.RouteCompositionError as e:
+            print(f"Composer error: {e}")
+            return
+
+        print(f"Engine:   {route['engine']}")
+        print(f"Distance: {route['distance_m']:.0f} m")
+        print()
+        print("Steps:")
+        for i, step in enumerate(route["steps"], 1):
+            print(f"  {i}. {step['instruction']}")
+
+
+if __name__ == "__main__":
+    main()
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\conftest.py ---
 
