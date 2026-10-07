@@ -56,7 +56,8 @@ def get_indoor_graph():
       nodes, graph, edge_tags, door_node_ids, entrance_node_ids,
       corridor_of_door, rooms, stair_ways,
       entrance_to_outdoor (dict of indoor_entrance_id -> outdoor_node_id),
-      outdoor_node_ids (set)
+      outdoor_node_ids (set),
+      indoor_node_ids (set)
     """
     global _built
     if _built is not None:
@@ -82,7 +83,7 @@ def is_indoor_node(node_id, bundle=None) -> bool:
         bundle = get_indoor_graph()
     if not isinstance(node_id, str):
         node_id = str(node_id)
-    return node_id in bundle["nodes"] and not node_id.startswith("o")
+    return node_id in bundle["indoor_node_ids"]
 
 
 def is_outdoor_node(node_id, bundle=None) -> bool:
@@ -91,7 +92,7 @@ def is_outdoor_node(node_id, bundle=None) -> bool:
         bundle = get_indoor_graph()
     if not isinstance(node_id, str):
         node_id = str(node_id)
-    return node_id.startswith("o") and node_id in bundle["nodes"]
+    return node_id in bundle["outdoor_node_ids"]
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +158,11 @@ def _build():
         outdoor_nodes_raw,
     )
 
+    # Distinguish indoor from outdoor nodes by the "o" prefix. Any
+    # node in `nodes` whose id does not start with "o" is indoor.
+    indoor_node_ids = {nid for nid in nodes if not nid.startswith("o")}
+    outdoor_node_ids = {"o" + oid for oid in outdoor_walkable_ids}
+
     logger.info(
         "Indoor graph built: %d total nodes, %d outdoor nodes, %d entrances linked",
         len(nodes),
@@ -174,8 +180,8 @@ def _build():
         "rooms": rooms,
         "stair_ways": stair_ways,
         "entrance_to_outdoor": entrance_to_outdoor,
-        "outdoor_node_ids": {"o" + oid for oid in outdoor_walkable_ids},
-        "indoor_node_ids": set(indoor_nodes.keys()),
+        "outdoor_node_ids": outdoor_node_ids,
+        "indoor_node_ids": indoor_node_ids,
     }
 
 

@@ -118,6 +118,11 @@ def compose_route(
 def _route_via_indoor_engine(from_ep, to_ep):
     """
     Route from_ep["node_id"] to to_ep["node_id"] on the enriched graph.
+
+    Post-processes the frozen engine's steps to fix one cosmetic
+    issue: the frozen engine prepends "Starting from X on the ground
+    floor" to the first step, which reads wrong when X is an outdoor
+    place. If the start node is outdoor, we strip the floor suffix.
     """
     bundle = indoor_graph_builder.get_indoor_graph()
 
@@ -125,6 +130,7 @@ def _route_via_indoor_engine(from_ep, to_ep):
     graph = bundle["graph"]
     door_node_ids = bundle["door_node_ids"]
     corridor_of_door = bundle["corridor_of_door"]
+    indoor_node_ids = bundle["indoor_node_ids"]
 
     from_id = from_ep["node_id"]
     to_id = to_ep["node_id"]
@@ -156,6 +162,15 @@ def _route_via_indoor_engine(from_ep, to_ep):
     )
     total = total_distance_m(path, nodes)
 
+    # Cosmetic fix: strip the floor suffix from the opening line if
+    # the walk starts outdoors.
+    start_is_outdoor = from_id not in indoor_node_ids
+    steps = _fix_opening_line(
+        steps,
+        start_is_outdoor=start_is_outdoor,
+        start_name=from_ep["name"],
+    )
+
     geometry = [
         {"lat": nodes[nid]["lat"], "lon": nodes[nid]["lon"]}
         for nid in path
@@ -169,3 +184,27 @@ def _route_via_indoor_engine(from_ep, to_ep):
         "from_name": from_ep["name"],
         "to_name": to_ep["name"],
     }
+
+
+def _fix_opening_line(steps, start_is_outdoor, start_name):
+    """
+    The frozen indoor engine produces an opening line like
+    "Starting from X on the ground floor". When X is an outdoor
+    place, "on the ground floor" doesn't apply. Strip it.
+
+    Only the first step is touched. Everything else is returned
+    unchanged, because the rest of the steps come from the outdoor
+    half and are already worded correctly by the frozen engine (the
+    outdoor walkways aren't tagged corridor=yes, so the engine treats
+    them as connecting paths and doesn't use corridor language).
+    """
+    if not start_is_outdoor:
+        return steps
+    if not steps:
+        return steps
+
+    opening = f"Starting from {start_name}" if start_name else "From your current position"
+
+    fixed = list(steps)
+    fixed[0] = {**fixed[0], "instruction": opening}
+    return fixed
