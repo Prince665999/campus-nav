@@ -59,21 +59,21 @@
     "noRoute": "No route found between those places."
   },
   "walking": {
-  "title": "Walking",
-  "offRouteTitle": "You seem off route",
-  "offRouteSubtitle": "Are you on a different path?",
-  "recalculate": "Recalculate",
-  "permissionNeeded": "Location permission is needed to guide you.",
-  "approaching": "You're approaching {name}",
-  "calculating": "Calculating route…",
-  "searchingGps": "Searching for GPS…",
-  "indoorsTitle": "You're inside now",
-  "indoorsBody": "Follow the steps below to reach {name}. Tap Next step after each one.",
-  "indoorsBodyNoName": "Follow the steps below to reach the destination. Tap Next step after each one.",
-  "indoorsBadge": "Indoor — no GPS",
-  "nextStepButton": "Next step",
-  "arrivedButton": "I've arrived"
-},
+    "title": "Walking",
+    "offRouteTitle": "You seem off route",
+    "offRouteSubtitle": "Are you on a different path?",
+    "recalculate": "Recalculate",
+    "permissionNeeded": "Location permission is needed to guide you.",
+    "approaching": "You're approaching {name}",
+    "calculating": "Calculating route…",
+    "searchingGps": "Searching for GPS…",
+    "indoorsTitle": "You're inside now",
+    "indoorsBody": "Follow the steps below to reach {name}. Tap Next step after each one.",
+    "indoorsBodyNoName": "Follow the steps below to reach the destination. Tap Next step after each one.",
+    "indoorsBadge": "Indoor — no GPS",
+    "nextStepButton": "Next step",
+    "arrivedButton": "I've arrived"
+  },
   "arrival": {
     "title": "Arrival",
     "arrived": "You've arrived",
@@ -157,6 +157,8 @@
     "hapticsDescription": "Buzz when you reach a turn.",
     "reduceMotion": "Reduce motion",
     "reduceMotionDescription": "Turn off animations.",
+    "indoorNavigation": "Indoor navigation",
+    "indoorNavigationDescription": "Show floor plans and step-by-step directions inside buildings.",
     "units": "Units",
     "unitsMetric": "Metric",
     "unitsImperial": "Imperial",
@@ -179,51 +181,51 @@
     "library": "Library"
   },
   "timetable": {
-  "title": "Timetable",
-  "noClasses": "No classes on this day.",
-  "periodsCount": "{count} period(s)",
-  "days": {
-    "monday": "Monday",
-    "tuesday": "Tuesday",
-    "wednesday": "Wednesday",
-    "thursday": "Thursday",
-    "friday": "Friday",
-    "saturday": "Saturday",
-    "sunday": "Sunday",
-    "mon": "Mon",
-    "tue": "Tue",
-    "wed": "Wed",
-    "thu": "Thu",
-    "fri": "Fri",
-    "sat": "Sat",
-    "sun": "Sun"
+    "title": "Timetable",
+    "noClasses": "No classes on this day.",
+    "periodsCount": "{count} period(s)",
+    "days": {
+      "monday": "Monday",
+      "tuesday": "Tuesday",
+      "wednesday": "Wednesday",
+      "thursday": "Thursday",
+      "friday": "Friday",
+      "saturday": "Saturday",
+      "sunday": "Sunday",
+      "mon": "Mon",
+      "tue": "Tue",
+      "wed": "Wed",
+      "thu": "Thu",
+      "fri": "Fri",
+      "sat": "Sat",
+      "sun": "Sun"
+    },
+    "picker": {
+      "intro": "Choose your program and year to see your timetable.",
+      "stepProgram": "Step 1 — Choose your program",
+      "stepYear": "Step 2 — Choose your year",
+      "loading": "Loading programs…",
+      "empty": "No programs available yet. Check back later.",
+      "noYears": "No years available for this program.",
+      "yearLabel": "Year {n}",
+      "searchPlaceholder": "Search programs…",
+      "noMatch": "No programs match your search."
+    },
+    "banner": {
+      "startingNow": "Starting now",
+      "startsIn": "In {minutes} min",
+      "takeMeThere": "Take me there",
+      "viewTimetable": "View timetable"
+    }
   },
-  "picker": {
-    "intro": "Choose your program and year to see your timetable.",
-    "stepProgram": "Step 1 — Choose your program",
-    "stepYear": "Step 2 — Choose your year",
-    "loading": "Loading programs…",
-    "empty": "No programs available yet. Check back later.",
-    "noYears": "No years available for this program.",
-    "yearLabel": "Year {n}",
-    "searchPlaceholder": "Search programs…",
-    "noMatch": "No programs match your search."
-  },
-  "banner": {
-    "startingNow": "Starting now",
-    "startsIn": "In {minutes} min",
-    "takeMeThere": "Take me there",
-    "viewTimetable": "View timetable"
+  "intents": {
+    "eat": "Food",
+    "study": "Study",
+    "print": "Print",
+    "wifi": "Wi-Fi",
+    "sports": "Sports",
+    "meet": "Meet up",
+    "toilet": "Toilets",
+    "prayer": "Prayer"
   }
-},
-"intents": {
-  "eat": "Food",
-  "study": "Study",
-  "print": "Print",
-  "wifi": "Wi-Fi",
-  "sports": "Sports",
-  "meet": "Meet up",
-  "toilet": "Toilets",
-  "prayer": "Prayer"
-}
 }

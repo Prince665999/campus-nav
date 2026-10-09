@@ -1,11 +1,13 @@
 // MapView.jsx — MapLibre version with rotation and recentering.
 //
-// When `mode` is "indoor", the tile map is replaced by a placeholder
-// panel. This keeps the outdoor map out of the way while the student
-// is inside a building — no misleading GPS dot on a map that doesn't
-// show the building's interior.
+// Two modes:
+//   - outdoor: the tile map (as before).
+//   - indoor:  the floor plan (IndoorMapView), which fetches rooms
+//              and corridors for the current building+level. If the
+//              API returns no rooms (unsurveyed building), we fall
+//              back to IndoorMapPlaceholder.
 
-import { useMemo, useRef, useEffect } from 'react';
+import { useMemo, useRef, useEffect, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import {
   MapView,
@@ -16,6 +18,7 @@ import {
 } from '@maplibre/maplibre-react-native';
 
 import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
+import { IndoorMapView } from '@/components/IndoorMapView';
 
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
 const DEFAULT_CENTER = [39.2000, -6.7500];
@@ -44,9 +47,23 @@ export function RouteMap({
   followBearing = false,
   mode = 'outdoor',
   destinationName = null,
+  // Indoor mode props:
+  indoorBuildingName = null,
+  indoorLevel = null,
+  indoorGeometry = [],
+  indoorDestination = null,
   style,
 }) {
   const cameraRef = useRef(null);
+
+  // If the indoor view reports no rooms for the current floor, we
+  // fall back to the placeholder. Reset whenever the building or
+  // level changes.
+  const [indoorNoRooms, setIndoorNoRooms] = useState(false);
+
+  useEffect(() => {
+    setIndoorNoRooms(false);
+  }, [indoorBuildingName, indoorLevel]);
 
   const routeCoords = useMemo(
     () => geometry.map((p) => [p.lon, p.lat]),
@@ -142,12 +159,24 @@ export function RouteMap({
     }
   }, [userLocation, bearing, followBearing, mode]);
 
-  // Indoor mode: no tile map. Replace with the placeholder panel.
+  // Indoor mode.
   if (mode === 'indoor') {
+    if (indoorNoRooms) {
+      return (
+        <IndoorMapPlaceholder
+          destinationName={destinationName}
+          style={style}
+        />
+      );
+    }
     return (
-      <IndoorMapPlaceholder
-        destinationName={destinationName}
+      <IndoorMapView
+        buildingName={indoorBuildingName}
+        level={indoorLevel}
+        routeGeometry={indoorGeometry}
+        destination={indoorDestination}
         style={style}
+        onNoRooms={() => setIndoorNoRooms(true)}
       />
     );
   }

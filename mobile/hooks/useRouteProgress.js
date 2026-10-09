@@ -87,8 +87,6 @@ export function useRouteProgress(route) {
   useEffect(() => {
     const mode = currentStep.mode;
 
-    // Transition outdoor → indoor: initialize the manual index at
-    // the first indoor step.
     if (
       lastModeRef.current === 'outdoor' &&
       mode === 'indoor' &&
@@ -121,24 +119,74 @@ export function useRouteProgress(route) {
     ? 0
     : outdoor.distanceRemainingM;
 
-  // Distance to next step. Only meaningful when outdoor.
   const distanceToNextStepM = currentStep.mode === 'indoor'
     ? 0
     : outdoor.distanceToNextStepM;
 
-  // Progress fraction. Outdoor uses the snapped value; indoor uses
-  // step index over total steps.
   const progress = currentStep.mode === 'indoor'
     ? (steps.length > 1 ? currentStep.index / (steps.length - 1) : 1)
     : outdoor.progress;
 
+  // -----------------------------------------------------------------
+  // Indoor-specific derived values
+  // -----------------------------------------------------------------
+
+  // The current indoor level, from the current step. Used by the
+  // indoor floor plan to fetch the right floor. Null when outdoor.
+  const indoorLevel =
+    currentStep.mode === 'indoor' && currentStep.step
+      ? currentStep.step.level || null
+      : null;
+
+  // The current building name, from the current step. Null when
+  // outdoor.
+  const indoorBuildingName =
+    currentStep.mode === 'indoor' && currentStep.step
+      ? currentStep.step.building_name || null
+      : null;
+
+  // The indoor portion of the route geometry. Sliced using the
+  // geometry_index of the first and last indoor steps.
+  //
+  // The route's geometry is one long array covering both outdoor and
+  // indoor legs. Each indoor step carries geometry_index — its
+  // position in that array. Taking the first indoor step's index as
+  // the start and the last's as the end gives us the indoor slice.
+  const indoorGeometry = useMemo(() => {
+    if (!route?.geometry || !steps.length) return [];
+
+    let firstIndoorIdx = null;
+    let lastIndoorIdx = null;
+    for (const step of steps) {
+      if (step.mode !== 'indoor') continue;
+      const gi = step.geometry_index;
+      if (gi == null) continue;
+      if (firstIndoorIdx === null) firstIndoorIdx = gi;
+      lastIndoorIdx = gi;
+    }
+    if (firstIndoorIdx === null) return [];
+
+    return route.geometry.slice(firstIndoorIdx, lastIndoorIdx + 1);
+  }, [route?.geometry, steps]);
+
+  // The destination point of the indoor leg. Used by the floor plan
+  // to place a marker. The last indoor step's geometry_index points
+  // at the destination node.
+  const indoorDestination = useMemo(() => {
+    if (!route?.geometry || !steps.length) return null;
+    let lastIndoorIdx = null;
+    for (const step of steps) {
+      if (step.mode !== 'indoor') continue;
+      if (step.geometry_index == null) continue;
+      lastIndoorIdx = step.geometry_index;
+    }
+    if (lastIndoorIdx === null) return null;
+    return route.geometry[lastIndoorIdx] || null;
+  }, [route?.geometry, steps]);
+
   return {
     permissionGranted: outdoor.permissionGranted,
 
-    // Position (snapped) — null when indoor, so the map doesn't render
-    // a stale dot. We keep rawPosition so compass/heading still work
-    // for the outdoor case, but the walking screen won't show the dot
-    // when mode is indoor.
     position: currentStep.mode === 'indoor' ? null : outdoor.position,
     rawPosition: outdoor.rawPosition,
 
@@ -155,9 +203,13 @@ export function useRouteProgress(route) {
 
     resetOffRoute: outdoor.resetOffRoute,
 
-    // Only exposed in indoor mode; the walking screen shows the
-    // "Next step" button only when mode === 'indoor'.
     advanceStep,
     isLastStep: currentStep.index >= steps.length - 1,
+
+    // Indoor-specific values, for the floor plan.
+    indoorLevel,
+    indoorBuildingName,
+    indoorGeometry,
+    indoorDestination,
   };
 }

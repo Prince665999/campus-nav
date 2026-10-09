@@ -131,11 +131,13 @@ export default function WalkingScreen() {
     mode,
     advanceStep,
     isLastStep,
+    // Indoor-specific:
+    indoorLevel,
+    indoorBuildingName,
+    indoorGeometry,
+    indoorDestination,
   } = useRouteProgress(route);
 
-  // Compass only runs when outdoor. When indoor, the compass is
-  // ignored — we still call the hook (calling it conditionally would
-  // violate React rules) but we don't feed its output to the arrow.
   const { heading } = useCompass({ position: rawPosition });
 
   useEffect(() => {
@@ -205,7 +207,6 @@ export default function WalkingScreen() {
     };
   }, []);
 
-  // Outdoor arrival: proximity-triggered, as before.
   useEffect(() => {
     if (mode !== 'outdoor') return;
     if (arrivedRef.current) return;
@@ -219,13 +220,11 @@ export default function WalkingScreen() {
     });
   }, [mode, distanceRemainingM, route, destinationId]);
 
-  // Indoor arrival: the student taps "I've arrived" on the last step.
   const handleAdvanceStep = useCallback(() => {
     if (!isLastStep) {
       advanceStep();
       return;
     }
-    // Last step: trigger arrival.
     if (arrivedRef.current) return;
     arrivedRef.current = true;
     haptics.arrivalPulse();
@@ -438,6 +437,10 @@ export default function WalkingScreen() {
             followBearing={true}
             mode={mode}
             destinationName={route.to_name}
+            indoorBuildingName={indoorBuildingName}
+            indoorLevel={indoorLevel}
+            indoorGeometry={indoorGeometry}
+            indoorDestination={indoorDestination}
             style={styles.map}
           />
         </View>

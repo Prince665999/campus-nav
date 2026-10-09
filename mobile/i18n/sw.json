@@ -59,21 +59,21 @@
     "noRoute": "Hakuna njia kati ya mahali hapo."
   },
   "walking": {
-  "title": "Kutembea",
-  "offRouteTitle": "Unaonekana uko nje ya njia",
-  "offRouteSubtitle": "Umepitia njia nyingine?",
-  "recalculate": "Hesabu tena",
-  "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
-  "approaching": "Unakaribia {name}",
-  "calculating": "Inahesabu njia…",
-  "searchingGps": "Inatafuta GPS…",
-  "indoorsTitle": "Uko ndani sasa",
-  "indoorsBody": "Fuata hatua hapa chini kufikia {name}. Gusa Endelea baada ya kila hatua.",
-  "indoorsBodyNoName": "Fuata hatua hapa chini kufikia unakoenda. Gusa Endelea baada ya kila hatua.",
-  "indoorsBadge": "Ndani — hakuna GPS",
-  "nextStepButton": "Endelea",
-  "arrivedButton": "Nimefika"
-},
+    "title": "Kutembea",
+    "offRouteTitle": "Unaonekana uko nje ya njia",
+    "offRouteSubtitle": "Umepitia njia nyingine?",
+    "recalculate": "Hesabu tena",
+    "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
+    "approaching": "Unakaribia {name}",
+    "calculating": "Inahesabu njia…",
+    "searchingGps": "Inatafuta GPS…",
+    "indoorsTitle": "Uko ndani sasa",
+    "indoorsBody": "Fuata hatua hapa chini kufikia {name}. Gusa Endelea baada ya kila hatua.",
+    "indoorsBodyNoName": "Fuata hatua hapa chini kufikia unakoenda. Gusa Endelea baada ya kila hatua.",
+    "indoorsBadge": "Ndani — hakuna GPS",
+    "nextStepButton": "Endelea",
+    "arrivedButton": "Nimefika"
+  },
   "arrival": {
     "title": "Kufika",
     "arrived": "Umefika",
@@ -157,6 +157,8 @@
     "hapticsDescription": "Tetema unapofika kwenye kona.",
     "reduceMotion": "Punguza mwendo",
     "reduceMotionDescription": "Zima uhuishaji.",
+    "indoorNavigation": "Urambazaji wa ndani",
+    "indoorNavigationDescription": "Onyesha ramani za sakafu na maelekezo ya hatua kwa hatua ndani ya majengo.",
     "units": "Vipimo",
     "unitsMetric": "Metric",
     "unitsImperial": "Imperial",
@@ -179,51 +181,51 @@
     "library": "Maktaba"
   },
   "timetable": {
-  "title": "Ratiba",
-  "noClasses": "Hakuna vipindi siku hii.",
-  "periodsCount": "Vipindi {count}",
-  "days": {
-    "monday": "Jumatatu",
-    "tuesday": "Jumanne",
-    "wednesday": "Jumatano",
-    "thursday": "Alhamisi",
-    "friday": "Ijumaa",
-    "saturday": "Jumamosi",
-    "sunday": "Jumapili",
-    "mon": "Jtat",
-    "tue": "Jnan",
-    "wed": "Jtan",
-    "thu": "Alh",
-    "fri": "Ijm",
-    "sat": "Jmos",
-    "sun": "Jpil"
+    "title": "Ratiba",
+    "noClasses": "Hakuna vipindi siku hii.",
+    "periodsCount": "Vipindi {count}",
+    "days": {
+      "monday": "Jumatatu",
+      "tuesday": "Jumanne",
+      "wednesday": "Jumatano",
+      "thursday": "Alhamisi",
+      "friday": "Ijumaa",
+      "saturday": "Jumamosi",
+      "sunday": "Jumapili",
+      "mon": "Jtat",
+      "tue": "Jnan",
+      "wed": "Jtan",
+      "thu": "Alh",
+      "fri": "Ijm",
+      "sat": "Jmos",
+      "sun": "Jpil"
+    },
+    "picker": {
+      "intro": "Chagua programu na mwaka wako ili kuona ratiba yako.",
+      "stepProgram": "Hatua 1 — Chagua programu yako",
+      "stepYear": "Hatua 2 — Chagua mwaka wako",
+      "loading": "Inapakia programu…",
+      "empty": "Hakuna programu bado. Angalia tena baadaye.",
+      "noYears": "Hakuna miaka inayopatikana kwa programu hii.",
+      "yearLabel": "Mwaka {n}",
+      "searchPlaceholder": "Tafuta programu…",
+      "noMatch": "Hakuna programu inayolingana na utafutaji wako."
+    },
+    "banner": {
+      "startingNow": "Inaanza sasa",
+      "startsIn": "Baada ya dakika {minutes}",
+      "takeMeThere": "Nipeleke hapo",
+      "viewTimetable": "Ona ratiba"
+    }
   },
-  "picker": {
-    "intro": "Chagua programu na mwaka wako ili kuona ratiba yako.",
-    "stepProgram": "Hatua 1 — Chagua programu yako",
-    "stepYear": "Hatua 2 — Chagua mwaka wako",
-    "loading": "Inapakia programu…",
-    "empty": "Hakuna programu bado. Angalia tena baadaye.",
-    "noYears": "Hakuna miaka inayopatikana kwa programu hii.",
-    "yearLabel": "Mwaka {n}",
-    "searchPlaceholder": "Tafuta programu…",
-    "noMatch": "Hakuna programu inayolingana na utafutaji wako."
-  },
-  "banner": {
-    "startingNow": "Inaanza sasa",
-    "startsIn": "Baada ya dakika {minutes}",
-    "takeMeThere": "Nipeleke hapo",
-    "viewTimetable": "Ona ratiba"
+  "intents": {
+    "eat": "Chakula",
+    "study": "Kusoma",
+    "print": "Kuchapisha",
+    "wifi": "Wi-Fi",
+    "sports": "Michezo",
+    "meet": "Kukutana",
+    "toilet": "Vyoo",
+    "prayer": "Kuomba"
   }
-},
-"intents": {
-  "eat": "Chakula",
-  "study": "Kusoma",
-  "print": "Kuchapisha",
-  "wifi": "Wi-Fi",
-  "sports": "Michezo",
-  "meet": "Kukutana",
-  "toilet": "Vyoo",
-  "prayer": "Kuomba"
-}
 }

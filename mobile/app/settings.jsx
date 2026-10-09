@@ -1,11 +1,6 @@
 // Settings screen.
-//
-// Sections: Language, Voice, Accessibility, Wi-Fi, Units.
-// Contains a temporary Development section with a reset-onboarding
-// button. Remove that section before the pilot.
 
 import {
-  Alert,
   ScrollView,
   StyleSheet,
   Switch,
@@ -84,6 +79,16 @@ export default function SettingsScreen() {
             accessibilityLabel={t('settings.reduceMotion')}
           />
         </Row>
+        <Row
+          label={t('settings.indoorNavigation')}
+          description={t('settings.indoorNavigationDescription')}
+        >
+          <Switch
+            value={settings.indoorsEnabled}
+            onValueChange={(v) => updateSetting('indoorsEnabled', v)}
+            accessibilityLabel={t('settings.indoorNavigation')}
+          />
+        </Row>
       </Section>
 
       <Section title={t('settings.wifi')}>
@@ -116,7 +121,7 @@ export default function SettingsScreen() {
 
       <View style={styles.footer}>
         <Text style={styles.footerText}>
-          {t('settings.version', { version: '0.18.0' })}
+          {t('settings.version', { version: '0.19.0' })}
         </Text>
       </View>
     </ScrollView>
@@ -214,15 +219,6 @@ const styles = StyleSheet.create({
   segmentActive: { backgroundColor: COLORS.background },
   segmentText: { fontSize: FONT_SIZE.body, color: COLORS.textMuted },
   segmentTextActive: { color: COLORS.text, fontWeight: '600' },
-  devButton: {
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  devButtonText: {
-    color: COLORS.danger,
-    fontSize: FONT_SIZE.body,
-    fontWeight: '500',
-  },
   footer: { alignItems: 'center', padding: SPACING.xl },
   footerText: { color: COLORS.textFaint, fontSize: FONT_SIZE.small },
 });

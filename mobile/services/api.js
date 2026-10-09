@@ -66,11 +66,12 @@ export async function searchPlaces(q, { limit = 20 } = {}) {
   return request(`/api/places/search?${params.toString()}`);
 }
 
-export async function listPlaces({ q, category, intent, lat, lon, radius_m, limit } = {}) {
+export async function listPlaces({ q, category, intent, kind, lat, lon, radius_m, limit } = {}) {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (category) params.set('category', category);
   if (intent) params.set('intent', intent);
+  if (kind) params.set('kind', kind);
   if (lat != null) params.set('lat', String(lat));
   if (lon != null) params.set('lon', String(lon));
   if (radius_m != null) params.set('radius_m', String(radius_m));
@@ -288,6 +289,30 @@ export async function getNearbyWifi({ lat, lon, r = 25 } = {}) {
   if (lon != null) params.set('lon', String(lon));
   params.set('r', String(r));
   return request(`/api/wifi/nearby?${params.toString()}`);
+}
+
+// ---------------------------------------------------------------
+// Indoor floor plans
+// ---------------------------------------------------------------
+
+/**
+ * Fetch the rooms and corridors for one floor of one building.
+ *
+ * Used by the walking screen when the current step is indoor.
+ * Returns { building_name, level, areas: [...] }.
+ *
+ * Each area has { id, osm_id, name, ref, type, level,
+ * door_node_id, boundary: [{lat, lon}], centroid: {lat, lon} }.
+ *
+ * If the building or level has no polygons yet, `areas` is empty
+ * and the caller falls back to the indoor placeholder.
+ */
+export async function getIndoorAreas({ buildingName, level }) {
+  const params = new URLSearchParams({
+    building_name: buildingName,
+    level: String(level),
+  });
+  return request(`/api/indoor/areas?${params.toString()}`);
 }
 
 // ---------------------------------------------------------------
