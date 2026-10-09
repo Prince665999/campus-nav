@@ -17,43 +17,22 @@ For mixed routes, each step carries a `mode` field ("outdoor" or
 "indoor") so the client can switch rendering behavior at the
 boundary.
 
-Mixed route with GPS start
---------------------------
-When the student starts walking from their live position (GPS), the
-composer can't just route from a place id — it has to snap the fix
-to a node on the merged graph. The merged graph contains both
-outdoor nodes (prefixed with "o") and indoor nodes (unprefixed). The
-snapping logic mirrors what the outdoor engine does, so the behavior
-at the boundary is consistent: a fix too far from any node raises
-UnreliableLocationError, same as pure outdoor.
+Step distances on mixed routes
+------------------------------
+The outdoor engine provides real `at_m` values per step. The indoor
+engine does not — it labels steps by node_id only.
 
-Indoor step enrichment
-----------------------
-The frozen indoor engine doesn't provide per-step distances,
-geometry indices, or level info. After it returns, this module walks
-the path and annotates each indoor step with:
+For a MIXED route (which always goes through the indoor engine,
+because at least one endpoint is indoor), we cannot leave `at_m`
+at 0 for every step, or the phone's currentStepIndex() would fall
+through its loop and jump straight to the last step ("You have
+arrived"). So `_annotate_steps_and_legs` computes real cumulative
+distances along the path for every step, outdoor and indoor.
 
-  - geometry_index — where in the route geometry that step's node
-                     sits.
-  - level          — the floor the step is on.
-  - building_name  — which building the step is in.
-
-Levels are stored on the *edges* in the OSM data (verified in the
-DB: every indoor_path_edges row has a level tag). Corridor and walk
+Levels are stored on the *edges* in the OSM data. Corridor and walk
 edges carry a single level like "0" or "-1". Stairs edges carry a
-semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top.
-
-The node's own `level` tag is deliberately NOT consulted. On this
-map, nodes are shared between ways and their tags can be stale. The
-edge is authoritative.
-
-Step distances (at_m, distance_m)
----------------------------------
-The frozen indoor engine doesn't provide per-step distances — it
-embeds them in the instruction text. Rather than parse the text or
-modify the frozen file, we leave `at_m` and `distance_m` at 0.0 for
-indoor steps. The mobile app in indoor mode advances by step index
-rather than by distance, so this is fine.
+semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top. See
+_enrich_indoor_steps for how levels are tracked.
 """
 
 import logging
@@ -230,9 +209,6 @@ def compose_route(
     from_kind = from_place.kind if from_place else None
     to_kind = to_place.kind if to_place else None
 
-    # Case 1 & 2: both endpoints are outdoor (or one side is GPS,
-    # which is treated as outdoor). The outdoor engine handles this —
-    # same code path as before the composer existed.
     from_is_outdoor = (
         from_kind == "outdoor"
         or (from_place is None and from_lat is not None)
@@ -281,8 +257,7 @@ def compose_route(
             "Either from_place_id or from_lat/from_lon is required."
         )
 
-    # Resolve the to endpoint. The mobile app always sends a place id
-    # for destinations, so this branch is simpler.
+    # Resolve the to endpoint.
     if to_place is not None:
         to_ep = _classify_endpoint(to_place)
     else:
@@ -311,6 +286,7 @@ def _route_via_outdoor_engine(
     each step and a single leg spanning the whole route.
     """
     from . import routing_service
+    from ..schemas.route import RouteLeg
 
     route = routing_service.compute_route(
         session, graph, nodes, edge_tags,
@@ -329,14 +305,14 @@ def _route_via_outdoor_engine(
         step.mode = "outdoor"
 
     route.legs = [
-        {
-            "mode": "outdoor",
-            "from_m": 0.0,
-            "to_m": route.distance_m,
-            "distance_m": route.distance_m,
-            "from_name": route.from_name,
-            "to_name": route.to_name,
-        }
+        RouteLeg(
+            mode="outdoor",
+            from_m=0.0,
+            to_m=route.distance_m,
+            distance_m=route.distance_m,
+            from_name=route.from_name,
+            to_name=route.to_name,
+        )
     ]
     return route
 
@@ -396,7 +372,7 @@ def _route_via_indoor_engine(from_ep, to_ep):
     )
 
     annotated_steps, legs = _annotate_steps_and_legs(
-        steps, path, indoor_node_ids, from_ep, to_ep, total
+        steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
     )
 
     # Fill in geometry_index, level, and building_name on each step.
@@ -434,59 +410,93 @@ def _fix_opening_line(steps, start_is_outdoor, start_name):
     return fixed
 
 
-def _annotate_steps_and_legs(steps, path, indoor_node_ids, from_ep, to_ep, total):
+def _annotate_steps_and_legs(
+    steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
+):
     """
-    Tag steps with mode; classify each step's kind; build a legs
-    array by grouping contiguous same-mode steps.
-    """
-    # --- Assign mode to each step ---
-    modes = []
-    last_mode = "outdoor"
-    for step in steps:
-        node_id = step.get("node_id") or ""
-        if node_id:
-            mode = "outdoor" if node_id.startswith("o") else "indoor"
-            last_mode = mode
-        else:
-            mode = last_mode
-        modes.append(mode)
+    Give every step a mode, a real at_m, and a real distance_m.
 
-    # --- Build the step dicts ---
+    The at_m values are cumulative distances along the path. Each
+    step's node_id is matched to a position in the path, and the
+    step's at_m is that node's cumulative distance. Steps whose node
+    isn't in the path (shouldn't happen) inherit the previous step's
+    at_m.
+
+    Why real at_m matters: the mobile app's currentStepIndex() picks
+    the current step by comparing distanceFromStartM to each step's
+    at_m. If every at_m is 0, the comparison never matches and the
+    function returns the last step — "You have arrived".
+
+    The pointer `ptr` advances monotonically, so repeated node ids in
+    the path (which happen when a step's instruction is generated
+    from a mid-way node) map to the correct position.
+    """
+    # Cumulative distance along the path.
+    cum = [0.0]
+    for a, b in zip(path, path[1:]):
+        cum.append(
+            cum[-1]
+            + _haversine_m(
+                nodes[a]["lat"], nodes[a]["lon"],
+                nodes[b]["lat"], nodes[b]["lon"],
+            )
+        )
+
+    modes = []
+    at_ms = []
+    last_mode = "outdoor"
+    last_at = 0.0
+    ptr = 0
+
+    for step in steps:
+        nid = step.get("node_id") or ""
+        if nid:
+            last_mode = "outdoor" if nid.startswith("o") else "indoor"
+            # Move forward until we find this node. We never go
+            # backwards, so repeated nodes map in order.
+            while ptr < len(path) and path[ptr] != nid:
+                ptr += 1
+            if ptr < len(path):
+                last_at = max(last_at, cum[ptr])
+            else:
+                # Node not found — likely a duplicate later in the
+                # path. Reset and search again from the start.
+                ptr = 0
+        modes.append(last_mode)
+        at_ms.append(last_at)
+
     annotated = []
-    for step, mode in zip(steps, modes):
+    for i, (step, mode) in enumerate(zip(steps, modes)):
+        next_at = at_ms[i + 1] if i + 1 < len(at_ms) else total
         annotated.append({
             "kind": _kind_for_step(step, mode),
             "instruction": step["instruction"],
-            "at_m": 0.0,
-            "distance_m": 0.0,
+            "at_m": round(at_ms[i], 1),
+            "distance_m": round(max(0.0, next_at - at_ms[i]), 1),
             "mode": mode,
         })
 
-    # --- Build legs by grouping contiguous modes ---
+    # Build legs from real boundaries.
     legs = []
-    if annotated:
-        current_mode = annotated[0]["mode"]
-        segment_start_idx = 0
-        for i in range(1, len(annotated)):
-            if annotated[i]["mode"] != current_mode:
-                legs.append({
-                    "mode": current_mode,
-                    "from_m": 0.0,
-                    "to_m": 0.0,
-                    "distance_m": 0.0,
-                    "from_name": from_ep["name"] if segment_start_idx == 0 else None,
-                    "to_name": None,
-                })
-                current_mode = annotated[i]["mode"]
-                segment_start_idx = i
-        legs.append({
-            "mode": current_mode,
-            "from_m": 0.0,
-            "to_m": total,
-            "distance_m": total,
-            "from_name": from_ep["name"] if segment_start_idx == 0 else None,
-            "to_name": to_ep["name"],
-        })
+    start = 0
+    for i in range(1, len(annotated) + 1):
+        at_end = i == len(annotated)
+        mode_changed = (
+            not at_end
+            and annotated[i]["mode"] != annotated[start]["mode"]
+        )
+        if at_end or mode_changed:
+            from_m = annotated[start]["at_m"]
+            to_m = annotated[i]["at_m"] if i < len(annotated) else total
+            legs.append({
+                "mode": annotated[start]["mode"],
+                "from_m": from_m,
+                "to_m": to_m,
+                "distance_m": max(0.0, to_m - from_m),
+                "from_name": from_ep["name"] if start == 0 else None,
+                "to_name": to_ep["name"] if at_end else None,
+            })
+            start = i
 
     return annotated, legs
 
@@ -589,12 +599,10 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     for i, nid in enumerate(path):
         node_tags = nodes.get(nid, {}).get("tags", {}) or {}
 
-        # Track building_name (independent of level).
         node_building = node_tags.get("building_name")
         if node_building:
             current_building = node_building.strip()
 
-        # Update level from the edge we just crossed. Only the edge.
         if i > 0:
             prev_nid = path[i - 1]
             edge_level = _edge_level_for_step(
@@ -603,8 +611,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
             if edge_level is not None:
                 current_level = edge_level
 
-        # If we're at the first indoor node and still have no level,
-        # default to ground floor.
         if current_level is None and not nid.startswith("o"):
             current_level = "0"
 

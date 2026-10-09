@@ -10887,16 +10887,49 @@ init_db.py
 
 Creates the tables defined by the models. Idempotent — calling it twice
 is a no-op.
+
+Safety note
+-----------
+Some of our indexes and columns were added by Alembic migrations or
+raw-SQL scripts (e.g. add_place_kind_columns.py), not by SQLAlchemy's
+metadata. `create_all` doesn't know about them and will fail with
+"index already exists" on a database that's already migrated. Since
+`create_all` aborts on the first such error, we create tables one at
+a time so a failure on one table's index doesn't stop the rest.
+
+If a table's index already exists, we catch the error, log it, and
+move on. The table itself was created (SQLite uses CREATE TABLE IF
+NOT EXISTS under the hood), so nothing is lost.
 """
+
+import logging
+
+from sqlalchemy.exc import OperationalError
 
 from .session import get_engine
 from ..models import area, path_edge, place  # noqa: F401 (registers models)
 from ..models.base import Base
 
+logger = logging.getLogger(__name__)
+
 
 def init_db():
     """Create every table that doesn't already exist."""
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    for table in Base.metadata.sorted_tables:
+        try:
+            table.create(bind=engine, checkfirst=True)
+        except OperationalError as e:
+            msg = str(e).lower()
+            if "already exists" in msg:
+                # The table exists; only an index was redundant.
+                logger.warning(
+                    "init_db: skipped duplicate index on %s (%s)",
+                    table.name,
+                    e,
+                )
+                continue
+            raise
 
 
 def drop_all():
@@ -11236,6 +11269,67 @@ def downgrade():
     op.drop_table("indoor_path_edges")
     op.drop_table("indoor_areas")
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\migrations\versions\0008_indoor_area_building_name_and_type.py ---
+
+"""Add building_name and type to indoor_areas.
+
+Revision ID: 0008
+Revises: 0007
+
+What this does:
+  1. Adds `building_name` (nullable String) to indoor_areas.
+     Populated from the `building_name` OSM tag on indoor=room and
+     indoor=corridor ways. Nullable so existing rows don't break.
+  2. Adds `type` (String, not null, default "room"). Distinguishes
+     rooms from corridors on the floor plan.
+
+Nothing is dropped, nothing is renamed. Every existing row is
+preserved; the new columns start with building_name NULL and
+type="room".
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0008"
+down_revision = "0007"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.add_column(
+        "indoor_areas",
+        sa.Column("building_name", sa.String(255), nullable=True),
+    )
+    op.add_column(
+        "indoor_areas",
+        sa.Column(
+            "type",
+            sa.String(16),
+            nullable=False,
+            server_default="room",
+        ),
+    )
+
+    op.create_index(
+        "ix_indoor_areas_building_name",
+        "indoor_areas",
+        ["building_name"],
+    )
+    op.create_index(
+        "ix_indoor_areas_type",
+        "indoor_areas",
+        ["type"],
+    )
+
+
+def downgrade():
+    op.drop_index("ix_indoor_areas_type", table_name="indoor_areas")
+    op.drop_index("ix_indoor_areas_building_name", table_name="indoor_areas")
+    op.drop_column("indoor_areas", "type")
+    op.drop_column("indoor_areas", "building_name")
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\session.py ---
 
 """
@@ -11555,6 +11649,7 @@ from .routers import (
     chat_doc,
     favorites,
     health,
+    indoor,
     media,
     narrate,
     places,
@@ -11614,7 +11709,7 @@ def create_app() -> FastAPI:
             "Backend for the Campus Navigation mobile app and the "
             "admin website."
         ),
-        version="0.18.0",
+        version="0.19.0",
         lifespan=lifespan,
     )
 
@@ -11655,6 +11750,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(places.router)
     app.include_router(areas.router)
+    app.include_router(indoor.router)          # ← new
     app.include_router(route.router)
     app.include_router(narrate.router)
     app.include_router(media.router)
@@ -11711,7 +11807,7 @@ def create_app() -> FastAPI:
     def root():
         return {
             "name": "Campus Navigation API",
-            "version": "0.18.0",
+            "version": "0.19.0",
             "docs": "/docs",
             "health": "/api/health",
         }
@@ -11919,18 +12015,29 @@ class Favorite(Base, TimestampMixin):
 """
 indoor_area.py
 
-A room or named area inside a building, as a polygon.
+A room or corridor inside a building, as a polygon.
 
-These are NOT routable — the routing endpoints are door nodes. Areas
-exist so the mobile app can draw floor plans, and so an admin can
-search for "Room 302" and see the room's geometry.
+These are NOT routable — the routing endpoints are door nodes.
+Areas exist so the mobile app can draw floor plans, and so an admin
+can search for "Room 302" and see the room's geometry.
 
-The `door_node_id` links the room to the door node(s) that serve it.
-If a room has multiple doors, only the primary one is stored here;
-the ingest can be extended later if that matters.
+Two kinds of polygon live here:
+  - type="room"     — a room, tagged indoor=room in JOSM
+  - type="corridor" — a corridor, tagged indoor=corridor in JOSM
+
+Both are drawn on the mobile floor plan. Rooms are filled light grey,
+corridors a slightly different shade so the student can see the
+walkable space.
+
+The `door_node_id` links a room to the door node(s) that serve it.
+For corridors, it's null — corridors have no single door.
+
+The `building_name` links a polygon to its building. It's a string
+tag you add in JOSM on every indoor=room and indoor=corridor way.
+The phone sends it as a query param to fetch one building's floor.
 """
 
-from sqlalchemy import Index, String, Text
+from sqlalchemy import Index, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin
@@ -11948,26 +12055,37 @@ class IndoorArea(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    # The floor the room is on, e.g. "0", "1", "-1".
-    level: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    # Which floor the polygon is on, e.g. "0", "1", "-1".
+    level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # Which building it belongs to. Free text, matches the building_name
+    # tag you add in JOSM. The phone queries by this + level.
+    building_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # "room" or "corridor". Rooms are filled grey, corridors a lighter
+    # shade. Both are drawn.
+    type: Mapped[str] = mapped_column(String(16), nullable=False, default="room")
 
     # WKT "POLYGON((lon lat, ...))"
     geometry_wkt: Mapped[str] = mapped_column(Text, nullable=False)
 
-    # The door node that opens into this room, if any. Matches
-    # Place.osm_id for the corresponding indoor Place row.
-    door_node_id: Mapped[str | None] = mapped_column(
-        String(32), nullable=True, index=True
-    )
+    # The door node that opens into this room, if any. Null for corridors.
+    door_node_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (
-        Index("ix_indoor_areas_name_lower", name),
-        Index("ix_indoor_areas_level", level),
+        Index("ix_indoor_areas_name_lower", func.lower(name)),
         Index("ix_indoor_areas_osm_id", osm_id),
+        Index("ix_indoor_areas_level", level),
+        Index("ix_indoor_areas_building_name", building_name),
+        Index("ix_indoor_areas_type", type),
+        Index("ix_indoor_areas_door_node_id", door_node_id),
     )
 
     def __repr__(self):
-        return f"<IndoorArea id={self.id} name={self.name!r} level={self.level!r}>"
+        return (
+            f"<IndoorArea id={self.id} name={self.name!r} "
+            f"level={self.level!r} building={self.building_name!r}>"
+        )
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\indoor_path_edge.py ---
 
@@ -14486,6 +14604,51 @@ def health(
         dependencies=dependencies,
     )
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\indoor.py ---
+
+"""
+indoor.py
+
+Endpoints for indoor floor plans.
+
+  GET /api/indoor/areas?building_name=X&level=Y
+
+Returns every room and corridor polygon on one floor of one
+building. The phone uses this to draw the floor plan when the
+student is walking inside.
+
+Public (no admin guard) — the mobile app calls it directly, just
+like the outdoor /api/areas endpoint.
+"""
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from ..dependencies import db_session
+from ..errors import NotFoundError
+from ..schemas.indoor import IndoorAreasResponse
+from ..services import indoor_area_service
+
+router = APIRouter(prefix="/api/indoor", tags=["indoor"])
+
+
+@router.get("/areas", response_model=IndoorAreasResponse)
+def get_indoor_areas(
+    building_name: str = Query(..., min_length=1),
+    level: str = Query(..., min_length=1),
+    session: Session = Depends(db_session),
+):
+    """
+    Every room and corridor polygon on one floor of one building.
+
+    Returns an empty `areas` list if the building or level has no
+    polygons yet. The mobile app falls back to the indoor
+    placeholder in that case.
+    """
+    return indoor_area_service.list_areas_for_floor(
+        session, building_name=building_name, level=level
+    )
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\map.py ---
 
 
@@ -14834,6 +14997,10 @@ def compute(
     node), the indoor engine is used and the route may include an
     entrance crossing.
 
+    A live GPS start is also supported: from_lat/from_lon is snapped
+    to the nearest outdoor node on the merged graph, and the route
+    continues from there.
+
     Steps in the response carry a `mode` field ("outdoor" or "indoor")
     so the client knows where to switch rendering behavior. The
     response also includes a `legs` array describing the boundaries.
@@ -14864,7 +15031,10 @@ def compute(
             to_lat=to_lat,
             to_lon=to_lon,
         )
-    except routing_service.UnreliableLocationError:
+    except (
+        routing_service.UnreliableLocationError,
+        route_composer.UnreliableLocationError,
+    ):
         raise LocationTooFarError()
     except route_composer.RouteCompositionError as e:
         raise RouteNotFoundError(str(e))
@@ -15441,6 +15611,47 @@ class HealthResponse(BaseModel):
     # Dependencies
     dependencies: list[DependencyStatus]
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\indoor.py ---
+
+"""
+indoor.py
+
+Request and response shapes for the indoor-areas endpoint.
+
+The endpoint returns plain JSON with lat/lon boundary points, not
+WKT strings. The phone builds GeoJSON from this directly.
+"""
+
+from pydantic import BaseModel, Field
+
+from .common import LatLon
+
+
+class IndoorAreaItem(BaseModel):
+    """One room or corridor on a floor plan."""
+
+    id: int
+    osm_id: str
+    name: str | None = None
+    ref: str | None = None
+    type: str  # "room" or "corridor"
+    level: str | None = None
+    door_node_id: str | None = None
+
+    # The polygon outline, as a list of lat/lon points.
+    boundary: list[LatLon]
+
+    # A single representative point. Used to place the name label.
+    centroid: LatLon
+
+
+class IndoorAreasResponse(BaseModel):
+    """Everything the phone needs to draw one floor of one building."""
+
+    building_name: str
+    level: str
+    areas: list[IndoorAreaItem] = Field(default_factory=list)
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\knowledge.py ---
 
 """
@@ -15689,6 +15900,20 @@ class TurnStep(BaseModel):
     # The mobile app uses this to switch behavior (GPS on/off, map
     # swap, compass hide) at the handover point.
     mode: str = "outdoor"
+
+    # For indoor steps:
+    #   geometry_index — the position in the route's `geometry` array
+    #                    where this step's node sits. Lets the phone
+    #                    draw a "you are here" marker on the floor plan.
+    #   level          — the floor the step is on ("0", "1", "-1").
+    #                    The phone uses this to fetch the right floor
+    #                    plan and switch when the student takes stairs.
+    #   building_name  — which building the step is in. The phone sends
+    #                    this as a query param to /api/indoor/areas.
+    # Null for outdoor steps.
+    geometry_index: int | None = None
+    level: str | None = None
+    building_name: str | None = None
 
 
 class RouteLeg(BaseModel):
@@ -16984,6 +17209,75 @@ def reset():
         _edges = None
         _edge_tags = None
         _areas = None
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\indoor_area_service.py ---
+
+"""
+indoor_area_service.py
+
+Read indoor polygons (rooms and corridors) for the floor plan.
+
+Reuses the WKT parser from area_service.py so the shapes come back
+in exactly the same form as outdoor areas — the phone's parsing code
+works the same for both.
+"""
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from ..models.indoor_area import IndoorArea
+from ..schemas.common import LatLon
+from ..schemas.indoor import IndoorAreaItem, IndoorAreasResponse
+
+# Reuse the outdoor area WKT parser so both area types come back in
+# the same shape. If the WKT format ever changes, it changes in one
+# place.
+from .area_service import _centroid, _parse_wkt_polygon
+
+
+def _to_item(area: IndoorArea) -> IndoorAreaItem:
+    boundary = _parse_wkt_polygon(area.geometry_wkt)
+    return IndoorAreaItem(
+        id=area.id,
+        osm_id=area.osm_id,
+        name=area.name,
+        ref=area.ref,
+        type=area.type,
+        level=area.level,
+        door_node_id=area.door_node_id,
+        boundary=boundary,
+        centroid=_centroid(boundary),
+    )
+
+
+def list_areas_for_floor(
+    session: Session,
+    building_name: str,
+    level: str,
+) -> IndoorAreasResponse:
+    """
+    Return every room and corridor on one floor of one building.
+
+    building_name is matched case-insensitively — the phone sends
+    whatever string it read from the route step, and the tag in JOSM
+    might not match character-for-character. Case-insensitive is the
+    forgiving choice without being sloppy.
+    """
+    needle = building_name.strip().lower()
+
+    rows = (
+        session.query(IndoorArea)
+        .filter(func.lower(IndoorArea.building_name) == needle)
+        .filter(IndoorArea.level == level)
+        .order_by(IndoorArea.type.asc(), IndoorArea.name.asc())
+        .all()
+    )
+
+    return IndoorAreasResponse(
+        building_name=building_name,
+        level=level,
+        areas=[_to_item(a) for a in rows],
+    )
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\indoor_graph_builder.py ---
 
@@ -19047,9 +19341,10 @@ route_composer.py
 Decides which engine handles a route request.
 
   - Both endpoints outdoor    →  outdoor engine (routing_service).
-                                 Same code path as before this file
-                                 existed. Same output shape.
-  - Any endpoint indoor       →  indoor engine on the enriched graph.
+  - Any endpoint indoor       →  indoor engine on the merged graph.
+  - GPS start → indoor dest   →  indoor engine on the merged graph,
+                                 after snapping the GPS fix to the
+                                 nearest outdoor node.
 
 The composer is the only place in the codebase that knows both
 engines exist. Everything downstream — the API, the mobile app —
@@ -19058,6 +19353,36 @@ sees a single route response.
 For mixed routes, each step carries a `mode` field ("outdoor" or
 "indoor") so the client can switch rendering behavior at the
 boundary.
+
+Mixed route with GPS start
+--------------------------
+When the student starts walking from their live position (GPS), the
+composer can't just route from a place id — it has to snap the fix
+to a node on the merged graph. The merged graph contains both
+outdoor nodes (prefixed with "o") and indoor nodes (unprefixed). The
+snapping logic mirrors what the outdoor engine does, so the behavior
+at the boundary is consistent: a fix too far from any node raises
+UnreliableLocationError, same as pure outdoor.
+
+Indoor step enrichment
+----------------------
+The frozen indoor engine doesn't provide per-step distances,
+geometry indices, or level info. After it returns, this module walks
+the path and annotates each indoor step with:
+
+  - geometry_index — where in the route geometry that step's node
+                     sits.
+  - level          — the floor the step is on.
+  - building_name  — which building the step is in.
+
+Levels are stored on the *edges* in the OSM data (verified in the
+DB: every indoor_path_edges row has a level tag). Corridor and walk
+edges carry a single level like "0" or "-1". Stairs edges carry a
+semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top.
+
+The node's own `level` tag is deliberately NOT consulted. On this
+map, nodes are shared between ways and their tags can be stale. The
+edge is authoritative.
 
 Step distances (at_m, distance_m)
 ---------------------------------
@@ -19069,6 +19394,7 @@ rather than by distance, so this is fine.
 """
 
 import logging
+import math
 
 from sqlalchemy.orm import Session
 
@@ -19083,6 +19409,21 @@ class RouteCompositionError(Exception):
     """Raised when the request can't be routed by either engine."""
 
 
+class UnreliableLocationError(Exception):
+    """
+    Raised when a live GPS fix can't be confidently snapped to the
+    walkable network. The route endpoint catches this and returns a
+    422 with a distinct error code so the client can show a specific
+    message.
+    """
+    pass
+
+
+# Same as routing_service.SNAP_MAX_DISTANCE_M — kept here so the
+# composer and the outdoor engine agree on what counts as "too far".
+SNAP_MAX_DISTANCE_M = 40
+
+
 # ---------------------------------------------------------------------------
 # Endpoint resolution
 # ---------------------------------------------------------------------------
@@ -19095,16 +19436,7 @@ def _lookup_place(session: Session, place_id: int) -> Place:
 
 
 def _classify_endpoint(place: Place) -> dict:
-    """
-    Return a dict describing how to hand this endpoint to the engine:
-
-      { "engine": "outdoor"|"indoor",
-        "place_id": int,
-        "kind": "outdoor"|"indoor",
-        "node_id": str,
-        "osm_id": str,
-        "name": str }
-    """
+    """Return a dict describing how to hand a place endpoint to the engine."""
     kind = (place.kind or "outdoor").lower()
     if kind == "indoor":
         return {
@@ -19124,6 +19456,76 @@ def _classify_endpoint(place: Place) -> dict:
             "osm_id": place.osm_id,
             "name": place.name,
         }
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Local copy so we don't have to import the outdoor engine."""
+    R = 6371000
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    )
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _resolve_coord_start(
+    lat: float,
+    lon: float,
+    bundle: dict,
+    *,
+    is_live_fix: bool,
+    accuracy_m: float | None = None,
+) -> tuple[str | None, str]:
+    """
+    Snap a GPS fix to the nearest outdoor node on the merged graph.
+
+    Returns (node_id_or_None, display_name). node_id is prefixed with
+    "o" (the outdoor prefix on the merged graph).
+
+    If is_live_fix is True and the nearest outdoor node is farther
+    than SNAP_MAX_DISTANCE_M, returns (None, ...). The caller turns
+    that into an UnreliableLocationError — same as the outdoor
+    engine does.
+    """
+    nodes = bundle["nodes"]
+    outdoor_node_ids = bundle["outdoor_node_ids"]
+
+    if is_live_fix and accuracy_m is not None:
+        logger.info(
+            "Composer: routing from live fix at (%.5f, %.5f) accuracy %.1fm",
+            lat, lon, accuracy_m,
+        )
+
+    best_id = None
+    best_dist = float("inf")
+
+    # Only search outdoor nodes. Indoor GPS is unreliable; the student
+    # is outdoors, so their fix should snap to an outdoor node.
+    for nid in outdoor_node_ids:
+        node = nodes.get(nid)
+        if node is None:
+            continue
+        d = _haversine_m(lat, lon, node["lat"], node["lon"])
+        if d < best_dist:
+            best_dist = d
+            best_id = nid
+
+    if best_id is None:
+        return None, "your current location"
+
+    if is_live_fix and best_dist > SNAP_MAX_DISTANCE_M:
+        logger.info(
+            "Composer: nearest outdoor node is %.1fm away — too far for a "
+            "live fix (limit %dm)",
+            best_dist, SNAP_MAX_DISTANCE_M,
+        )
+        return None, "your current location"
+
+    return best_id, "your current location"
 
 
 # ---------------------------------------------------------------------------
@@ -19147,7 +19549,12 @@ def compose_route(
     """
     Return a route response. Decides which engine to use.
 
-    See module docstring for the decision rules.
+    Handles four cases:
+      1. Outdoor place → outdoor place: outdoor engine.
+      2. GPS → outdoor place: outdoor engine (unchanged path).
+      3. Place → indoor place, or indoor place → place: indoor engine.
+      4. GPS → indoor place: indoor engine, after snapping GPS to a
+         nearby outdoor node on the merged graph.
     """
     from_place = None
     if from_place_id is not None:
@@ -19157,12 +19564,22 @@ def compose_route(
     if to_place_id is not None:
         to_place = _lookup_place(session, to_place_id)
 
-    from_kind = (from_place.kind if from_place else "outdoor").lower()
-    to_kind = (to_place.kind if to_place else "outdoor").lower()
+    from_kind = from_place.kind if from_place else None
+    to_kind = to_place.kind if to_place else None
 
-    both_outdoor = (from_kind == "outdoor" and to_kind == "outdoor")
+    # Case 1 & 2: both endpoints are outdoor (or one side is GPS,
+    # which is treated as outdoor). The outdoor engine handles this —
+    # same code path as before the composer existed.
+    from_is_outdoor = (
+        from_kind == "outdoor"
+        or (from_place is None and from_lat is not None)
+    )
+    to_is_outdoor = (
+        to_kind == "outdoor"
+        or (to_place is None and to_lat is not None)
+    )
 
-    if both_outdoor:
+    if from_is_outdoor and to_is_outdoor:
         return _route_via_outdoor_engine(
             session, graph, nodes, edge_tags,
             from_place_id=from_place_id,
@@ -19174,17 +19591,43 @@ def compose_route(
             to_lon=to_lon,
         )
 
-    # At least one endpoint is indoor. Currently require both to be
-    # named places (the composer can't yet resolve a GPS-start indoor
-    # destination).
-    if from_place is None or to_place is None:
+    # At least one endpoint is indoor. Route on the merged graph.
+    bundle = indoor_graph_builder.get_indoor_graph()
+
+    # Resolve the from endpoint.
+    if from_place is not None:
+        from_ep = _classify_endpoint(from_place)
+    elif from_lat is not None and from_lon is not None:
+        node_id, display_name = _resolve_coord_start(
+            from_lat, from_lon, bundle,
+            is_live_fix=True,
+            accuracy_m=from_accuracy_m,
+        )
+        if node_id is None:
+            raise UnreliableLocationError()
+        from_ep = {
+            "engine": "indoor",  # the merged engine handles both
+            "place_id": None,
+            "kind": "outdoor",
+            "node_id": node_id,
+            "osm_id": node_id[1:] if node_id.startswith("o") else node_id,
+            "name": display_name,
+        }
+    else:
         raise RouteCompositionError(
-            "Mixed indoor/outdoor routes currently require both "
-            "endpoints to be named places."
+            "Either from_place_id or from_lat/from_lon is required."
         )
 
-    from_ep = _classify_endpoint(from_place)
-    to_ep = _classify_endpoint(to_place)
+    # Resolve the to endpoint. The mobile app always sends a place id
+    # for destinations, so this branch is simpler.
+    if to_place is not None:
+        to_ep = _classify_endpoint(to_place)
+    else:
+        raise RouteCompositionError(
+            "Mixed routes currently require the destination to be a "
+            "named place."
+        )
+
     return _route_via_indoor_engine(from_ep, to_ep)
 
 
@@ -19194,8 +19637,7 @@ def compose_route(
 
 def _route_via_outdoor_engine(
     session, graph, nodes, edge_tags,
-    *,
-    from_place_id, from_lat, from_lon, from_accuracy_m,
+    *, from_place_id, from_lat, from_lon, from_accuracy_m,
     to_place_id, to_lat, to_lon,
 ):
     """
@@ -19293,6 +19735,9 @@ def _route_via_indoor_engine(from_ep, to_ep):
     annotated_steps, legs = _annotate_steps_and_legs(
         steps, path, indoor_node_ids, from_ep, to_ep, total
     )
+
+    # Fill in geometry_index, level, and building_name on each step.
+    _enrich_indoor_steps(annotated_steps, path, nodes, graph)
 
     geometry = [
         {"lat": nodes[nid]["lat"], "lon": nodes[nid]["lon"]}
@@ -19395,6 +19840,142 @@ def _kind_for_step(step, mode):
     if "stairs" in instr:
         return "stairs"
     return "walk"
+
+
+# ---------------------------------------------------------------------------
+# Indoor step enrichment — geometry index, level, building name
+# ---------------------------------------------------------------------------
+
+def _edge_level_for_step(from_nid, to_nid, current_level, graph):
+    """
+    Return the level the walker arrives on after crossing the edge
+    from_nid -> to_nid.
+
+    - Corridor / walk edges: single level. Return it.
+    - Stairs edges: semicolon list like "0;1" or "-1;0;1", bottom-to-top.
+      Work out which way the walker is going from their current level.
+    - No level on the edge, or no such edge: return None. Caller keeps
+      the previous level.
+    """
+    edge_info = None
+    for nb, _d, info in graph.get(from_nid, []):
+        if nb == to_nid:
+            edge_info = info
+            break
+
+    if edge_info is None:
+        return None
+
+    way_tags = edge_info.get("way_tags") or {}
+    edge_level_raw = way_tags.get("level")
+    if edge_level_raw is None:
+        return None
+
+    levels = [p.strip() for p in str(edge_level_raw).split(";") if p.strip()]
+    if not levels:
+        return None
+
+    is_stairs = edge_info.get("kind") == "stairs"
+
+    if not is_stairs:
+        return levels[0]
+
+    if len(levels) == 1:
+        return levels[0]
+
+    if current_level is None:
+        return levels[-1]
+
+    if current_level not in levels:
+        return levels[-1]
+
+    idx = levels.index(current_level)
+    if idx == 0:
+        return levels[1]
+    if idx == len(levels) - 1:
+        return levels[-2]
+    return levels[idx + 1]
+
+
+def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
+    """
+    Mutate each step in place, adding geometry_index, level, and
+    building_name for indoor steps.
+
+    Level tracking is edge-based and simple:
+
+      1. Start with current_level = None.
+      2. For each step i (i > 0), look at the edge between path[i-1]
+         and path[i].
+      3. If the edge exists and carries a level, update current_level.
+      4. If the edge has no level, hold the previous current_level.
+      5. The node's own `level` tag is never consulted — the edge is
+         authoritative.
+      6. If current_level is still None at the first indoor node,
+         default it to "0".
+
+    Then assign level_at[i] and building_at[i] to each path node, and
+    pair them up with the indoor step list in order.
+    """
+    level_at = [None] * len(path)
+    building_at = [None] * len(path)
+
+    current_level = None
+    current_building = None
+
+    for i, nid in enumerate(path):
+        node_tags = nodes.get(nid, {}).get("tags", {}) or {}
+
+        # Track building_name (independent of level).
+        node_building = node_tags.get("building_name")
+        if node_building:
+            current_building = node_building.strip()
+
+        # Update level from the edge we just crossed. Only the edge.
+        if i > 0:
+            prev_nid = path[i - 1]
+            edge_level = _edge_level_for_step(
+                prev_nid, nid, current_level, graph
+            )
+            if edge_level is not None:
+                current_level = edge_level
+
+        # If we're at the first indoor node and still have no level,
+        # default to ground floor.
+        if current_level is None and not nid.startswith("o"):
+            current_level = "0"
+
+        level_at[i] = current_level
+        building_at[i] = current_building
+
+    # Pair indoor steps with indoor path nodes, in order.
+    indoor_path_indices = [
+        i for i, nid in enumerate(path) if not nid.startswith("o")
+    ]
+    indoor_step_indices = [
+        i for i, s in enumerate(annotated_steps)
+        if s.get("mode") == "indoor"
+    ]
+
+    for step_pos, path_i in zip(indoor_step_indices, indoor_path_indices):
+        step = annotated_steps[step_pos]
+        step["geometry_index"] = path_i
+        step["level"] = level_at[path_i] or "0"
+        step["building_name"] = building_at[path_i]
+
+    # Safety net: any indoor step that didn't get paired still gets
+    # the first indoor node's data.
+    if indoor_path_indices:
+        first_path_i = indoor_path_indices[0]
+        fallback_level = level_at[first_path_i] or "0"
+        fallback_building = building_at[first_path_i]
+        for step in annotated_steps:
+            if step.get("mode") != "indoor":
+                continue
+            if step.get("geometry_index") is None:
+                step["geometry_index"] = first_path_i
+                step["level"] = fallback_level
+                step["building_name"] = fallback_building
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\routing_service.py ---
 
@@ -25349,7 +25930,7 @@ Reads map.osm once and writes:
 
 Then reads final.osm and writes:
   - one row per door node       → places (kind="indoor")
-  - one row per room polygon    → indoor_areas
+  - one row per indoor polygon  → indoor_areas (rooms and corridors)
   - one row per walkable edge   → indoor_path_edges
 
 Run:
@@ -25542,6 +26123,10 @@ def ingest_path_edges(nodes, ways, session):
 _INDOOR_WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
 _INDOOR_STAIRS_HIGHWAY = "steps"
 
+# Polygon types we save into indoor_areas. Both are drawn on the
+# phone's floor plan.
+_INDOOR_POLYGON_TYPES = {"room", "corridor"}
+
 
 def _is_door(tags):
     return bool(tags.get("door")) or tags.get("indoor") == "door"
@@ -25550,7 +26135,7 @@ def _is_door(tags):
 def ingest_indoor_places(nodes, ways, session):
     """
     Write one Place row per door node, one IndoorArea row per room
-    polygon, and one IndoorPathEdge row per walkable edge.
+    or corridor polygon, and one IndoorPathEdge row per walkable edge.
 
     Returns a dict of counts: {"places": n, "areas": n, "edges": n}.
     """
@@ -25602,16 +26187,19 @@ def ingest_indoor_places(nodes, ways, session):
 
         places_written += 1
 
-    # ---- Indoor areas: one per room polygon ----
+    # ---- Indoor areas: rooms and corridors ----
     areas_written = 0
     for way in ways:
         tags = way["tags"]
-        if tags.get("indoor") != "room":
+        polygon_type = tags.get("indoor")
+        if polygon_type not in _INDOOR_POLYGON_TYPES:
             continue
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
+        # Corridors often have no name. Give them a placeholder so the
+        # column stays not-null.
         if not rname:
-            continue
+            rname = "corridor" if polygon_type == "corridor" else "unnamed"
 
         refs = [r for r in way["refs"] if r in nodes]
         if len(refs) < 3:
@@ -25633,8 +26221,14 @@ def ingest_indoor_places(nodes, ways, session):
         if level is not None:
             level = str(level).split(";")[0]
 
+        # Building name tag — you add this in JOSM on every room and
+        # corridor way. Nullable so untagged polygons don't break.
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
         # Door node: the first door shared between this polygon and
-        # the walkable network, if any.
+        # the walkable network, if any. Corridors usually have none.
         shared_doors = [r for r in way["refs"] if r in door_node_ids]
         door_node_id = shared_doors[0] if shared_doors else None
 
@@ -25650,6 +26244,8 @@ def ingest_indoor_places(nodes, ways, session):
         existing.name = rname
         existing.ref = tags.get("ref")
         existing.level = level
+        existing.building_name = building_name
+        existing.type = polygon_type
         existing.geometry_wkt = wkt
         existing.door_node_id = door_node_id
 
@@ -25767,7 +26363,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
             n_indoor_areas = counts["areas"]
             n_indoor_edges = counts["edges"]
             print(f"  indoor door places: {n_indoor_places}")
-            print(f"  indoor rooms: {n_indoor_areas}")
+            print(f"  indoor rooms + corridors: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
     print("\nIngest complete.")
@@ -26247,6 +26843,60 @@ def _main():
 
 if __name__ == "__main__":
     _main()
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\scripts\add_indoor_area_building_name_and_type.py ---
+
+"""
+One-off script to add building_name and type columns to indoor_areas.
+
+Safe to run twice — checks existing columns before altering.
+
+Usage (from the backend/ folder, inside the venv):
+    python -m backend.scripts.add_indoor_area_building_name_and_type
+"""
+
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.api.settings import DATABASE_PATH  # noqa: E402
+
+
+def main():
+    conn = sqlite3.connect(str(DATABASE_PATH))
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(indoor_areas)")}
+
+    if "building_name" not in cols:
+        conn.execute(
+            "ALTER TABLE indoor_areas ADD COLUMN building_name TEXT"
+        )
+        print("  added indoor_areas.building_name")
+
+    if "type" not in cols:
+        conn.execute(
+            "ALTER TABLE indoor_areas "
+            "ADD COLUMN type TEXT NOT NULL DEFAULT 'room'"
+        )
+        print("  added indoor_areas.type")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_indoor_areas_building_name "
+        "ON indoor_areas(building_name)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_indoor_areas_type "
+        "ON indoor_areas(type)"
+    )
+
+    conn.commit()
+    conn.close()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\scripts\add_indoor_tables.py ---
 
@@ -31602,13 +32252,8 @@ const styles = StyleSheet.create({
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\settings.jsx ---
 
 // Settings screen.
-//
-// Sections: Language, Voice, Accessibility, Wi-Fi, Units.
-// Contains a temporary Development section with a reset-onboarding
-// button. Remove that section before the pilot.
 
 import {
-  Alert,
   ScrollView,
   StyleSheet,
   Switch,
@@ -31687,6 +32332,16 @@ export default function SettingsScreen() {
             accessibilityLabel={t('settings.reduceMotion')}
           />
         </Row>
+        <Row
+          label={t('settings.indoorNavigation')}
+          description={t('settings.indoorNavigationDescription')}
+        >
+          <Switch
+            value={settings.indoorsEnabled}
+            onValueChange={(v) => updateSetting('indoorsEnabled', v)}
+            accessibilityLabel={t('settings.indoorNavigation')}
+          />
+        </Row>
       </Section>
 
       <Section title={t('settings.wifi')}>
@@ -31719,7 +32374,7 @@ export default function SettingsScreen() {
 
       <View style={styles.footer}>
         <Text style={styles.footerText}>
-          {t('settings.version', { version: '0.18.0' })}
+          {t('settings.version', { version: '0.19.0' })}
         </Text>
       </View>
     </ScrollView>
@@ -31817,15 +32472,6 @@ const styles = StyleSheet.create({
   segmentActive: { backgroundColor: COLORS.background },
   segmentText: { fontSize: FONT_SIZE.body, color: COLORS.textMuted },
   segmentTextActive: { color: COLORS.text, fontWeight: '600' },
-  devButton: {
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  devButtonText: {
-    color: COLORS.danger,
-    fontSize: FONT_SIZE.body,
-    fontWeight: '500',
-  },
   footer: { alignItems: 'center', padding: SPACING.xl },
   footerText: { color: COLORS.textFaint, fontSize: FONT_SIZE.small },
 });
@@ -32212,11 +32858,13 @@ export default function WalkingScreen() {
     mode,
     advanceStep,
     isLastStep,
+    // Indoor-specific:
+    indoorLevel,
+    indoorBuildingName,
+    indoorGeometry,
+    indoorDestination,
   } = useRouteProgress(route);
 
-  // Compass only runs when outdoor. When indoor, the compass is
-  // ignored — we still call the hook (calling it conditionally would
-  // violate React rules) but we don't feed its output to the arrow.
   const { heading } = useCompass({ position: rawPosition });
 
   useEffect(() => {
@@ -32286,7 +32934,6 @@ export default function WalkingScreen() {
     };
   }, []);
 
-  // Outdoor arrival: proximity-triggered, as before.
   useEffect(() => {
     if (mode !== 'outdoor') return;
     if (arrivedRef.current) return;
@@ -32300,13 +32947,11 @@ export default function WalkingScreen() {
     });
   }, [mode, distanceRemainingM, route, destinationId]);
 
-  // Indoor arrival: the student taps "I've arrived" on the last step.
   const handleAdvanceStep = useCallback(() => {
     if (!isLastStep) {
       advanceStep();
       return;
     }
-    // Last step: trigger arrival.
     if (arrivedRef.current) return;
     arrivedRef.current = true;
     haptics.arrivalPulse();
@@ -32519,6 +33164,10 @@ export default function WalkingScreen() {
             followBearing={true}
             mode={mode}
             destinationName={route.to_name}
+            indoorBuildingName={indoorBuildingName}
+            indoorLevel={indoorLevel}
+            indoorGeometry={indoorGeometry}
+            indoorDestination={indoorDestination}
             style={styles.map}
           />
         </View>
@@ -33516,6 +34165,464 @@ const styles = StyleSheet.create({
   },
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\IndoorMapPlaceholder.jsx ---
+
+// Indoor map placeholder. Shown in place of the outdoor tile map
+// when the current step is indoor.
+//
+// Phase 5e-2 will replace this with an actual floor-plan render
+// (rooms from `indoor_areas`, route line, destination marker).
+// For now it's an honest panel: the student knows they're inside,
+// and there's no misleading map underneath.
+
+import { StyleSheet, Text, View } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
+
+export function IndoorMapPlaceholder({ destinationName, style }) {
+  return (
+    <View style={[styles.container, style]}>
+      <View style={styles.iconCircle}>
+        <MaterialIcons
+          name="meeting-room"
+          size={48}
+          color={COLORS.primaryDark}
+        />
+      </View>
+      <Text style={styles.title}>{t('walking.indoorsTitle')}</Text>
+      <Text style={styles.body}>
+        {destinationName
+          ? t('walking.indoorsBody', { name: destinationName })
+          : t('walking.indoorsBodyNoName')}
+      </Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#eef2ff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: SPACING.xl,
+  },
+  iconCircle: {
+    width: 96,
+    height: 96,
+    borderRadius: 48,
+    backgroundColor: 'rgba(255, 255, 255, 0.7)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: SPACING.lg,
+  },
+  title: {
+    fontSize: FONT_SIZE.large,
+    fontWeight: '700',
+    color: COLORS.primaryDark,
+    marginBottom: SPACING.sm,
+    textAlign: 'center',
+  },
+  body: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    textAlign: 'center',
+    lineHeight: 22,
+    maxWidth: 320,
+  },
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\IndoorMapView.jsx ---
+
+// IndoorMapView — draws the indoor floor plan.
+//
+// When the walking screen's current step is indoor, this component
+// replaces the outdoor tile map. It:
+//   1. Fetches the rooms and corridors for the current building+level
+//      from /api/indoor/areas.
+//   2. Renders them on a blank MapLibre map: rooms filled light grey,
+//      corridors a slightly different shade, room names as labels.
+//   3. Draws the indoor portion of the route as a blue line.
+//   4. Marks the destination with a red marker.
+//
+// The camera auto-fits to the room bounds on first render.
+//
+// If the API returns no rooms (unsurveyed building), we render
+// nothing and the parent falls back to IndoorMapPlaceholder.
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import {
+  MapView,
+  Camera,
+  ShapeSource,
+  FillLayer,
+  LineLayer,
+  SymbolLayer,
+  MarkerView,
+} from '@maplibre/maplibre-react-native';
+
+import { getIndoorAreas } from '@/services/api';
+import { COLORS } from '@/constants/theme';
+
+// A minimal blank map style. No tiles, no labels, no country outlines.
+// Just a flat background the floor plan draws on top of.
+//
+// The shape of a MapLibre style is fixed by the spec: version,
+// sources, layers. We give it one empty background layer.
+const BLANK_STYLE = {
+  version: 8,
+  name: 'indoor-blank',
+  sources: {},
+  layers: [
+    {
+      id: 'background',
+      type: 'background',
+      paint: {
+        'background-color': '#f1f5f9',
+      },
+    },
+  ],
+};
+
+export function IndoorMapView({
+  buildingName,
+  level,
+  routeGeometry = [],
+  destination = null,
+  style,
+  onNoRooms,
+}) {
+  const cameraRef = useRef(null);
+
+  const [areas, setAreas] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // Fetch rooms and corridors whenever the building or level changes.
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!buildingName || level == null) {
+      setAreas([]);
+      setLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setLoading(true);
+    setError(null);
+
+    getIndoorAreas({ buildingName, level })
+      .then((data) => {
+        if (cancelled) return;
+        const list = data?.areas || [];
+        setAreas(list);
+        if (list.length === 0 && onNoRooms) onNoRooms();
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err.message || 'Could not load floor plan.');
+        setAreas([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buildingName, level]);
+
+  // -------------------------------------------------------------------------
+  // GeoJSON assembly
+  // -------------------------------------------------------------------------
+
+  // Rooms as one FeatureCollection. Corridors as another.
+  const { roomsGeoJSON, corridorsGeoJSON } = useMemo(() => {
+    if (!areas || areas.length === 0) {
+      return { roomsGeoJSON: null, corridorsGeoJSON: null };
+    }
+
+    const rooms = [];
+    const corridors = [];
+
+    for (const area of areas) {
+      const ring = (area.boundary || []).map((p) => [p.lon, p.lat]);
+      // A polygon ring must be closed — first point === last point.
+      if (ring.length === 0) continue;
+      const first = ring[0];
+      const last = ring[ring.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) {
+        ring.push([first[0], first[1]]);
+      }
+
+      const feature = {
+        type: 'Feature',
+        properties: {
+          id: area.id,
+          name: area.name || '',
+          ref: area.ref || '',
+          type: area.type,
+          level: area.level,
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [ring],
+        },
+      };
+
+      if (area.type === 'corridor') corridors.push(feature);
+      else rooms.push(feature);
+    }
+
+    return {
+      roomsGeoJSON: {
+        type: 'FeatureCollection',
+        features: rooms,
+      },
+      corridorsGeoJSON: {
+        type: 'FeatureCollection',
+        features: corridors,
+      },
+    };
+  }, [areas]);
+
+  // Route line — a single LineString from the passed-in geometry.
+  const routeGeoJSON = useMemo(() => {
+    if (!routeGeometry || routeGeometry.length < 2) return null;
+    return {
+      type: 'Feature',
+      properties: {},
+      geometry: {
+        type: 'LineString',
+        coordinates: routeGeometry.map((p) => [p.lon, p.lat]),
+      },
+    };
+  }, [routeGeometry]);
+
+  // Camera fit — compute a bounding box from the areas and route,
+  // then set the camera to fit. Called whenever the data changes.
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    if (loading) return;
+
+    // Gather points from areas and route.
+    const points = [];
+    if (areas) {
+      for (const area of areas) {
+        for (const p of area.boundary || []) {
+          points.push([p.lon, p.lat]);
+        }
+      }
+    }
+    if (routeGeometry) {
+      for (const p of routeGeometry) {
+        points.push([p.lon, p.lat]);
+      }
+    }
+
+    if (points.length === 0) return;
+
+    const lons = points.map((p) => p[0]);
+    const lats = points.map((p) => p[1]);
+    const west = Math.min(...lons);
+    const east = Math.max(...lons);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+
+    const centerLon = (west + east) / 2;
+    const centerLat = (south + north) / 2;
+    const span = Math.max(east - west, north - south);
+
+    // Convert a span in degrees to a zoom level. This is
+    // approximate but close enough. We clamp between 15 and 20.
+    // Latitude scaling is ignored — the building is small enough.
+    let zoom = 17;
+    if (span > 0) {
+      zoom = 15 + Math.log2(0.0015 / span);
+    }
+    zoom = Math.max(15, Math.min(20, zoom));
+
+    const timeout = setTimeout(() => {
+      try {
+        cameraRef.current?.setCamera({
+          centerCoordinate: [centerLon, centerLat],
+          zoomLevel: zoom,
+          animationDuration: 400,
+        });
+      } catch {
+        // Silent.
+      }
+    }, 100);
+
+    return () => clearTimeout(timeout);
+  }, [areas, routeGeometry, loading]);
+
+  // -------------------------------------------------------------------------
+  // Render
+  // -------------------------------------------------------------------------
+
+  if (loading) {
+    return (
+      <View style={[styles.container, style]}>
+        <ActivityIndicator color={COLORS.primaryDark} />
+      </View>
+    );
+  }
+
+  if (error) {
+    return <View style={[styles.container, style]} />;
+  }
+
+  if (!areas || areas.length === 0) {
+    // Parent will fall back to the placeholder.
+    return <View style={[styles.container, style]} />;
+  }
+
+  // Initial camera — center on the first area's centroid, or on the
+  // first room boundary point as a fallback.
+  const firstCentroid =
+    areas[0]?.centroid || areas[0]?.boundary?.[0] || null;
+  const initialCenter = firstCentroid
+    ? [firstCentroid.lon, firstCentroid.lat]
+    : [0, 0];
+
+  return (
+    <View style={[styles.container, style]}>
+      <MapView
+        style={styles.map}
+        mapStyle={BLANK_STYLE}
+        logoEnabled={false}
+        attributionEnabled={false}
+        compassEnabled={false}
+        rotateEnabled={false}
+      >
+        <Camera
+          ref={cameraRef}
+          defaultSettings={{
+            centerCoordinate: initialCenter,
+            zoomLevel: 18,
+            heading: 0,
+          }}
+        />
+
+        {/* Corridors first so rooms sit on top. */}
+        {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
+            <FillLayer
+              id="corridorsFill"
+              style={{
+                fillColor: '#e2e8f0',
+                fillOpacity: 1,
+              }}
+            />
+            <LineLayer
+              id="corridorsOutline"
+              style={{
+                lineColor: '#cbd5e1',
+                lineWidth: 0.5,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* Rooms. */}
+        {roomsGeoJSON && roomsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="roomsSource" shape={roomsGeoJSON}>
+            <FillLayer
+              id="roomsFill"
+              style={{
+                fillColor: '#ffffff',
+                fillOpacity: 1,
+              }}
+            />
+            <LineLayer
+              id="roomsOutline"
+              style={{
+                lineColor: '#94a3b8',
+                lineWidth: 0.75,
+              }}
+            />
+            <SymbolLayer
+              id="roomsLabels"
+              style={{
+                textField: ['get', 'name'],
+                textSize: 11,
+                textColor: '#334155',
+                textHaloColor: '#ffffff',
+                textHaloWidth: 1.5,
+                textAllowOverlap: false,
+                textIgnorePlacement: false,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* Route line on top of everything. */}
+        {routeGeoJSON ? (
+          <ShapeSource id="indoorRouteSource" shape={routeGeoJSON}>
+            <LineLayer
+              id="indoorRouteLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 4,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* Destination marker. */}
+        {destination ? (
+          <MarkerView
+            coordinate={[destination.lon, destination.lat]}
+            anchor={{ x: 0.5, y: 1.0 }}
+          >
+            <View style={styles.destMarkerOuter}>
+              <View style={styles.destMarkerInner} />
+            </View>
+          </MarkerView>
+        ) : null}
+      </MapView>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#f1f5f9',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  map: {
+    flex: 1,
+    width: '100%',
+  },
+  destMarkerOuter: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: 'rgba(220, 38, 38, 0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  destMarkerInner: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#dc2626',
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
+});
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\InstructionCard.jsx ---
 
 // The card at the bottom of the walking screen.
@@ -33827,12 +34934,14 @@ const styles = StyleSheet.create({
 
 // MapView.jsx — MapLibre version with rotation and recentering.
 //
-// When `mode` is "indoor", the tile map is replaced by a placeholder
-// panel. This keeps the outdoor map out of the way while the student
-// is inside a building — no misleading GPS dot on a map that doesn't
-// show the building's interior.
+// Two modes:
+//   - outdoor: the tile map (as before).
+//   - indoor:  the floor plan (IndoorMapView), which fetches rooms
+//              and corridors for the current building+level. If the
+//              API returns no rooms (unsurveyed building), we fall
+//              back to IndoorMapPlaceholder.
 
-import { useMemo, useRef, useEffect } from 'react';
+import { useMemo, useRef, useEffect, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import {
   MapView,
@@ -33843,6 +34952,7 @@ import {
 } from '@maplibre/maplibre-react-native';
 
 import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
+import { IndoorMapView } from '@/components/IndoorMapView';
 
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
 const DEFAULT_CENTER = [39.2000, -6.7500];
@@ -33871,9 +34981,23 @@ export function RouteMap({
   followBearing = false,
   mode = 'outdoor',
   destinationName = null,
+  // Indoor mode props:
+  indoorBuildingName = null,
+  indoorLevel = null,
+  indoorGeometry = [],
+  indoorDestination = null,
   style,
 }) {
   const cameraRef = useRef(null);
+
+  // If the indoor view reports no rooms for the current floor, we
+  // fall back to the placeholder. Reset whenever the building or
+  // level changes.
+  const [indoorNoRooms, setIndoorNoRooms] = useState(false);
+
+  useEffect(() => {
+    setIndoorNoRooms(false);
+  }, [indoorBuildingName, indoorLevel]);
 
   const routeCoords = useMemo(
     () => geometry.map((p) => [p.lon, p.lat]),
@@ -33969,12 +35093,24 @@ export function RouteMap({
     }
   }, [userLocation, bearing, followBearing, mode]);
 
-  // Indoor mode: no tile map. Replace with the placeholder panel.
+  // Indoor mode.
   if (mode === 'indoor') {
+    if (indoorNoRooms) {
+      return (
+        <IndoorMapPlaceholder
+          destinationName={destinationName}
+          style={style}
+        />
+      );
+    }
     return (
-      <IndoorMapPlaceholder
-        destinationName={destinationName}
+      <IndoorMapView
+        buildingName={indoorBuildingName}
+        level={indoorLevel}
+        routeGeometry={indoorGeometry}
+        destination={indoorDestination}
         style={style}
+        onNoRooms={() => setIndoorNoRooms(true)}
       />
     );
   }
@@ -35873,7 +37009,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
+const DEFAULT_API_BASE_URL = 'https://kissing-download-devon-toolkit.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -36668,8 +37804,6 @@ export function useRouteProgress(route) {
   useEffect(() => {
     const mode = currentStep.mode;
 
-    // Transition outdoor → indoor: initialize the manual index at
-    // the first indoor step.
     if (
       lastModeRef.current === 'outdoor' &&
       mode === 'indoor' &&
@@ -36702,24 +37836,74 @@ export function useRouteProgress(route) {
     ? 0
     : outdoor.distanceRemainingM;
 
-  // Distance to next step. Only meaningful when outdoor.
   const distanceToNextStepM = currentStep.mode === 'indoor'
     ? 0
     : outdoor.distanceToNextStepM;
 
-  // Progress fraction. Outdoor uses the snapped value; indoor uses
-  // step index over total steps.
   const progress = currentStep.mode === 'indoor'
     ? (steps.length > 1 ? currentStep.index / (steps.length - 1) : 1)
     : outdoor.progress;
 
+  // -----------------------------------------------------------------
+  // Indoor-specific derived values
+  // -----------------------------------------------------------------
+
+  // The current indoor level, from the current step. Used by the
+  // indoor floor plan to fetch the right floor. Null when outdoor.
+  const indoorLevel =
+    currentStep.mode === 'indoor' && currentStep.step
+      ? currentStep.step.level || null
+      : null;
+
+  // The current building name, from the current step. Null when
+  // outdoor.
+  const indoorBuildingName =
+    currentStep.mode === 'indoor' && currentStep.step
+      ? currentStep.step.building_name || null
+      : null;
+
+  // The indoor portion of the route geometry. Sliced using the
+  // geometry_index of the first and last indoor steps.
+  //
+  // The route's geometry is one long array covering both outdoor and
+  // indoor legs. Each indoor step carries geometry_index — its
+  // position in that array. Taking the first indoor step's index as
+  // the start and the last's as the end gives us the indoor slice.
+  const indoorGeometry = useMemo(() => {
+    if (!route?.geometry || !steps.length) return [];
+
+    let firstIndoorIdx = null;
+    let lastIndoorIdx = null;
+    for (const step of steps) {
+      if (step.mode !== 'indoor') continue;
+      const gi = step.geometry_index;
+      if (gi == null) continue;
+      if (firstIndoorIdx === null) firstIndoorIdx = gi;
+      lastIndoorIdx = gi;
+    }
+    if (firstIndoorIdx === null) return [];
+
+    return route.geometry.slice(firstIndoorIdx, lastIndoorIdx + 1);
+  }, [route?.geometry, steps]);
+
+  // The destination point of the indoor leg. Used by the floor plan
+  // to place a marker. The last indoor step's geometry_index points
+  // at the destination node.
+  const indoorDestination = useMemo(() => {
+    if (!route?.geometry || !steps.length) return null;
+    let lastIndoorIdx = null;
+    for (const step of steps) {
+      if (step.mode !== 'indoor') continue;
+      if (step.geometry_index == null) continue;
+      lastIndoorIdx = step.geometry_index;
+    }
+    if (lastIndoorIdx === null) return null;
+    return route.geometry[lastIndoorIdx] || null;
+  }, [route?.geometry, steps]);
+
   return {
     permissionGranted: outdoor.permissionGranted,
 
-    // Position (snapped) — null when indoor, so the map doesn't render
-    // a stale dot. We keep rawPosition so compass/heading still work
-    // for the outdoor case, but the walking screen won't show the dot
-    // when mode is indoor.
     position: currentStep.mode === 'indoor' ? null : outdoor.position,
     rawPosition: outdoor.rawPosition,
 
@@ -36736,10 +37920,14 @@ export function useRouteProgress(route) {
 
     resetOffRoute: outdoor.resetOffRoute,
 
-    // Only exposed in indoor mode; the walking screen shows the
-    // "Next step" button only when mode === 'indoor'.
     advanceStep,
     isLastStep: currentStep.index >= steps.length - 1,
+
+    // Indoor-specific values, for the floor plan.
+    indoorLevel,
+    indoorBuildingName,
+    indoorGeometry,
+    indoorDestination,
   };
 }
 
@@ -37182,21 +38370,21 @@ export function useWalkingProgress(route) {
     "noRoute": "No route found between those places."
   },
   "walking": {
-  "title": "Walking",
-  "offRouteTitle": "You seem off route",
-  "offRouteSubtitle": "Are you on a different path?",
-  "recalculate": "Recalculate",
-  "permissionNeeded": "Location permission is needed to guide you.",
-  "approaching": "You're approaching {name}",
-  "calculating": "Calculating route…",
-  "searchingGps": "Searching for GPS…",
-  "indoorsTitle": "You're inside now",
-  "indoorsBody": "Follow the steps below to reach {name}. Tap Next step after each one.",
-  "indoorsBodyNoName": "Follow the steps below to reach the destination. Tap Next step after each one.",
-  "indoorsBadge": "Indoor — no GPS",
-  "nextStepButton": "Next step",
-  "arrivedButton": "I've arrived"
-},
+    "title": "Walking",
+    "offRouteTitle": "You seem off route",
+    "offRouteSubtitle": "Are you on a different path?",
+    "recalculate": "Recalculate",
+    "permissionNeeded": "Location permission is needed to guide you.",
+    "approaching": "You're approaching {name}",
+    "calculating": "Calculating route…",
+    "searchingGps": "Searching for GPS…",
+    "indoorsTitle": "You're inside now",
+    "indoorsBody": "Follow the steps below to reach {name}. Tap Next step after each one.",
+    "indoorsBodyNoName": "Follow the steps below to reach the destination. Tap Next step after each one.",
+    "indoorsBadge": "Indoor — no GPS",
+    "nextStepButton": "Next step",
+    "arrivedButton": "I've arrived"
+  },
   "arrival": {
     "title": "Arrival",
     "arrived": "You've arrived",
@@ -37280,6 +38468,8 @@ export function useWalkingProgress(route) {
     "hapticsDescription": "Buzz when you reach a turn.",
     "reduceMotion": "Reduce motion",
     "reduceMotionDescription": "Turn off animations.",
+    "indoorNavigation": "Indoor navigation",
+    "indoorNavigationDescription": "Show floor plans and step-by-step directions inside buildings.",
     "units": "Units",
     "unitsMetric": "Metric",
     "unitsImperial": "Imperial",
@@ -37302,53 +38492,53 @@ export function useWalkingProgress(route) {
     "library": "Library"
   },
   "timetable": {
-  "title": "Timetable",
-  "noClasses": "No classes on this day.",
-  "periodsCount": "{count} period(s)",
-  "days": {
-    "monday": "Monday",
-    "tuesday": "Tuesday",
-    "wednesday": "Wednesday",
-    "thursday": "Thursday",
-    "friday": "Friday",
-    "saturday": "Saturday",
-    "sunday": "Sunday",
-    "mon": "Mon",
-    "tue": "Tue",
-    "wed": "Wed",
-    "thu": "Thu",
-    "fri": "Fri",
-    "sat": "Sat",
-    "sun": "Sun"
+    "title": "Timetable",
+    "noClasses": "No classes on this day.",
+    "periodsCount": "{count} period(s)",
+    "days": {
+      "monday": "Monday",
+      "tuesday": "Tuesday",
+      "wednesday": "Wednesday",
+      "thursday": "Thursday",
+      "friday": "Friday",
+      "saturday": "Saturday",
+      "sunday": "Sunday",
+      "mon": "Mon",
+      "tue": "Tue",
+      "wed": "Wed",
+      "thu": "Thu",
+      "fri": "Fri",
+      "sat": "Sat",
+      "sun": "Sun"
+    },
+    "picker": {
+      "intro": "Choose your program and year to see your timetable.",
+      "stepProgram": "Step 1 — Choose your program",
+      "stepYear": "Step 2 — Choose your year",
+      "loading": "Loading programs…",
+      "empty": "No programs available yet. Check back later.",
+      "noYears": "No years available for this program.",
+      "yearLabel": "Year {n}",
+      "searchPlaceholder": "Search programs…",
+      "noMatch": "No programs match your search."
+    },
+    "banner": {
+      "startingNow": "Starting now",
+      "startsIn": "In {minutes} min",
+      "takeMeThere": "Take me there",
+      "viewTimetable": "View timetable"
+    }
   },
-  "picker": {
-    "intro": "Choose your program and year to see your timetable.",
-    "stepProgram": "Step 1 — Choose your program",
-    "stepYear": "Step 2 — Choose your year",
-    "loading": "Loading programs…",
-    "empty": "No programs available yet. Check back later.",
-    "noYears": "No years available for this program.",
-    "yearLabel": "Year {n}",
-    "searchPlaceholder": "Search programs…",
-    "noMatch": "No programs match your search."
-  },
-  "banner": {
-    "startingNow": "Starting now",
-    "startsIn": "In {minutes} min",
-    "takeMeThere": "Take me there",
-    "viewTimetable": "View timetable"
+  "intents": {
+    "eat": "Food",
+    "study": "Study",
+    "print": "Print",
+    "wifi": "Wi-Fi",
+    "sports": "Sports",
+    "meet": "Meet up",
+    "toilet": "Toilets",
+    "prayer": "Prayer"
   }
-},
-"intents": {
-  "eat": "Food",
-  "study": "Study",
-  "print": "Print",
-  "wifi": "Wi-Fi",
-  "sports": "Sports",
-  "meet": "Meet up",
-  "toilet": "Toilets",
-  "prayer": "Prayer"
-}
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\i18n\index.js ---
@@ -37496,21 +38686,21 @@ export function ttsLanguageForCurrentLang() {
     "noRoute": "Hakuna njia kati ya mahali hapo."
   },
   "walking": {
-  "title": "Kutembea",
-  "offRouteTitle": "Unaonekana uko nje ya njia",
-  "offRouteSubtitle": "Umepitia njia nyingine?",
-  "recalculate": "Hesabu tena",
-  "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
-  "approaching": "Unakaribia {name}",
-  "calculating": "Inahesabu njia…",
-  "searchingGps": "Inatafuta GPS…",
-  "indoorsTitle": "Uko ndani sasa",
-  "indoorsBody": "Fuata hatua hapa chini kufikia {name}. Gusa Endelea baada ya kila hatua.",
-  "indoorsBodyNoName": "Fuata hatua hapa chini kufikia unakoenda. Gusa Endelea baada ya kila hatua.",
-  "indoorsBadge": "Ndani — hakuna GPS",
-  "nextStepButton": "Endelea",
-  "arrivedButton": "Nimefika"
-},
+    "title": "Kutembea",
+    "offRouteTitle": "Unaonekana uko nje ya njia",
+    "offRouteSubtitle": "Umepitia njia nyingine?",
+    "recalculate": "Hesabu tena",
+    "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
+    "approaching": "Unakaribia {name}",
+    "calculating": "Inahesabu njia…",
+    "searchingGps": "Inatafuta GPS…",
+    "indoorsTitle": "Uko ndani sasa",
+    "indoorsBody": "Fuata hatua hapa chini kufikia {name}. Gusa Endelea baada ya kila hatua.",
+    "indoorsBodyNoName": "Fuata hatua hapa chini kufikia unakoenda. Gusa Endelea baada ya kila hatua.",
+    "indoorsBadge": "Ndani — hakuna GPS",
+    "nextStepButton": "Endelea",
+    "arrivedButton": "Nimefika"
+  },
   "arrival": {
     "title": "Kufika",
     "arrived": "Umefika",
@@ -37594,6 +38784,8 @@ export function ttsLanguageForCurrentLang() {
     "hapticsDescription": "Tetema unapofika kwenye kona.",
     "reduceMotion": "Punguza mwendo",
     "reduceMotionDescription": "Zima uhuishaji.",
+    "indoorNavigation": "Urambazaji wa ndani",
+    "indoorNavigationDescription": "Onyesha ramani za sakafu na maelekezo ya hatua kwa hatua ndani ya majengo.",
     "units": "Vipimo",
     "unitsMetric": "Metric",
     "unitsImperial": "Imperial",
@@ -37616,53 +38808,53 @@ export function ttsLanguageForCurrentLang() {
     "library": "Maktaba"
   },
   "timetable": {
-  "title": "Ratiba",
-  "noClasses": "Hakuna vipindi siku hii.",
-  "periodsCount": "Vipindi {count}",
-  "days": {
-    "monday": "Jumatatu",
-    "tuesday": "Jumanne",
-    "wednesday": "Jumatano",
-    "thursday": "Alhamisi",
-    "friday": "Ijumaa",
-    "saturday": "Jumamosi",
-    "sunday": "Jumapili",
-    "mon": "Jtat",
-    "tue": "Jnan",
-    "wed": "Jtan",
-    "thu": "Alh",
-    "fri": "Ijm",
-    "sat": "Jmos",
-    "sun": "Jpil"
+    "title": "Ratiba",
+    "noClasses": "Hakuna vipindi siku hii.",
+    "periodsCount": "Vipindi {count}",
+    "days": {
+      "monday": "Jumatatu",
+      "tuesday": "Jumanne",
+      "wednesday": "Jumatano",
+      "thursday": "Alhamisi",
+      "friday": "Ijumaa",
+      "saturday": "Jumamosi",
+      "sunday": "Jumapili",
+      "mon": "Jtat",
+      "tue": "Jnan",
+      "wed": "Jtan",
+      "thu": "Alh",
+      "fri": "Ijm",
+      "sat": "Jmos",
+      "sun": "Jpil"
+    },
+    "picker": {
+      "intro": "Chagua programu na mwaka wako ili kuona ratiba yako.",
+      "stepProgram": "Hatua 1 — Chagua programu yako",
+      "stepYear": "Hatua 2 — Chagua mwaka wako",
+      "loading": "Inapakia programu…",
+      "empty": "Hakuna programu bado. Angalia tena baadaye.",
+      "noYears": "Hakuna miaka inayopatikana kwa programu hii.",
+      "yearLabel": "Mwaka {n}",
+      "searchPlaceholder": "Tafuta programu…",
+      "noMatch": "Hakuna programu inayolingana na utafutaji wako."
+    },
+    "banner": {
+      "startingNow": "Inaanza sasa",
+      "startsIn": "Baada ya dakika {minutes}",
+      "takeMeThere": "Nipeleke hapo",
+      "viewTimetable": "Ona ratiba"
+    }
   },
-  "picker": {
-    "intro": "Chagua programu na mwaka wako ili kuona ratiba yako.",
-    "stepProgram": "Hatua 1 — Chagua programu yako",
-    "stepYear": "Hatua 2 — Chagua mwaka wako",
-    "loading": "Inapakia programu…",
-    "empty": "Hakuna programu bado. Angalia tena baadaye.",
-    "noYears": "Hakuna miaka inayopatikana kwa programu hii.",
-    "yearLabel": "Mwaka {n}",
-    "searchPlaceholder": "Tafuta programu…",
-    "noMatch": "Hakuna programu inayolingana na utafutaji wako."
-  },
-  "banner": {
-    "startingNow": "Inaanza sasa",
-    "startsIn": "Baada ya dakika {minutes}",
-    "takeMeThere": "Nipeleke hapo",
-    "viewTimetable": "Ona ratiba"
+  "intents": {
+    "eat": "Chakula",
+    "study": "Kusoma",
+    "print": "Kuchapisha",
+    "wifi": "Wi-Fi",
+    "sports": "Michezo",
+    "meet": "Kukutana",
+    "toilet": "Vyoo",
+    "prayer": "Kuomba"
   }
-},
-"intents": {
-  "eat": "Chakula",
-  "study": "Kusoma",
-  "print": "Kuchapisha",
-  "wifi": "Wi-Fi",
-  "sports": "Michezo",
-  "meet": "Kukutana",
-  "toilet": "Vyoo",
-  "prayer": "Kuomba"
-}
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\jest.setup.js ---
@@ -54582,11 +55774,12 @@ export async function searchPlaces(q, { limit = 20 } = {}) {
   return request(`/api/places/search?${params.toString()}`);
 }
 
-export async function listPlaces({ q, category, intent, lat, lon, radius_m, limit } = {}) {
+export async function listPlaces({ q, category, intent, kind, lat, lon, radius_m, limit } = {}) {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (category) params.set('category', category);
   if (intent) params.set('intent', intent);
+  if (kind) params.set('kind', kind);
   if (lat != null) params.set('lat', String(lat));
   if (lon != null) params.set('lon', String(lon));
   if (radius_m != null) params.set('radius_m', String(radius_m));
@@ -54804,6 +55997,30 @@ export async function getNearbyWifi({ lat, lon, r = 25 } = {}) {
   if (lon != null) params.set('lon', String(lon));
   params.set('r', String(r));
   return request(`/api/wifi/nearby?${params.toString()}`);
+}
+
+// ---------------------------------------------------------------
+// Indoor floor plans
+// ---------------------------------------------------------------
+
+/**
+ * Fetch the rooms and corridors for one floor of one building.
+ *
+ * Used by the walking screen when the current step is indoor.
+ * Returns { building_name, level, areas: [...] }.
+ *
+ * Each area has { id, osm_id, name, ref, type, level,
+ * door_node_id, boundary: [{lat, lon}], centroid: {lat, lon} }.
+ *
+ * If the building or level has no polygons yet, `areas` is empty
+ * and the caller falls back to the indoor placeholder.
+ */
+export async function getIndoorAreas({ buildingName, level }) {
+  const params = new URLSearchParams({
+    building_name: buildingName,
+    level: String(level),
+  });
+  return request(`/api/indoor/areas?${params.toString()}`);
 }
 
 // ---------------------------------------------------------------

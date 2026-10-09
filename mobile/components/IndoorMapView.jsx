@@ -29,14 +29,21 @@ import {
 import { getIndoorAreas } from '@/services/api';
 import { COLORS } from '@/constants/theme';
 
-// A minimal blank map style. No tiles, no labels, no country outlines.
-// Just a flat background the floor plan draws on top of.
+// A minimal blank map style. No tiles, no outlines, no country
+// boundaries — just a flat background for the floor plan.
 //
-// The shape of a MapLibre style is fixed by the spec: version,
-// sources, layers. We give it one empty background layer.
-const BLANK_STYLE = {
+// The glyphs URL is required: MapLibre downloads font glyphs from
+// here to render text in SymbolLayer. Without it, MapLibre logs
+// "Unable to parse resourceUrl" on every redraw and room labels
+// never appear.
+//
+// The style is passed as a JSON string rather than an object because
+// MapLibre RN versions differ in how they handle inline objects —
+// a string is stable across renders and avoids unnecessary reloads.
+const BLANK_STYLE = JSON.stringify({
   version: 8,
   name: 'indoor-blank',
+  glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
   sources: {},
   layers: [
     {
@@ -47,7 +54,7 @@ const BLANK_STYLE = {
       },
     },
   ],
-};
+});
 
 export function IndoorMapView({
   buildingName,
@@ -104,7 +111,6 @@ export function IndoorMapView({
   // GeoJSON assembly
   // -------------------------------------------------------------------------
 
-  // Rooms as one FeatureCollection. Corridors as another.
   const { roomsGeoJSON, corridorsGeoJSON } = useMemo(() => {
     if (!areas || areas.length === 0) {
       return { roomsGeoJSON: null, corridorsGeoJSON: null };
@@ -115,7 +121,6 @@ export function IndoorMapView({
 
     for (const area of areas) {
       const ring = (area.boundary || []).map((p) => [p.lon, p.lat]);
-      // A polygon ring must be closed — first point === last point.
       if (ring.length === 0) continue;
       const first = ring[0];
       const last = ring[ring.length - 1];
@@ -143,18 +148,11 @@ export function IndoorMapView({
     }
 
     return {
-      roomsGeoJSON: {
-        type: 'FeatureCollection',
-        features: rooms,
-      },
-      corridorsGeoJSON: {
-        type: 'FeatureCollection',
-        features: corridors,
-      },
+      roomsGeoJSON: { type: 'FeatureCollection', features: rooms },
+      corridorsGeoJSON: { type: 'FeatureCollection', features: corridors },
     };
   }, [areas]);
 
-  // Route line — a single LineString from the passed-in geometry.
   const routeGeoJSON = useMemo(() => {
     if (!routeGeometry || routeGeometry.length < 2) return null;
     return {
@@ -167,13 +165,11 @@ export function IndoorMapView({
     };
   }, [routeGeometry]);
 
-  // Camera fit — compute a bounding box from the areas and route,
-  // then set the camera to fit. Called whenever the data changes.
+  // Camera fit — compute a bounding box from areas and route.
   useEffect(() => {
     if (!cameraRef.current) return;
     if (loading) return;
 
-    // Gather points from areas and route.
     const points = [];
     if (areas) {
       for (const area of areas) {
@@ -187,7 +183,6 @@ export function IndoorMapView({
         points.push([p.lon, p.lat]);
       }
     }
-
     if (points.length === 0) return;
 
     const lons = points.map((p) => p[0]);
@@ -201,9 +196,6 @@ export function IndoorMapView({
     const centerLat = (south + north) / 2;
     const span = Math.max(east - west, north - south);
 
-    // Convert a span in degrees to a zoom level. This is
-    // approximate but close enough. We clamp between 15 and 20.
-    // Latitude scaling is ignored — the building is small enough.
     let zoom = 17;
     if (span > 0) {
       zoom = 15 + Math.log2(0.0015 / span);
@@ -242,12 +234,9 @@ export function IndoorMapView({
   }
 
   if (!areas || areas.length === 0) {
-    // Parent will fall back to the placeholder.
     return <View style={[styles.container, style]} />;
   }
 
-  // Initial camera — center on the first area's centroid, or on the
-  // first room boundary point as a fallback.
   const firstCentroid =
     areas[0]?.centroid || areas[0]?.boundary?.[0] || null;
   const initialCenter = firstCentroid
@@ -273,7 +262,7 @@ export function IndoorMapView({
           }}
         />
 
-        {/* Corridors first so rooms sit on top. */}
+        {/* Corridors first, so rooms sit on top. */}
         {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
           <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
             <FillLayer
@@ -314,6 +303,7 @@ export function IndoorMapView({
               id="roomsLabels"
               style={{
                 textField: ['get', 'name'],
+                textFont: ['Noto Sans Regular'],
                 textSize: 11,
                 textColor: '#334155',
                 textHaloColor: '#ffffff',
