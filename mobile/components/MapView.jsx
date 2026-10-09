@@ -1,4 +1,9 @@
 // MapView.jsx — MapLibre version with rotation and recentering.
+//
+// When `mode` is "indoor", the tile map is replaced by a placeholder
+// panel. This keeps the outdoor map out of the way while the student
+// is inside a building — no misleading GPS dot on a map that doesn't
+// show the building's interior.
 
 import { useMemo, useRef, useEffect } from 'react';
 import { StyleSheet, View } from 'react-native';
@@ -9,6 +14,8 @@ import {
   LineLayer,
   MarkerView,
 } from '@maplibre/maplibre-react-native';
+
+import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
 
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
 const DEFAULT_CENTER = [39.2000, -6.7500];
@@ -35,6 +42,8 @@ export function RouteMap({
   userLocation = null,
   bearing = null,
   followBearing = false,
+  mode = 'outdoor',
+  destinationName = null,
   style,
 }) {
   const cameraRef = useRef(null);
@@ -60,6 +69,7 @@ export function RouteMap({
   // changes. Only runs when the route is stable — a mid-recompute
   // empty geometry is skipped.
   useEffect(() => {
+    if (mode !== 'outdoor') return;
     if (routeCoords.length < 2 || !cameraRef.current) return;
 
     const valid = routeCoords.filter(
@@ -105,12 +115,13 @@ export function RouteMap({
     }, 200);
 
     return () => clearTimeout(timeout);
-  }, [routeCoords]);
+  }, [routeCoords, mode]);
 
   // Single effect for real-time camera updates. Position and
   // heading are set in one call, so the map moves and rotates
   // atomically rather than in two separate animations.
   useEffect(() => {
+    if (mode !== 'outdoor') return;
     if (!cameraRef.current) return;
     if (!userLocation) return;
     if (!isWithinCampus(userLocation.lon, userLocation.lat)) return;
@@ -129,7 +140,17 @@ export function RouteMap({
     } catch {
       // Silent.
     }
-  }, [userLocation, bearing, followBearing]);
+  }, [userLocation, bearing, followBearing, mode]);
+
+  // Indoor mode: no tile map. Replace with the placeholder panel.
+  if (mode === 'indoor') {
+    return (
+      <IndoorMapPlaceholder
+        destinationName={destinationName}
+        style={style}
+      />
+    );
+  }
 
   const initialCenter =
     routeCoords.length > 0 ? routeCoords[0] : DEFAULT_CENTER;

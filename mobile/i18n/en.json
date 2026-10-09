@@ -66,7 +66,13 @@
   "permissionNeeded": "Location permission is needed to guide you.",
   "approaching": "You're approaching {name}",
   "calculating": "Calculating route…",
-  "searchingGps": "Searching for GPS…"
+  "searchingGps": "Searching for GPS…",
+  "indoorsTitle": "You're inside now",
+  "indoorsBody": "Follow the steps below to reach {name}. Tap Next step after each one.",
+  "indoorsBodyNoName": "Follow the steps below to reach the destination. Tap Next step after each one.",
+  "indoorsBadge": "Indoor — no GPS",
+  "nextStepButton": "Next step",
+  "arrivedButton": "I've arrived"
 },
   "arrival": {
     "title": "Arrival",

@@ -66,7 +66,13 @@
   "permissionNeeded": "Ruhusa ya mahali inahitajika kukuelekeza.",
   "approaching": "Unakaribia {name}",
   "calculating": "Inahesabu njia…",
-  "searchingGps": "Inatafuta GPS…"
+  "searchingGps": "Inatafuta GPS…",
+  "indoorsTitle": "Uko ndani sasa",
+  "indoorsBody": "Fuata hatua hapa chini kufikia {name}. Gusa Endelea baada ya kila hatua.",
+  "indoorsBodyNoName": "Fuata hatua hapa chini kufikia unakoenda. Gusa Endelea baada ya kila hatua.",
+  "indoorsBadge": "Ndani — hakuna GPS",
+  "nextStepButton": "Endelea",
+  "arrivedButton": "Nimefika"
 },
   "arrival": {
     "title": "Kufika",

@@ -14,7 +14,7 @@ from ..errors import (
     RouteNotFoundError,
 )
 from ..schemas.route import RouteResponse
-from ..services import routing_service
+from ..services import route_composer, routing_service
 from ..services.graph_service import get_edge_tags, get_nodes
 
 router = APIRouter(prefix="/api/route", tags=["route"])
@@ -35,10 +35,15 @@ def compute(
     """
     Compute a walking route.
 
-    Each endpoint is either a place_id OR a lat/lon pair. The from
-    side may also include from_accuracy_m, the GPS fix's reported
-    accuracy in metres. When given, the backend uses it to decide
-    whether the fix is trustworthy enough to route from.
+    Each endpoint is either a place_id OR a lat/lon pair. When both
+    endpoints resolve to outdoor places, the outdoor engine is used
+    (same as always). When either endpoint is an indoor place (a door
+    node), the indoor engine is used and the route may include an
+    entrance crossing.
+
+    Steps in the response carry a `mode` field ("outdoor" or "indoor")
+    so the client knows where to switch rendering behavior. The
+    response also includes a `legs` array describing the boundaries.
     """
     from_ok = from_place_id is not None or (
         from_lat is not None and from_lon is not None
@@ -56,7 +61,7 @@ def compute(
         )
 
     try:
-        result = routing_service.compute_route(
+        result = route_composer.compose_route(
             session, g, get_nodes(), get_edge_tags(),
             from_place_id=from_place_id,
             from_lat=from_lat,
@@ -68,6 +73,8 @@ def compute(
         )
     except routing_service.UnreliableLocationError:
         raise LocationTooFarError()
+    except route_composer.RouteCompositionError as e:
+        raise RouteNotFoundError(str(e))
 
     if result is None:
         raise RouteNotFoundError()

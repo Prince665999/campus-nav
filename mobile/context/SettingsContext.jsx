@@ -26,6 +26,11 @@ const DEFAULT_SETTINGS = {
   // The selected program-year for the timetable. Null until the
   // student picks one (or if they skipped). Local only — no login.
   programYearId: null,
+  // Whether indoor navigation is enabled. When true, routes that
+  // cross into a building use the indoor mode (no GPS dot, manual
+  // step advance). When false, the walking screen behaves as it did
+  // before indoor support existed.
+  indoorsEnabled: true,
 };
 
 const SettingsContext = createContext({

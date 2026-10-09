@@ -17,7 +17,7 @@ import { OffRouteBanner } from '@/components/OffRouteBanner';
 import { ApproachPhoto } from '@/components/ApproachPhoto';
 import { ReportSheet } from '@/components/ReportSheet';
 import { WifiBanner } from '@/components/WifiBanner';
-import { useWalkingProgress } from '@/hooks/useWalkingProgress';
+import { useRouteProgress } from '@/hooks/useRouteProgress';
 import { useCompass } from '@/hooks/useCompass';
 import { useNearbyWifi } from '@/hooks/useNearbyWifi';
 import { useSettings } from '@/context/SettingsContext';
@@ -128,13 +128,20 @@ export default function WalkingScreen() {
     progress,
     resetOffRoute,
     gpsStale,
-  } = useWalkingProgress(route);
+    mode,
+    advanceStep,
+    isLastStep,
+  } = useRouteProgress(route);
 
+  // Compass only runs when outdoor. When indoor, the compass is
+  // ignored — we still call the hook (calling it conditionally would
+  // violate React rules) but we don't feed its output to the arrow.
   const { heading } = useCompass({ position: rawPosition });
 
   useEffect(() => {
+    if (mode !== 'outdoor') return;
     if (!destinationId) return;
-    if (!offRoute) return;                 // only recompute when genuinely off-route
+    if (!offRoute) return;
     if (recomputeAttemptsRef.current >= 3) return;
     if (!rawPosition) return;
     if (
@@ -164,11 +171,11 @@ export default function WalkingScreen() {
     }, RECOMPUTE_AFTER_MS);
 
     return () => clearTimeout(timer);
-  }, [offRoute, rawPosition, destinationId, resetOffRoute]);
+  }, [mode, offRoute, rawPosition, destinationId, resetOffRoute]);
 
   const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
     position,
-    enabled: settings.wifiProximityEnabled,
+    enabled: settings.wifiProximityEnabled && mode === 'outdoor',
   });
 
   useEffect(() => {
@@ -198,7 +205,9 @@ export default function WalkingScreen() {
     };
   }, []);
 
+  // Outdoor arrival: proximity-triggered, as before.
   useEffect(() => {
+    if (mode !== 'outdoor') return;
     if (arrivedRef.current) return;
     if (!route) return;
     if (distanceRemainingM > ARRIVAL_DISTANCE_M) return;
@@ -208,9 +217,26 @@ export default function WalkingScreen() {
       pathname: '/arrival',
       params: { toId: String(destinationId) },
     });
-  }, [distanceRemainingM, route, destinationId]);
+  }, [mode, distanceRemainingM, route, destinationId]);
+
+  // Indoor arrival: the student taps "I've arrived" on the last step.
+  const handleAdvanceStep = useCallback(() => {
+    if (!isLastStep) {
+      advanceStep();
+      return;
+    }
+    // Last step: trigger arrival.
+    if (arrivedRef.current) return;
+    arrivedRef.current = true;
+    haptics.arrivalPulse();
+    router.replace({
+      pathname: '/arrival',
+      params: { toId: String(destinationId) },
+    });
+  }, [isLastStep, advanceStep, destinationId]);
 
   const approachPhoto = (() => {
+    if (mode !== 'outdoor') return null;
     if (approachPhotos.length === 0) return null;
     if (distanceRemainingM > APPROACH_PHOTO_DISTANCE_M) return null;
 
@@ -230,6 +256,7 @@ export default function WalkingScreen() {
   })();
 
   const bearing = (() => {
+    if (mode !== 'outdoor') return null;
     if (!position || !route || !route.geometry || route.geometry.length < 2) {
       return null;
     }
@@ -259,10 +286,7 @@ export default function WalkingScreen() {
   })();
 
   const handleRecalculate = useCallback(async () => {
-    // Prefer the freshest live GPS fix. `position` is snapped to the
-    // route and can be stuck on a stale segment; `rawPosition` is the
-    // real raw fix from the OS. Fall back to `position` only if no
-    // raw fix has arrived yet.
+    if (mode !== 'outdoor') return;
     const from = rawPosition || position;
     if (!from) return;
     if (!destinationId) return;
@@ -280,26 +304,20 @@ export default function WalkingScreen() {
       });
       setRoute(data);
     } catch {}
-  }, [position, rawPosition, destinationId, resetOffRoute]);
+  }, [mode, position, rawPosition, destinationId, resetOffRoute]);
 
   const openChat = useCallback(() => {
-    const req = routeRequestRef.current;
     router.push({
       pathname: '/chat',
       params: {
-        // Place-based start, if there was one.
-        fromPlaceId: req?.fromId != null ? String(req.fromId) : '',
-        // GPS-based start, if that's how the walk began. The chat
-        // screen needs one or the other to rebuild the route.
-        fromLat: req?.fromLat != null ? String(req.fromLat) : '',
-        fromLon: req?.fromLon != null ? String(req.fromLon) : '',
-        // The destination and where the student is on the walk.
+        fromPlaceId: routeRequestRef.current?.fromId
+          ? String(routeRequestRef.current.fromId)
+          : '',
         toPlaceId: String(destinationId || ''),
         currentStepIndex: String(currentStepIndex ?? 0),
         distanceFromStartM: String(
           (route?.distance_m || 0) - distanceRemainingM
         ),
-        // Live position, used for nearby-places context only.
         currentLat: position ? String(position.lat) : '',
         currentLon: position ? String(position.lon) : '',
       },
@@ -328,7 +346,7 @@ export default function WalkingScreen() {
     );
   }
 
-  if (permissionGranted === false) {
+  if (permissionGranted === false && mode !== 'indoor') {
     return (
       <>
         <Stack.Screen options={{ title: t('walking.title') }} />
@@ -367,11 +385,12 @@ export default function WalkingScreen() {
                 style={styles.headerButton}
                 accessibilityRole="button"
                 accessibilityLabel="Recalculate route"
+                disabled={mode === 'indoor'}
               >
                 <MaterialIcons
                   name="my-location"
                   size={22}
-                  color={COLORS.text}
+                  color={mode === 'indoor' ? COLORS.textFaint : COLORS.text}
                 />
               </TouchableOpacity>
               <TouchableOpacity
@@ -399,14 +418,14 @@ export default function WalkingScreen() {
         }}
       />
       <View style={styles.container}>
-        {offRoute && !bannerDismissed ? (
+        {offRoute && !bannerDismissed && mode === 'outdoor' ? (
           <OffRouteBanner
             onRecalculate={handleRecalculate}
             onDismiss={() => setBannerDismissed(true)}
           />
         ) : null}
 
-        {wifiSpot ? (
+        {wifiSpot && mode === 'outdoor' ? (
           <WifiBanner spot={wifiSpot} onDismiss={dismissWifi} />
         ) : null}
 
@@ -417,6 +436,8 @@ export default function WalkingScreen() {
             userLocation={position}
             bearing={heading}
             followBearing={true}
+            mode={mode}
+            destinationName={route.to_name}
             style={styles.map}
           />
         </View>
@@ -438,6 +459,9 @@ export default function WalkingScreen() {
             heading={heading}
             bearing={bearing}
             gpsStale={gpsStale}
+            mode={mode}
+            onAdvanceStep={handleAdvanceStep}
+            isLastStep={isLastStep}
           />
         </View>
       </View>
