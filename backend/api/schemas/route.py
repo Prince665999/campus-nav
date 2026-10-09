@@ -22,6 +22,20 @@ class TurnStep(BaseModel):
     # swap, compass hide) at the handover point.
     mode: str = "outdoor"
 
+    # For indoor steps:
+    #   geometry_index — the position in the route's `geometry` array
+    #                    where this step's node sits. Lets the phone
+    #                    draw a "you are here" marker on the floor plan.
+    #   level          — the floor the step is on ("0", "1", "-1").
+    #                    The phone uses this to fetch the right floor
+    #                    plan and switch when the student takes stairs.
+    #   building_name  — which building the step is in. The phone sends
+    #                    this as a query param to /api/indoor/areas.
+    # Null for outdoor steps.
+    geometry_index: int | None = None
+    level: str | None = None
+    building_name: str | None = None
+
 
 class RouteLeg(BaseModel):
     """

@@ -8,7 +8,7 @@ Reads map.osm once and writes:
 
 Then reads final.osm and writes:
   - one row per door node       → places (kind="indoor")
-  - one row per room polygon    → indoor_areas
+  - one row per indoor polygon  → indoor_areas (rooms and corridors)
   - one row per walkable edge   → indoor_path_edges
 
 Run:
@@ -201,6 +201,10 @@ def ingest_path_edges(nodes, ways, session):
 _INDOOR_WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
 _INDOOR_STAIRS_HIGHWAY = "steps"
 
+# Polygon types we save into indoor_areas. Both are drawn on the
+# phone's floor plan.
+_INDOOR_POLYGON_TYPES = {"room", "corridor"}
+
 
 def _is_door(tags):
     return bool(tags.get("door")) or tags.get("indoor") == "door"
@@ -209,7 +213,7 @@ def _is_door(tags):
 def ingest_indoor_places(nodes, ways, session):
     """
     Write one Place row per door node, one IndoorArea row per room
-    polygon, and one IndoorPathEdge row per walkable edge.
+    or corridor polygon, and one IndoorPathEdge row per walkable edge.
 
     Returns a dict of counts: {"places": n, "areas": n, "edges": n}.
     """
@@ -261,16 +265,19 @@ def ingest_indoor_places(nodes, ways, session):
 
         places_written += 1
 
-    # ---- Indoor areas: one per room polygon ----
+    # ---- Indoor areas: rooms and corridors ----
     areas_written = 0
     for way in ways:
         tags = way["tags"]
-        if tags.get("indoor") != "room":
+        polygon_type = tags.get("indoor")
+        if polygon_type not in _INDOOR_POLYGON_TYPES:
             continue
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
+        # Corridors often have no name. Give them a placeholder so the
+        # column stays not-null.
         if not rname:
-            continue
+            rname = "corridor" if polygon_type == "corridor" else "unnamed"
 
         refs = [r for r in way["refs"] if r in nodes]
         if len(refs) < 3:
@@ -292,8 +299,14 @@ def ingest_indoor_places(nodes, ways, session):
         if level is not None:
             level = str(level).split(";")[0]
 
+        # Building name tag — you add this in JOSM on every room and
+        # corridor way. Nullable so untagged polygons don't break.
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
         # Door node: the first door shared between this polygon and
-        # the walkable network, if any.
+        # the walkable network, if any. Corridors usually have none.
         shared_doors = [r for r in way["refs"] if r in door_node_ids]
         door_node_id = shared_doors[0] if shared_doors else None
 
@@ -309,6 +322,8 @@ def ingest_indoor_places(nodes, ways, session):
         existing.name = rname
         existing.ref = tags.get("ref")
         existing.level = level
+        existing.building_name = building_name
+        existing.type = polygon_type
         existing.geometry_wkt = wkt
         existing.door_node_id = door_node_id
 
@@ -426,7 +441,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
             n_indoor_areas = counts["areas"]
             n_indoor_edges = counts["edges"]
             print(f"  indoor door places: {n_indoor_places}")
-            print(f"  indoor rooms: {n_indoor_areas}")
+            print(f"  indoor rooms + corridors: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
     print("\nIngest complete.")

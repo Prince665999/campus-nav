@@ -24,6 +24,7 @@ from .routers import (
     chat_doc,
     favorites,
     health,
+    indoor,
     media,
     narrate,
     places,
@@ -83,7 +84,7 @@ def create_app() -> FastAPI:
             "Backend for the Campus Navigation mobile app and the "
             "admin website."
         ),
-        version="0.18.0",
+        version="0.19.0",
         lifespan=lifespan,
     )
 
@@ -124,6 +125,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(places.router)
     app.include_router(areas.router)
+    app.include_router(indoor.router)          # ← new
     app.include_router(route.router)
     app.include_router(narrate.router)
     app.include_router(media.router)
@@ -180,7 +182,7 @@ def create_app() -> FastAPI:
     def root():
         return {
             "name": "Campus Navigation API",
-            "version": "0.18.0",
+            "version": "0.19.0",
             "docs": "/docs",
             "health": "/api/health",
         }
