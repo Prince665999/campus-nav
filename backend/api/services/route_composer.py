@@ -4,9 +4,10 @@ route_composer.py
 Decides which engine handles a route request.
 
   - Both endpoints outdoor    →  outdoor engine (routing_service).
-                                 Same code path as before this file
-                                 existed. Same output shape.
-  - Any endpoint indoor       →  indoor engine on the enriched graph.
+  - Any endpoint indoor       →  indoor engine on the merged graph.
+  - GPS start → indoor dest   →  indoor engine on the merged graph,
+                                 after snapping the GPS fix to the
+                                 nearest outdoor node.
 
 The composer is the only place in the codebase that knows both
 engines exist. Everything downstream — the API, the mobile app —
@@ -16,6 +17,16 @@ For mixed routes, each step carries a `mode` field ("outdoor" or
 "indoor") so the client can switch rendering behavior at the
 boundary.
 
+Mixed route with GPS start
+--------------------------
+When the student starts walking from their live position (GPS), the
+composer can't just route from a place id — it has to snap the fix
+to a node on the merged graph. The merged graph contains both
+outdoor nodes (prefixed with "o") and indoor nodes (unprefixed). The
+snapping logic mirrors what the outdoor engine does, so the behavior
+at the boundary is consistent: a fix too far from any node raises
+UnreliableLocationError, same as pure outdoor.
+
 Indoor step enrichment
 ----------------------
 The frozen indoor engine doesn't provide per-step distances,
@@ -23,8 +34,7 @@ geometry indices, or level info. After it returns, this module walks
 the path and annotates each indoor step with:
 
   - geometry_index — where in the route geometry that step's node
-                     sits. Used by the phone's indoor floor plan to
-                     place a "you are here" marker.
+                     sits.
   - level          — the floor the step is on.
   - building_name  — which building the step is in.
 
@@ -32,10 +42,6 @@ Levels are stored on the *edges* in the OSM data (verified in the
 DB: every indoor_path_edges row has a level tag). Corridor and walk
 edges carry a single level like "0" or "-1". Stairs edges carry a
 semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top.
-
-So the enrichment walks the path edge by edge. After each edge it
-asks: "what level did the walker arrive on?" That answer becomes the
-level of the step at the edge's destination node.
 
 The node's own `level` tag is deliberately NOT consulted. On this
 map, nodes are shared between ways and their tags can be stale. The
@@ -51,6 +57,7 @@ rather than by distance, so this is fine.
 """
 
 import logging
+import math
 
 from sqlalchemy.orm import Session
 
@@ -65,6 +72,21 @@ class RouteCompositionError(Exception):
     """Raised when the request can't be routed by either engine."""
 
 
+class UnreliableLocationError(Exception):
+    """
+    Raised when a live GPS fix can't be confidently snapped to the
+    walkable network. The route endpoint catches this and returns a
+    422 with a distinct error code so the client can show a specific
+    message.
+    """
+    pass
+
+
+# Same as routing_service.SNAP_MAX_DISTANCE_M — kept here so the
+# composer and the outdoor engine agree on what counts as "too far".
+SNAP_MAX_DISTANCE_M = 40
+
+
 # ---------------------------------------------------------------------------
 # Endpoint resolution
 # ---------------------------------------------------------------------------
@@ -77,16 +99,7 @@ def _lookup_place(session: Session, place_id: int) -> Place:
 
 
 def _classify_endpoint(place: Place) -> dict:
-    """
-    Return a dict describing how to hand this endpoint to the engine:
-
-      { "engine": "outdoor"|"indoor",
-        "place_id": int,
-        "kind": "outdoor"|"indoor",
-        "node_id": str,
-        "osm_id": str,
-        "name": str }
-    """
+    """Return a dict describing how to hand a place endpoint to the engine."""
     kind = (place.kind or "outdoor").lower()
     if kind == "indoor":
         return {
@@ -106,6 +119,76 @@ def _classify_endpoint(place: Place) -> dict:
             "osm_id": place.osm_id,
             "name": place.name,
         }
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Local copy so we don't have to import the outdoor engine."""
+    R = 6371000
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    )
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _resolve_coord_start(
+    lat: float,
+    lon: float,
+    bundle: dict,
+    *,
+    is_live_fix: bool,
+    accuracy_m: float | None = None,
+) -> tuple[str | None, str]:
+    """
+    Snap a GPS fix to the nearest outdoor node on the merged graph.
+
+    Returns (node_id_or_None, display_name). node_id is prefixed with
+    "o" (the outdoor prefix on the merged graph).
+
+    If is_live_fix is True and the nearest outdoor node is farther
+    than SNAP_MAX_DISTANCE_M, returns (None, ...). The caller turns
+    that into an UnreliableLocationError — same as the outdoor
+    engine does.
+    """
+    nodes = bundle["nodes"]
+    outdoor_node_ids = bundle["outdoor_node_ids"]
+
+    if is_live_fix and accuracy_m is not None:
+        logger.info(
+            "Composer: routing from live fix at (%.5f, %.5f) accuracy %.1fm",
+            lat, lon, accuracy_m,
+        )
+
+    best_id = None
+    best_dist = float("inf")
+
+    # Only search outdoor nodes. Indoor GPS is unreliable; the student
+    # is outdoors, so their fix should snap to an outdoor node.
+    for nid in outdoor_node_ids:
+        node = nodes.get(nid)
+        if node is None:
+            continue
+        d = _haversine_m(lat, lon, node["lat"], node["lon"])
+        if d < best_dist:
+            best_dist = d
+            best_id = nid
+
+    if best_id is None:
+        return None, "your current location"
+
+    if is_live_fix and best_dist > SNAP_MAX_DISTANCE_M:
+        logger.info(
+            "Composer: nearest outdoor node is %.1fm away — too far for a "
+            "live fix (limit %dm)",
+            best_dist, SNAP_MAX_DISTANCE_M,
+        )
+        return None, "your current location"
+
+    return best_id, "your current location"
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +212,12 @@ def compose_route(
     """
     Return a route response. Decides which engine to use.
 
-    See module docstring for the decision rules.
+    Handles four cases:
+      1. Outdoor place → outdoor place: outdoor engine.
+      2. GPS → outdoor place: outdoor engine (unchanged path).
+      3. Place → indoor place, or indoor place → place: indoor engine.
+      4. GPS → indoor place: indoor engine, after snapping GPS to a
+         nearby outdoor node on the merged graph.
     """
     from_place = None
     if from_place_id is not None:
@@ -139,12 +227,22 @@ def compose_route(
     if to_place_id is not None:
         to_place = _lookup_place(session, to_place_id)
 
-    from_kind = (from_place.kind if from_place else "outdoor").lower()
-    to_kind = (to_place.kind if to_place else "outdoor").lower()
+    from_kind = from_place.kind if from_place else None
+    to_kind = to_place.kind if to_place else None
 
-    both_outdoor = (from_kind == "outdoor" and to_kind == "outdoor")
+    # Case 1 & 2: both endpoints are outdoor (or one side is GPS,
+    # which is treated as outdoor). The outdoor engine handles this —
+    # same code path as before the composer existed.
+    from_is_outdoor = (
+        from_kind == "outdoor"
+        or (from_place is None and from_lat is not None)
+    )
+    to_is_outdoor = (
+        to_kind == "outdoor"
+        or (to_place is None and to_lat is not None)
+    )
 
-    if both_outdoor:
+    if from_is_outdoor and to_is_outdoor:
         return _route_via_outdoor_engine(
             session, graph, nodes, edge_tags,
             from_place_id=from_place_id,
@@ -156,17 +254,43 @@ def compose_route(
             to_lon=to_lon,
         )
 
-    # At least one endpoint is indoor. Currently require both to be
-    # named places (the composer can't yet resolve a GPS-start indoor
-    # destination).
-    if from_place is None or to_place is None:
+    # At least one endpoint is indoor. Route on the merged graph.
+    bundle = indoor_graph_builder.get_indoor_graph()
+
+    # Resolve the from endpoint.
+    if from_place is not None:
+        from_ep = _classify_endpoint(from_place)
+    elif from_lat is not None and from_lon is not None:
+        node_id, display_name = _resolve_coord_start(
+            from_lat, from_lon, bundle,
+            is_live_fix=True,
+            accuracy_m=from_accuracy_m,
+        )
+        if node_id is None:
+            raise UnreliableLocationError()
+        from_ep = {
+            "engine": "indoor",  # the merged engine handles both
+            "place_id": None,
+            "kind": "outdoor",
+            "node_id": node_id,
+            "osm_id": node_id[1:] if node_id.startswith("o") else node_id,
+            "name": display_name,
+        }
+    else:
         raise RouteCompositionError(
-            "Mixed indoor/outdoor routes currently require both "
-            "endpoints to be named places."
+            "Either from_place_id or from_lat/from_lon is required."
         )
 
-    from_ep = _classify_endpoint(from_place)
-    to_ep = _classify_endpoint(to_place)
+    # Resolve the to endpoint. The mobile app always sends a place id
+    # for destinations, so this branch is simpler.
+    if to_place is not None:
+        to_ep = _classify_endpoint(to_place)
+    else:
+        raise RouteCompositionError(
+            "Mixed routes currently require the destination to be a "
+            "named place."
+        )
+
     return _route_via_indoor_engine(from_ep, to_ep)
 
 
@@ -417,10 +541,8 @@ def _edge_level_for_step(from_nid, to_nid, current_level, graph):
     is_stairs = edge_info.get("kind") == "stairs"
 
     if not is_stairs:
-        # Corridor or ordinary walk edge — single level.
         return levels[0]
 
-    # Stairs edge. Figure out which direction we're travelling.
     if len(levels) == 1:
         return levels[0]
 

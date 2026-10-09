@@ -41,6 +41,10 @@ def compute(
     node), the indoor engine is used and the route may include an
     entrance crossing.
 
+    A live GPS start is also supported: from_lat/from_lon is snapped
+    to the nearest outdoor node on the merged graph, and the route
+    continues from there.
+
     Steps in the response carry a `mode` field ("outdoor" or "indoor")
     so the client knows where to switch rendering behavior. The
     response also includes a `legs` array describing the boundaries.
@@ -71,7 +75,10 @@ def compute(
             to_lat=to_lat,
             to_lon=to_lon,
         )
-    except routing_service.UnreliableLocationError:
+    except (
+        routing_service.UnreliableLocationError,
+        route_composer.UnreliableLocationError,
+    ):
         raise LocationTooFarError()
     except route_composer.RouteCompositionError as e:
         raise RouteNotFoundError(str(e))
