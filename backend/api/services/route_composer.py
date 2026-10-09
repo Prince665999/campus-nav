@@ -28,10 +28,18 @@ the path and annotates each indoor step with:
   - level          — the floor the step is on.
   - building_name  — which building the step is in.
 
-The annotation happens here so the frozen files stay frozen. The
-logic is: for each step, find its node_id in the path, then look up
-the node's level and building_name (from the indoor map's tags).
-For stairs steps, the level is the level *after* the stairs.
+Levels are stored on the *edges* in the OSM data (verified in the
+DB: every indoor_path_edges row has a level tag). Corridor and walk
+edges carry a single level like "0" or "-1". Stairs edges carry a
+semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top.
+
+So the enrichment walks the path edge by edge. After each edge it
+asks: "what level did the walker arrive on?" That answer becomes the
+level of the step at the edge's destination node.
+
+The node's own `level` tag is deliberately NOT consulted. On this
+map, nodes are shared between ways and their tags can be stale. The
+edge is authoritative.
 
 Step distances (at_m, distance_m)
 ---------------------------------
@@ -377,28 +385,79 @@ def _kind_for_step(step, mode):
 # Indoor step enrichment — geometry index, level, building name
 # ---------------------------------------------------------------------------
 
+def _edge_level_for_step(from_nid, to_nid, current_level, graph):
+    """
+    Return the level the walker arrives on after crossing the edge
+    from_nid -> to_nid.
+
+    - Corridor / walk edges: single level. Return it.
+    - Stairs edges: semicolon list like "0;1" or "-1;0;1", bottom-to-top.
+      Work out which way the walker is going from their current level.
+    - No level on the edge, or no such edge: return None. Caller keeps
+      the previous level.
+    """
+    edge_info = None
+    for nb, _d, info in graph.get(from_nid, []):
+        if nb == to_nid:
+            edge_info = info
+            break
+
+    if edge_info is None:
+        return None
+
+    way_tags = edge_info.get("way_tags") or {}
+    edge_level_raw = way_tags.get("level")
+    if edge_level_raw is None:
+        return None
+
+    levels = [p.strip() for p in str(edge_level_raw).split(";") if p.strip()]
+    if not levels:
+        return None
+
+    is_stairs = edge_info.get("kind") == "stairs"
+
+    if not is_stairs:
+        # Corridor or ordinary walk edge — single level.
+        return levels[0]
+
+    # Stairs edge. Figure out which direction we're travelling.
+    if len(levels) == 1:
+        return levels[0]
+
+    if current_level is None:
+        return levels[-1]
+
+    if current_level not in levels:
+        return levels[-1]
+
+    idx = levels.index(current_level)
+    if idx == 0:
+        return levels[1]
+    if idx == len(levels) - 1:
+        return levels[-2]
+    return levels[idx + 1]
+
+
 def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     """
     Mutate each step in place, adding geometry_index, level, and
     building_name for indoor steps.
 
-    How it works:
-      - We walk the path once, accumulating the current level. The
-        level starts from the first indoor node we encounter (or "0"
-        as a fallback) and flips when we cross a stairs edge.
-      - For each step, we find its node_id in the path, then read the
-        level at that index and the building_name from the enclosing
-        indoor node's tags.
+    Level tracking is edge-based and simple:
 
-    Outdoor steps get level=None and building_name=None. The phone
-    only reads these fields when the step's mode is "indoor".
+      1. Start with current_level = None.
+      2. For each step i (i > 0), look at the edge between path[i-1]
+         and path[i].
+      3. If the edge exists and carries a level, update current_level.
+      4. If the edge has no level, hold the previous current_level.
+      5. The node's own `level` tag is never consulted — the edge is
+         authoritative.
+      6. If current_level is still None at the first indoor node,
+         default it to "0".
+
+    Then assign level_at[i] and building_at[i] to each path node, and
+    pair them up with the indoor step list in order.
     """
-    # Build a node_id -> geometry_index map.
-    index_of = {nid: i for i, nid in enumerate(path)}
-
-    # Walk the path to determine the level at each node.
-    # We start from the first indoor node's level, and flip when we
-    # cross a stairs edge.
     level_at = [None] * len(path)
     building_at = [None] * len(path)
 
@@ -408,48 +467,29 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     for i, nid in enumerate(path):
         node_tags = nodes.get(nid, {}).get("tags", {}) or {}
 
-        # Read the node's own level/building_name tags if present.
-        node_level = node_tags.get("level")
-        if node_level is not None:
-            current_level = str(node_level).split(";")[0]
+        # Track building_name (independent of level).
         node_building = node_tags.get("building_name")
         if node_building:
             current_building = node_building.strip()
 
-        # If we're crossing a stairs edge, the NEXT node is on the
-        # other level. The frozen engine's steps carry the level
-        # change in the instruction text; we approximate here by
-        # looking at the next node's level tag, if any.
+        # Update level from the edge we just crossed. Only the edge.
+        if i > 0:
+            prev_nid = path[i - 1]
+            edge_level = _edge_level_for_step(
+                prev_nid, nid, current_level, graph
+            )
+            if edge_level is not None:
+                current_level = edge_level
+
+        # If we're at the first indoor node and still have no level,
+        # default to ground floor.
+        if current_level is None and not nid.startswith("o"):
+            current_level = "0"
+
         level_at[i] = current_level
         building_at[i] = current_building
 
-    # Default the first indoor level to "0" if no node tags carried it.
-    for i, nid in enumerate(path):
-        if not nid.startswith("o") and level_at[i] is None:
-            level_at[i] = "0"
-
-    # Now apply to each step.
-    for step in annotated_steps:
-        if step.get("mode") != "indoor":
-            continue
-
-        # We didn't store node_id on the annotated step dicts — but
-        # we can recover the geometry index by matching on the
-        # instruction, since generate_turn_by_turn preserves order
-        # and the indoor engine's step order matches the path order.
-        #
-        # Simpler: we still have the original `steps` list in the
-        # caller, but it's not passed here. Instead, we rely on the
-        # `kind` and the sequence: the Nth indoor step corresponds
-        # to the Nth indoor node in the path.
-        #
-        # That's not perfectly right for multi-edge steps, but it's
-        # close enough for the phone's floor plan.
-        pass
-
-    # Fallback: annotate using the path directly.
-    # The indoor engine's step list and the path are in the same
-    # order. We walk both, tracking the current path index.
+    # Pair indoor steps with indoor path nodes, in order.
     indoor_path_indices = [
         i for i, nid in enumerate(path) if not nid.startswith("o")
     ]
@@ -464,8 +504,8 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
         step["level"] = level_at[path_i] or "0"
         step["building_name"] = building_at[path_i]
 
-    # For any indoor step that didn't get a path index (shouldn't
-    # happen, but be safe), give it the first indoor node's data.
+    # Safety net: any indoor step that didn't get paired still gets
+    # the first indoor node's data.
     if indoor_path_indices:
         first_path_i = indoor_path_indices[0]
         fallback_level = level_at[first_path_i] or "0"

@@ -23,7 +23,7 @@ tag you add in JOSM on every indoor=room and indoor=corridor way.
 The phone sends it as a query param to fetch one building's floor.
 """
 
-from sqlalchemy import Index, String, Text
+from sqlalchemy import Index, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin
@@ -42,34 +42,29 @@ class IndoorArea(Base, TimestampMixin):
     ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Which floor the polygon is on, e.g. "0", "1", "-1".
-    level: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    level: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Which building it belongs to. Free text, matches the building_name
     # tag you add in JOSM. The phone queries by this + level.
-    building_name: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, index=True
-    )
+    building_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # "room" or "corridor". Rooms are filled grey, corridors a lighter
     # shade. Both are drawn.
-    type: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="room", index=True
-    )
+    type: Mapped[str] = mapped_column(String(16), nullable=False, default="room")
 
     # WKT "POLYGON((lon lat, ...))"
     geometry_wkt: Mapped[str] = mapped_column(Text, nullable=False)
 
     # The door node that opens into this room, if any. Null for corridors.
-    door_node_id: Mapped[str | None] = mapped_column(
-        String(32), nullable=True, index=True
-    )
+    door_node_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (
-        Index("ix_indoor_areas_name_lower", name),
-        Index("ix_indoor_areas_level", level),
+        Index("ix_indoor_areas_name_lower", func.lower(name)),
         Index("ix_indoor_areas_osm_id", osm_id),
+        Index("ix_indoor_areas_level", level),
         Index("ix_indoor_areas_building_name", building_name),
         Index("ix_indoor_areas_type", type),
+        Index("ix_indoor_areas_door_node_id", door_node_id),
     )
 
     def __repr__(self):
