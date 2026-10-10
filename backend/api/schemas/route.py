@@ -62,9 +62,18 @@ class RouteResponse(BaseModel):
     profile: str = "fastest"
     from_name: str
     to_name: str
+
     # Optional for backward compatibility: mobile apps that don't read
     # it will ignore it. Newer clients use it to switch rendering.
     legs: list[RouteLeg] | None = None
+
+    # The list of merged-graph node ids walked, in order. Outdoor
+    # nodes are prefixed with 'o'; indoor nodes are not. Not part of
+    # the public mobile API — the mobile client ignores it — but the
+    # narration service reads it to split the route into runs and
+    # narrate each with the right engine. Optional so old clients
+    # don't break.
+    node_path: list[str] | None = None
 
 
 class RouteParams(BaseModel):

@@ -17,6 +17,25 @@ For mixed routes, each step carries a `mode` field ("outdoor" or
 "indoor") so the client can switch rendering behavior at the
 boundary.
 
+New in this version
+-------------------
+Both return branches now include a `node_path` field: the list of
+merged-graph node ids the route actually walks, in order. Outdoor
+nodes are prefixed with 'o'; indoor nodes are not.
+
+The mobile app ignores this field. The narration service uses it to
+split the route into runs and narrate each with the right engine.
+
+Why node_path instead of relying on `legs` or `geometry`:
+
+  - `legs` are distance boundaries in metres, not node ids. Using
+    them to find the exact split node requires matching cumulative
+    distances, which is fragile.
+  - `geometry` is a list of lat/lon pairs, which are not node ids.
+    Reversing geometry → node id means re-searching the graph.
+  - `node_path` is exact and already known by the composer. Adding
+    it is one line in each branch.
+
 Step distances on mixed routes
 ------------------------------
 The outdoor engine provides real `at_m` values per step. The indoor
@@ -89,6 +108,17 @@ def _classify_endpoint(place: Place) -> dict:
             "osm_id": place.osm_id,
             "name": place.name,
         }
+    elif kind == "entrance":
+        # An entrance is on the indoor graph as a connector endpoint.
+        # Treat it the same as an indoor node for routing purposes.
+        return {
+            "engine": "indoor",
+            "place_id": place.id,
+            "kind": "entrance",
+            "node_id": place.osm_id,
+            "osm_id": place.osm_id,
+            "name": place.name,
+        }
     else:
         return {
             "engine": "outdoor",
@@ -145,8 +175,6 @@ def _resolve_coord_start(
     best_id = None
     best_dist = float("inf")
 
-    # Only search outdoor nodes. Indoor GPS is unreliable; the student
-    # is outdoors, so their fix should snap to an outdoor node.
     for nid in outdoor_node_ids:
         node = nodes.get(nid)
         if node is None:
@@ -197,6 +225,9 @@ def compose_route(
       3. Place → indoor place, or indoor place → place: indoor engine.
       4. GPS → indoor place: indoor engine, after snapping GPS to a
          nearby outdoor node on the merged graph.
+
+    Every returned route includes a "node_path" field — the list of
+    merged-graph node ids walked, in order.
     """
     from_place = None
     if from_place_id is not None:
@@ -230,10 +261,10 @@ def compose_route(
             to_lon=to_lon,
         )
 
-    # At least one endpoint is indoor. Route on the merged graph.
+    # At least one endpoint is indoor (or entrance). Route on the
+    # merged graph.
     bundle = indoor_graph_builder.get_indoor_graph()
 
-    # Resolve the from endpoint.
     if from_place is not None:
         from_ep = _classify_endpoint(from_place)
     elif from_lat is not None and from_lon is not None:
@@ -257,13 +288,28 @@ def compose_route(
             "Either from_place_id or from_lat/from_lon is required."
         )
 
-    # Resolve the to endpoint.
     if to_place is not None:
         to_ep = _classify_endpoint(to_place)
+    elif to_lat is not None and to_lon is not None:
+        node_id, display_name = _resolve_coord_start(
+            to_lat, to_lon, bundle,
+            is_live_fix=False,
+        )
+        if node_id is None:
+            raise RouteCompositionError(
+                "Could not snap the destination to the walkable network."
+            )
+        to_ep = {
+            "engine": "indoor",
+            "place_id": None,
+            "kind": "outdoor",
+            "node_id": node_id,
+            "osm_id": node_id[1:] if node_id.startswith("o") else node_id,
+            "name": display_name,
+        }
     else:
         raise RouteCompositionError(
-            "Mixed routes currently require the destination to be a "
-            "named place."
+            "Either to_place_id or to_lat/to_lon is required."
         )
 
     return _route_via_indoor_engine(from_ep, to_ep)
@@ -283,7 +329,8 @@ def _route_via_outdoor_engine(
     the API used before the composer existed.
 
     The returned RouteResponse is annotated with mode="outdoor" on
-    each step and a single leg spanning the whole route.
+    each step and a single leg spanning the whole route. We also
+    attach the node_path so narration can reuse it.
     """
     from . import routing_service
     from ..schemas.route import RouteLeg
@@ -314,7 +361,61 @@ def _route_via_outdoor_engine(
             to_name=route.to_name,
         )
     ]
+
+    # Retrieve the node path from routing_service. routing_service
+    # attaches it as a private attribute on the RouteResponse when
+    # it computes a fresh route; if the route came from a cache hit,
+    # we re-derive the path from the geometry's nodes. Simpler: we
+    # always recompute the path in the composer using the resolved
+    # endpoints. See _resolve_path_for_outdoor_route below.
+    node_path = _resolve_path_for_outdoor_route(
+        session, graph, nodes, route,
+        from_place_id=from_place_id,
+        from_lat=from_lat,
+        from_lon=from_lon,
+        to_place_id=to_place_id,
+        to_lat=to_lat,
+        to_lon=to_lon,
+    )
+    route.node_path = node_path
+
     return route
+
+
+def _resolve_path_for_outdoor_route(
+    session, graph, nodes, route,
+    *, from_place_id, from_lat, from_lon,
+    to_place_id, to_lat, to_lon,
+):
+    """
+    Return the node path for an outdoor route, in the merged-graph
+    naming convention (each id prefixed with 'o').
+
+    We re-run a_star here rather than threading the path through
+    routing_service's cache layer. a_star on the outdoor graph is
+    fast and this keeps routing_service's contract unchanged.
+    """
+    from .routing_service import _resolve_endpoint
+    from backend.core.campus_graph import a_star
+
+    from_node, _ = _resolve_endpoint(
+        session, graph, nodes,
+        place_id=from_place_id,
+        lat=from_lat, lon=from_lon,
+        is_live_fix=(from_place_id is None and from_lat is not None),
+    )
+    to_node, _ = _resolve_endpoint(
+        session, graph, nodes,
+        place_id=to_place_id,
+        lat=to_lat, lon=to_lon,
+        is_live_fix=False,
+    )
+    if from_node is None or to_node is None:
+        return []
+    path, _ = a_star(graph, nodes, from_node, to_node)
+    if not path:
+        return []
+    return ["o" + n for n in path]
 
 
 # ---------------------------------------------------------------------------
@@ -323,9 +424,9 @@ def _route_via_outdoor_engine(
 
 def _route_via_indoor_engine(from_ep, to_ep):
     """
-    Route from_ep["node_id"] to to_ep["node_id"] on the enriched graph.
-    Returns a dict-shaped route (not a RouteResponse object) with the
-    same keys the API returns, plus a `legs` array.
+    Route from_ep["node_id"] to to_ep["node_id"] on the enriched
+    graph. Returns a dict-shaped route with the same keys the API
+    returns, plus `legs` and `node_path`.
     """
     bundle = indoor_graph_builder.get_indoor_graph()
 
@@ -375,7 +476,6 @@ def _route_via_indoor_engine(from_ep, to_ep):
         steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
     )
 
-    # Fill in geometry_index, level, and building_name on each step.
     _enrich_indoor_steps(annotated_steps, path, nodes, graph)
 
     geometry = [
@@ -391,6 +491,7 @@ def _route_via_indoor_engine(from_ep, to_ep):
         "from_name": from_ep["name"],
         "to_name": to_ep["name"],
         "legs": legs,
+        "node_path": path,
     }
 
 
@@ -426,12 +527,7 @@ def _annotate_steps_and_legs(
     the current step by comparing distanceFromStartM to each step's
     at_m. If every at_m is 0, the comparison never matches and the
     function returns the last step — "You have arrived".
-
-    The pointer `ptr` advances monotonically, so repeated node ids in
-    the path (which happen when a step's instruction is generated
-    from a mid-way node) map to the correct position.
     """
-    # Cumulative distance along the path.
     cum = [0.0]
     for a, b in zip(path, path[1:]):
         cum.append(
@@ -452,15 +548,11 @@ def _annotate_steps_and_legs(
         nid = step.get("node_id") or ""
         if nid:
             last_mode = "outdoor" if nid.startswith("o") else "indoor"
-            # Move forward until we find this node. We never go
-            # backwards, so repeated nodes map in order.
             while ptr < len(path) and path[ptr] != nid:
                 ptr += 1
             if ptr < len(path):
                 last_at = max(last_at, cum[ptr])
             else:
-                # Node not found — likely a duplicate later in the
-                # path. Reset and search again from the start.
                 ptr = 0
         modes.append(last_mode)
         at_ms.append(last_at)
@@ -476,7 +568,6 @@ def _annotate_steps_and_legs(
             "mode": mode,
         })
 
-    # Build legs from real boundaries.
     legs = []
     start = 0
     for i in range(1, len(annotated) + 1):
@@ -523,12 +614,6 @@ def _edge_level_for_step(from_nid, to_nid, current_level, graph):
     """
     Return the level the walker arrives on after crossing the edge
     from_nid -> to_nid.
-
-    - Corridor / walk edges: single level. Return it.
-    - Stairs edges: semicolon list like "0;1" or "-1;0;1", bottom-to-top.
-      Work out which way the walker is going from their current level.
-    - No level on the edge, or no such edge: return None. Caller keeps
-      the previous level.
     """
     edge_info = None
     for nb, _d, info in graph.get(from_nid, []):
@@ -574,21 +659,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     """
     Mutate each step in place, adding geometry_index, level, and
     building_name for indoor steps.
-
-    Level tracking is edge-based and simple:
-
-      1. Start with current_level = None.
-      2. For each step i (i > 0), look at the edge between path[i-1]
-         and path[i].
-      3. If the edge exists and carries a level, update current_level.
-      4. If the edge has no level, hold the previous current_level.
-      5. The node's own `level` tag is never consulted — the edge is
-         authoritative.
-      6. If current_level is still None at the first indoor node,
-         default it to "0".
-
-    Then assign level_at[i] and building_at[i] to each path node, and
-    pair them up with the indoor step list in order.
     """
     level_at = [None] * len(path)
     building_at = [None] * len(path)
@@ -617,7 +687,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
         level_at[i] = current_level
         building_at[i] = current_building
 
-    # Pair indoor steps with indoor path nodes, in order.
     indoor_path_indices = [
         i for i, nid in enumerate(path) if not nid.startswith("o")
     ]
@@ -632,8 +701,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
         step["level"] = level_at[path_i] or "0"
         step["building_name"] = building_at[path_i]
 
-    # Safety net: any indoor step that didn't get paired still gets
-    # the first indoor node's data.
     if indoor_path_indices:
         first_path_i = indoor_path_indices[0]
         fallback_level = level_at[first_path_i] or "0"
