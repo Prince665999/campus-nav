@@ -19,6 +19,10 @@ import { CategoryChips } from '@/components/CategoryChips';
 import { FeatureCard } from '@/components/FeatureCard';
 import { RecentStrip } from '@/components/RecentStrip';
 import { NextClassBanner } from '@/components/NextClassBanner';
+import { FromChip } from '@/components/FromChip';
+import { StartingPointSheet } from '@/components/StartingPointSheet';
+import { AreYouInsideSheet } from '@/components/AreYouInsideSheet';
+import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
@@ -35,11 +39,7 @@ import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
 import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
 
-// How close a class has to be to appear on the banner. 30 minutes.
 const BANNER_WINDOW_S = 30 * 60;
-
-// How often to re-check the schedule while Home is foregrounded.
-// Every 60 seconds. The check itself is local — no network.
 const BANNER_TICK_MS = 60 * 1000;
 
 export default function HomeScreen() {
@@ -53,14 +53,30 @@ export default function HomeScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // Timetable-related state.
   const [weekEntries, setWeekEntries] = useState([]);
   const [nextClass, setNextClass] = useState(null);
-  const [, setTick] = useState(0); // forces recompute of nextClass every minute
+  const [, setTick] = useState(0);
+
+  const [startSheetOpen, setStartSheetOpen] = useState(false);
+  const [startSheetMode, setStartSheetMode] = useState('choose');
+  const [doorPickerOpen, setDoorPickerOpen] = useState(false);
+  const [pendingDestination, setPendingDestination] = useState(null);
 
   const navigatingRef = useRef(false);
 
-  const { resolveStart } = useStartingPoint();
+  const {
+    state: startState,
+    start,
+    nearbyPlaces,
+    suspiciousBuilding,
+    resolveStart,
+    choosePlace,
+    startDoorPick,
+    confirmOutside,
+    loadOutdoorPlaces,
+    forgetStart,
+    reset: resetStart,
+  } = useStartingPoint();
 
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
@@ -72,7 +88,7 @@ export default function HomeScreen() {
     }
   }, [loaded, settings.hasSeenOnboarding]);
 
-  // Load recents and favorites on mount.
+  // Load recents and favorites.
   useEffect(() => {
     let cancelled = false;
     Promise.all([
@@ -89,7 +105,7 @@ export default function HomeScreen() {
     };
   }, []);
 
-  // Load the timetable week when the selection changes.
+  // Load timetable week when the selection changes.
   useEffect(() => {
     const programYearId = settings.programYearId;
     if (!programYearId) {
@@ -110,8 +126,7 @@ export default function HomeScreen() {
     };
   }, [settings.programYearId]);
 
-  // Compute the next class. Recomputes when the week changes, and
-  // every 60 seconds otherwise (so the countdown stays fresh).
+  // Compute the next class.
   useEffect(() => {
     function computeNext() {
       if (!weekEntries.length) {
@@ -119,26 +134,19 @@ export default function HomeScreen() {
         return;
       }
       const now = new Date();
-      const todayDow = (now.getDay() + 6) % 7; // 0 = Monday
-
+      const todayDow = (now.getDay() + 6) % 7;
       let bestEntry = null;
       let bestDelta = null;
 
       for (const entry of weekEntries) {
-        // Days forward from today to this entry's day.
         const daysAhead = (entry.day_of_week - todayDow + 7) % 7;
-
         const [hh, mm] = entry.start_time.split(':').map(Number);
-        const start = new Date(now);
-        start.setDate(start.getDate() + daysAhead);
-        start.setHours(hh, mm, 0, 0);
-
-        const deltaSec = (start - now) / 1000;
-
-        // Skip already-started classes and classes beyond the window.
+        const startTime = new Date(now);
+        startTime.setDate(startTime.getDate() + daysAhead);
+        startTime.setHours(hh, mm, 0, 0);
+        const deltaSec = (startTime - now) / 1000;
         if (deltaSec < 0) continue;
         if (deltaSec > BANNER_WINDOW_S) continue;
-
         if (bestDelta === null || deltaSec < bestDelta) {
           bestDelta = deltaSec;
           bestEntry = entry;
@@ -151,7 +159,6 @@ export default function HomeScreen() {
         setNextClass(null);
       }
     }
-
     computeNext();
     const id = setInterval(() => {
       computeNext();
@@ -160,10 +167,9 @@ export default function HomeScreen() {
     return () => clearInterval(id);
   }, [weekEntries]);
 
-  // Search when query or category changes.
+  // Search.
   useEffect(() => {
     let cancelled = false;
-
     async function load() {
       setLoading(true);
       setError(null);
@@ -180,7 +186,6 @@ export default function HomeScreen() {
         if (!cancelled) setLoading(false);
       }
     }
-
     load();
     return () => {
       cancelled = true;
@@ -203,99 +208,197 @@ export default function HomeScreen() {
     router.push('/timetable');
   }, []);
 
-  // When the banner's "Take me there" is tapped, start a route to
-  // the venue. Same flow as the place detail screen.
+  // Perform a route from a resolved start to a destination.
+  const beginRoute = useCallback((resolvedStart, destId) => {
+    if (!resolvedStart && !destId) {
+      return false;
+    }
+    if (resolvedStart.lat != null && resolvedStart.lon != null) {
+      setRouteRequest({
+        fromLat: resolvedStart.lat,
+        fromLon: resolvedStart.lon,
+        fromAccuracyM: resolvedStart.accuracyM,
+        toId: destId,
+      });
+    } else if (resolvedStart.placeId != null) {
+      setRouteRequest({
+        fromId: resolvedStart.placeId,
+        toId: destId,
+      });
+    } else {
+      return false;
+    }
+    router.push('/route-preview');
+    return true;
+  }, []);
+
+  // Take me there — from a place detail or from anywhere.
+  // On Home, this is only called via the sentence search or the
+  // next-class banner. Destination is a place id.
+  const startRouteToDestination = useCallback(
+    async (destId) => {
+      if (navigatingRef.current) return;
+      navigatingRef.current = true;
+      setPendingDestination(destId);
+
+      try {
+        const result = await resolveStart({ destinationPlaceId: destId });
+
+        switch (result.status) {
+          case 'ok':
+          case 'ok_place':
+            beginRoute(result.start, destId);
+            navigatingRef.current = false;
+            setPendingDestination(null);
+            return;
+
+          case 'ask':
+            // AreYouInsideSheet is driven by startState === 'askIndoor'.
+            // Keep navigatingRef true and pendingDestination set —
+            // the sheet's handlers will finish the flow.
+            return;
+
+          case 'pick':
+            setStartSheetMode('place-list');
+            setStartSheetOpen(true);
+            return;
+
+          case 'denied':
+            if (result.reason === 'permission_denied') {
+              setError(t('start.permissionDenied'));
+            } else {
+              setError(t('common.error'));
+            }
+            navigatingRef.current = false;
+            setPendingDestination(null);
+            return;
+
+          default:
+            navigatingRef.current = false;
+            setPendingDestination(null);
+            return;
+        }
+      } catch (err) {
+        setError(err.message || t('common.error'));
+        navigatingRef.current = false;
+        setPendingDestination(null);
+      }
+    },
+    [resolveStart, beginRoute]
+  );
+
+  // Banner's Take me there.
   const navigateToNextClass = useCallback(
     async (entry) => {
       if (entry.venue_place_id == null) return;
-      if (navigatingRef.current) return;
-      navigatingRef.current = true;
-
-      try {
-        const start = await resolveStart({
-          destinationPlaceId: entry.venue_place_id,
-        });
-        if (!start) {
-          navigatingRef.current = false;
-          return;
-        }
-
-        if (start.lat != null && start.lon != null) {
-          setRouteRequest({
-            fromLat: start.lat,
-            fromLon: start.lon,
-            fromAccuracyM: start.accuracyM,
-            toId: entry.venue_place_id,
-          });
-        } else if (start.placeId != null) {
-          setRouteRequest({
-            fromId: start.placeId,
-            toId: entry.venue_place_id,
-          });
-        } else {
-          navigatingRef.current = false;
-          return;
-        }
-
-        router.push('/route-preview');
-      } catch {
-        navigatingRef.current = false;
-      }
+      await startRouteToDestination(entry.venue_place_id);
     },
-    [resolveStart]
+    [startRouteToDestination]
   );
 
+  // Sentence search: "take me to the library".
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
     if (text.split(/\s+/).length < 3) return;
-
     if (navigatingRef.current) return;
-    navigatingRef.current = true;
 
     try {
       const extracted = await extractDestination(text);
-      if (!extracted.matched) {
-        navigatingRef.current = false;
-        return;
-      }
-
-      const start = await resolveStart({
-        destinationPlaceId: extracted.place_id,
-      });
-
-      if (!start) {
-        navigatingRef.current = false;
-        return;
-      }
-
-      if (start.lat != null && start.lon != null) {
-        setRouteRequest({
-          fromLat: start.lat,
-          fromLon: start.lon,
-          toId: extracted.place_id,
-        });
-      } else if (start.placeId != null) {
-        setRouteRequest({
-          fromId: start.placeId,
-          toId: extracted.place_id,
-        });
-      } else {
-        navigatingRef.current = false;
-        return;
-      }
-
-      router.push('/route-preview');
+      if (!extracted.matched) return;
+      await startRouteToDestination(extracted.place_id);
     } catch {
-      navigatingRef.current = false;
+      // Silent.
     }
-  }, [query, resolveStart]);
+  }, [query, startRouteToDestination]);
+
+  // Chip handlers.
+  const openStartSheet = useCallback(() => {
+    setStartSheetMode('choose');
+    setStartSheetOpen(true);
+    resetStart();
+  }, [resetStart]);
+
+  const handleChoosePlace = useCallback(
+    (place) => {
+      if (place == null) {
+        // Student picked "pick a starting place" — switch to the list.
+        setStartSheetMode('place-list');
+        if (nearbyPlaces.length === 0) {
+          loadOutdoorPlaces({ excludePlaceId: pendingDestination });
+        }
+        return;
+      }
+      choosePlace(place);
+      setStartSheetOpen(false);
+      setStartSheetMode('choose');
+    },
+    [choosePlace, nearbyPlaces.length, loadOutdoorPlaces, pendingDestination]
+  );
+
+  const handleUseGps = useCallback(() => {
+    setStartSheetOpen(false);
+    // Forget any previously chosen start so the next route does a
+    // fresh GPS read.
+    forgetStart();
+  }, [forgetStart]);
+
+  const handleImInside = useCallback(() => {
+    setStartSheetOpen(false);
+    setDoorPickerOpen(true);
+  }, []);
+
+  const handleDoorPicked = useCallback(
+    (door) => {
+      setDoorPickerOpen(false);
+      choosePlace(door);
+      // If there's a pending destination (auto-trigger flow), route
+      // to it now.
+      if (pendingDestination != null) {
+        beginRoute(
+          {
+            placeId: door.id,
+            placeName: door.name,
+            buildingName: door.building_name || null,
+            level: door.level || null,
+          },
+          pendingDestination
+        );
+        navigatingRef.current = false;
+        setPendingDestination(null);
+      }
+    },
+    [choosePlace, pendingDestination, beginRoute]
+  );
+
+  // Auto-trigger — "Are you inside?" — yes/no.
+  const handleInsideYes = useCallback(() => {
+    setDoorPickerOpen(true);
+  }, []);
+
+  const handleInsideNo = useCallback(() => {
+    const dest = pendingDestination;
+    if (dest == null) {
+      navigatingRef.current = false;
+      resetStart();
+      return;
+    }
+    const resolved = confirmOutside();
+    if (resolved) {
+      beginRoute(resolved, dest);
+    }
+    navigatingRef.current = false;
+    setPendingDestination(null);
+  }, [pendingDestination, confirmOutside, beginRoute, resetStart]);
+
+  const handleInsideDismiss = useCallback(() => {
+    navigatingRef.current = false;
+    setPendingDestination(null);
+    resetStart();
+  }, [resetStart]);
 
   const showSearchResults = isSearching;
 
-  // The header-right area. Two icons side by side: timetable and
-  // settings. Order: timetable first (more frequently used), then
-  // settings.
   const headerRight = useCallback(
     () => (
       <View style={styles.headerButtons}>
@@ -341,8 +444,8 @@ export default function HomeScreen() {
           loading={loading && !error && isSearching}
         />
 
-        {/* The next-class banner. Only shows when there's a class
-            within 90 minutes. */}
+        <FromChip start={start} onPress={openStartSheet} />
+
         {nextClass ? (
           <NextClassBanner
             entry={nextClass.entry}
@@ -409,36 +512,60 @@ export default function HomeScreen() {
             />
 
             <View style={styles.chipsWrapper}>
-              <Text style={styles.sectionTitle}>{t('home.categoriesTitle')}</Text>
+              <Text style={styles.sectionTitle}>
+                {t('home.categoriesTitle')}
+              </Text>
               <CategoryChips selected={null} onSelect={setCategory} />
             </View>
           </ScrollView>
         )}
       </View>
+
+      {/* Starting-point sheet */}
+      <StartingPointSheet
+        visible={startSheetOpen}
+        places={nearbyPlaces}
+        mode={startSheetMode}
+        onChoose={handleChoosePlace}
+        onUseGps={handleUseGps}
+        onImInside={handleImInside}
+        onCancel={() => {
+          setStartSheetOpen(false);
+          setStartSheetMode('choose');
+        }}
+      />
+
+      {/* Door picker */}
+      <DoorPickerSheet
+        visible={doorPickerOpen}
+        buildingName={suspiciousBuilding}
+        onPick={handleDoorPicked}
+        onCancel={() => setDoorPickerOpen(false)}
+      />
+
+      {/* Are you inside? */}
+      <AreYouInsideSheet
+        visible={startState === 'askIndoor'}
+        buildingName={suspiciousBuilding}
+        onYes={handleInsideYes}
+        onNo={handleInsideNo}
+        onCancel={handleInsideDismiss}
+      />
     </>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: COLORS.backgroundSubtle,
-  },
-  scroll: {
-    flex: 1,
-  },
-  scrollContent: {
-    paddingBottom: SPACING.xl,
-  },
+  container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
+  scroll: { flex: 1 },
+  scrollContent: { paddingBottom: SPACING.xl },
   featureRow: {
     flexDirection: 'row',
     gap: SPACING.md,
     paddingHorizontal: SPACING.md,
     marginTop: SPACING.md,
   },
-  chipsWrapper: {
-    marginTop: SPACING.md,
-  },
+  chipsWrapper: { marginTop: SPACING.md },
   sectionTitle: {
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
@@ -448,10 +575,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.md,
     marginBottom: SPACING.sm,
   },
-  headerButtons: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
+  headerButtons: { flexDirection: 'row', alignItems: 'center' },
   headerButton: {
     paddingHorizontal: 10,
     minWidth: TOUCH.minWidth,

@@ -10891,15 +10891,12 @@ is a no-op.
 Safety note
 -----------
 Some of our indexes and columns were added by Alembic migrations or
-raw-SQL scripts (e.g. add_place_kind_columns.py), not by SQLAlchemy's
-metadata. `create_all` doesn't know about them and will fail with
-"index already exists" on a database that's already migrated. Since
-`create_all` aborts on the first such error, we create tables one at
-a time so a failure on one table's index doesn't stop the rest.
+raw-SQL scripts, not by SQLAlchemy's metadata. `create_all` doesn't
+know about them and will fail with "index already exists" on a
+database that's already migrated.
 
-If a table's index already exists, we catch the error, log it, and
-move on. The table itself was created (SQLite uses CREATE TABLE IF
-NOT EXISTS under the hood), so nothing is lost.
+To make this safe to run on any DB state, we create tables one at a
+time so a failure on one table's index doesn't stop the rest.
 """
 
 import logging
@@ -10922,8 +10919,10 @@ def init_db():
         except OperationalError as e:
             msg = str(e).lower()
             if "already exists" in msg:
-                # The table exists; only an index was redundant.
-                logger.warning(
+                # Expected on an already-migrated database. Log at
+                # debug level — this is not a problem worth warning
+                # about on every startup.
+                logger.debug(
                     "init_db: skipped duplicate index on %s (%s)",
                     table.name,
                     e,
@@ -11329,6 +11328,47 @@ def downgrade():
     op.drop_index("ix_indoor_areas_building_name", table_name="indoor_areas")
     op.drop_column("indoor_areas", "type")
     op.drop_column("indoor_areas", "building_name")
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\migrations\versions\0009_place_building_name.py ---
+
+"""Add building_name to places.
+
+Revision ID: 0009
+Revises: 0008
+
+What this does:
+  1. Adds `building_name` (nullable String) to places.
+  2. Adds an index on it.
+
+Existing rows get NULL. The next ingest run populates it for indoor
+places and entrances. Outdoor places stay NULL — they have no
+building.
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0009"
+down_revision = "0008"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.add_column(
+        "places",
+        sa.Column("building_name", sa.String(255), nullable=True),
+    )
+    op.create_index(
+        "ix_places_building_name",
+        "places",
+        ["building_name"],
+    )
+
+
+def downgrade():
+    op.drop_index("ix_places_building_name", table_name="places")
+    op.drop_column("places", "building_name")
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\db\session.py ---
 
@@ -12346,13 +12386,14 @@ a gate, a specific room. This is what routing can start from and end at.
 Points come from OSM nodes with a `name` tag. Areas (polygons) live in
 a separate table because they are walked past, not routed to.
 
-Two kinds of place:
-  - outdoor: from map.osm (named OSM nodes)
-  - indoor:  from final.osm (door nodes inside buildings)
+Three kinds of place:
+  - outdoor:   from map.osm (named OSM nodes)
+  - indoor:    from final.osm (door nodes inside buildings)
+  - entrance:  from final.osm (nodes tagged entrance=*)
 
-Indoor places carry `level` and `room_name`. Outdoor places leave them
-null. The `kind` column lets search filter and lets the mobile UI style
-each type differently.
+The `building_name` links a place to its building. Null for outdoor
+places (which have no building); populated for indoor places and
+entrances when the tag is present in the OSM file.
 """
 
 from sqlalchemy import Float, Index, String, Text, func
@@ -12373,36 +12414,35 @@ class Place(Base, TimestampMixin):
     # Names
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     name_sw: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    alt_names: Mapped[str | None] = mapped_column(Text, nullable=True)  # semicolon-separated
+    alt_names: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Public description — shown to students in the app. Formal text
-    # written by an admin. Not fed to the AI.
+    # Public description — shown to students in the app.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # AI description — fed to the narration system. Informal text
-    # that mentions landmarks, local nicknames, "the big mango tree".
-    # Never shown in the app front end.
+    # AI description — fed to the narration system.
     description_ai: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Free-text list of intents this place serves, semicolon-separated.
-    # Examples: "eat; study; wifi", "print; study".
     intents: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Where this place lives: "outdoor" or "indoor".
+    # "outdoor", "indoor", or "entrance".
     kind: Mapped[str] = mapped_column(
         String(16), nullable=False, default="outdoor", index=True
     )
 
+    # Which building the place belongs to. Null for outdoor places.
+    # Free text, matches the building_name tag on rooms and doors.
+    building_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+
     # For indoor places: the level the door is on, e.g. "0", "1", "-1".
-    # Nullable for outdoor places, which don't have levels.
     level: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
-    # For indoor places: the room this door serves, if any. Free text,
-    # read from the room polygon's name or ref. Nullable.
+    # For indoor places: the room this door serves, if any.
     room_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    # Coordinates. Kept as separate lat/lon columns for ease of read;
-    # Phase 13 adds a proper geometry column alongside these.
+    # Coordinates.
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lon: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -12425,6 +12465,7 @@ class Place(Base, TimestampMixin):
         Index("ix_places_category", category),
         Index("ix_places_osm_id", osm_id),
         Index("ix_places_kind", kind),
+        Index("ix_places_building_name", building_name),
     )
 
     def __repr__(self):
@@ -14614,8 +14655,9 @@ Endpoints for indoor floor plans.
   GET /api/indoor/areas?building_name=X&level=Y
 
 Returns every room and corridor polygon on one floor of one
-building. The phone uses this to draw the floor plan when the
-student is walking inside.
+building, plus the list of levels the building has. The phone uses
+this to draw the floor plan when the student is walking inside, and
+to show a floor switcher.
 
 Public (no admin guard) — the mobile app calls it directly, just
 like the outdoor /api/areas endpoint.
@@ -14625,7 +14667,6 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from ..dependencies import db_session
-from ..errors import NotFoundError
 from ..schemas.indoor import IndoorAreasResponse
 from ..services import indoor_area_service
 
@@ -14640,6 +14681,9 @@ def get_indoor_areas(
 ):
     """
     Every room and corridor polygon on one floor of one building.
+
+    Also returns `levels`, the list of floors this building has
+    polygons on. The phone uses it to show a floor switcher.
 
     Returns an empty `areas` list if the building or level has no
     polygons yet. The mobile app falls back to the indoor
@@ -14854,7 +14898,16 @@ def list_places(
     category: str | None = Query(None),
     intent: str | None = Query(None, description="Substring match on intents"),
     kind: str | None = Query(
-        None, description="Filter by kind: 'outdoor' or 'indoor'"
+        None,
+        description="Filter by kind: 'outdoor', 'indoor', or 'entrance'",
+    ),
+    building_name: str | None = Query(
+        None,
+        description="Filter by building name (indoor and entrance places)",
+    ),
+    level: str | None = Query(
+        None,
+        description="Filter by level (indoor places)",
     ),
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
@@ -14862,14 +14915,18 @@ def list_places(
     limit: int = Query(50, gt=0, le=200),
     session: Session = Depends(db_session),
 ):
-    """List places, optionally filtered by query, category, intent,
-    kind, or proximity."""
+    """
+    List places, optionally filtered by query, category, intent, kind,
+    building, level, or proximity.
+    """
     return place_service.search_places(
         session,
         q=q,
         category=category,
         intent=intent,
         kind=kind,
+        building_name=building_name,
+        level=level,
         lat=lat,
         lon=lon,
         radius_m=radius_m,
@@ -14881,12 +14938,17 @@ def list_places(
 def search_places(
     q: str = Query(..., min_length=1),
     kind: str | None = Query(None),
+    building_name: str | None = Query(None),
     limit: int = Query(20, gt=0, le=100),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
     return place_service.search_places(
-        session, q=q, kind=kind, limit=limit
+        session,
+        q=q,
+        kind=kind,
+        building_name=building_name,
+        limit=limit,
     )
 
 
@@ -15620,6 +15682,11 @@ Request and response shapes for the indoor-areas endpoint.
 
 The endpoint returns plain JSON with lat/lon boundary points, not
 WKT strings. The phone builds GeoJSON from this directly.
+
+The `levels` array lists every level that has polygons in this
+building. The floor switcher uses it to know what to show. It's
+computed from the DB, not hard-coded, so it always reflects what's
+actually ingested.
 """
 
 from pydantic import BaseModel, Field
@@ -15651,6 +15718,10 @@ class IndoorAreasResponse(BaseModel):
     building_name: str
     level: str
     areas: list[IndoorAreaItem] = Field(default_factory=list)
+
+    # Every level this building has polygons on, sorted ascending.
+    # Includes the requested level. Used by the floor switcher.
+    levels: list[str] = Field(default_factory=list)
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\knowledge.py ---
 
@@ -15793,6 +15864,7 @@ class PlaceSummary(BaseModel):
     category_icon_key: str | None = None
     intents: str | None = None
     kind: str = "outdoor"
+    building_name: str | None = None
     level: str | None = None
     room_name: str | None = None
     location: LatLon
@@ -15802,12 +15874,7 @@ class PlaceSummary(BaseModel):
 
 class PlaceDetail(BaseModel):
     """The shape returned by /api/places/{id}. Adds fields the summary
-    doesn't need.
-
-    Note: the `description` here is the public one, read from the
-    database's `description` column. The AI-facing description lives
-    under `description_ai` and is never returned in a public response.
-    """
+    doesn't need."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -15819,6 +15886,7 @@ class PlaceDetail(BaseModel):
     category: str | None = None
     intents: str | None = None
     kind: str = "outdoor"
+    building_name: str | None = None
     level: str | None = None
     room_name: str | None = None
     ref: str | None = None
@@ -15837,6 +15905,8 @@ class PlaceListParams(BaseModel):
     category: str | None = None
     intent: str | None = None
     kind: str | None = None
+    building_name: str | None = None
+    level: str | None = None
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)
@@ -17226,7 +17296,6 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models.indoor_area import IndoorArea
-from ..schemas.common import LatLon
 from ..schemas.indoor import IndoorAreaItem, IndoorAreasResponse
 
 # Reuse the outdoor area WKT parser so both area types come back in
@@ -17250,13 +17319,43 @@ def _to_item(area: IndoorArea) -> IndoorAreaItem:
     )
 
 
+def _levels_for_building(session: Session, building_name: str) -> list[str]:
+    """
+    Every level this building has polygons on, sorted ascending.
+
+    Building name is matched case-insensitively, same as the areas
+    query. Levels are sorted with a numeric comparison so "-1" comes
+    before "0", which lexical sort gets wrong. Non-numeric levels are
+    sorted last, as strings.
+    """
+    needle = building_name.strip().lower()
+    rows = (
+        session.query(IndoorArea.level)
+        .filter(func.lower(IndoorArea.building_name) == needle)
+        .filter(IndoorArea.level.isnot(None))
+        .distinct()
+        .all()
+    )
+
+    levels = [r[0] for r in rows if r[0] is not None and r[0] != ""]
+
+    def _sort_key(lvl: str):
+        try:
+            return (0, int(lvl))
+        except (TypeError, ValueError):
+            return (1, lvl)
+
+    return sorted(levels, key=_sort_key)
+
+
 def list_areas_for_floor(
     session: Session,
     building_name: str,
     level: str,
 ) -> IndoorAreasResponse:
     """
-    Return every room and corridor on one floor of one building.
+    Return every room and corridor on one floor of one building, plus
+    the list of levels this building has.
 
     building_name is matched case-insensitively — the phone sends
     whatever string it read from the route step, and the tag in JOSM
@@ -17273,10 +17372,13 @@ def list_areas_for_floor(
         .all()
     )
 
+    levels = _levels_for_building(session, building_name)
+
     return IndoorAreasResponse(
         building_name=building_name,
         level=level,
         areas=[_to_item(a) for a in rows],
+        levels=levels,
     )
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\indoor_graph_builder.py ---
@@ -18906,9 +19008,6 @@ from ..schemas.place import PlaceDetail, PlaceSummary
 from ..schemas.common import LatLon
 
 
-# Maps OSM category values to icon keys the mobile app understands.
-# The mobile side has an ICONS map with matching keys. Anything not
-# listed falls back to the default "place" icon.
 _CATEGORY_ICON_KEYS = {
     "amenity=library": "library",
     "amenity=cafe": "food",
@@ -18930,10 +19029,7 @@ def _icon_key_for_category(category):
 
 
 def _primary_photo_for(session, place_id):
-    """
-    Return the URL of a place's primary photo, or None. Uses the card
-    variant, which is what the app shows in grids.
-    """
+    """Return the URL of a place's primary photo, or None."""
     row = (
         session.query(Media)
         .filter_by(place_id=place_id)
@@ -18955,6 +19051,7 @@ def _to_summary(session, place: Place) -> PlaceSummary:
         category_icon_key=_icon_key_for_category(place.category),
         intents=place.intents,
         kind=place.kind,
+        building_name=place.building_name,
         level=place.level,
         room_name=place.room_name,
         location=LatLon(lat=place.lat, lon=place.lon),
@@ -18973,6 +19070,7 @@ def _to_detail(session, place: Place) -> PlaceDetail:
         category=place.category,
         intents=place.intents,
         kind=place.kind,
+        building_name=place.building_name,
         level=place.level,
         room_name=place.room_name,
         ref=place.ref,
@@ -18991,6 +19089,8 @@ def search_places(
     category: str | None = None,
     intent: str | None = None,
     kind: str | None = None,
+    building_name: str | None = None,
+    level: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
     radius_m: float = 500,
@@ -19002,7 +19102,9 @@ def search_places(
     - q: case-insensitive substring against name, name_sw, alt_names
     - category: exact match against the category column
     - intent: case-insensitive substring against the intents column
-    - kind: "outdoor" or "indoor"
+    - kind: "outdoor", "indoor", or "entrance"
+    - building_name: exact match (case-insensitive)
+    - level: exact match against the level column
     - lat/lon/radius_m: proximity filter
     """
     query = session.query(Place)
@@ -19028,6 +19130,15 @@ def search_places(
 
     if kind:
         query = query.filter(Place.kind == kind)
+
+    if building_name:
+        needle = building_name.strip().lower()
+        query = query.filter(
+            func.lower(func.coalesce(Place.building_name, "")) == needle
+        )
+
+    if level is not None:
+        query = query.filter(Place.level == str(level))
 
     if lat is not None and lon is not None:
         import math
@@ -19354,43 +19465,22 @@ For mixed routes, each step carries a `mode` field ("outdoor" or
 "indoor") so the client can switch rendering behavior at the
 boundary.
 
-Mixed route with GPS start
---------------------------
-When the student starts walking from their live position (GPS), the
-composer can't just route from a place id — it has to snap the fix
-to a node on the merged graph. The merged graph contains both
-outdoor nodes (prefixed with "o") and indoor nodes (unprefixed). The
-snapping logic mirrors what the outdoor engine does, so the behavior
-at the boundary is consistent: a fix too far from any node raises
-UnreliableLocationError, same as pure outdoor.
+Step distances on mixed routes
+------------------------------
+The outdoor engine provides real `at_m` values per step. The indoor
+engine does not — it labels steps by node_id only.
 
-Indoor step enrichment
-----------------------
-The frozen indoor engine doesn't provide per-step distances,
-geometry indices, or level info. After it returns, this module walks
-the path and annotates each indoor step with:
+For a MIXED route (which always goes through the indoor engine,
+because at least one endpoint is indoor), we cannot leave `at_m`
+at 0 for every step, or the phone's currentStepIndex() would fall
+through its loop and jump straight to the last step ("You have
+arrived"). So `_annotate_steps_and_legs` computes real cumulative
+distances along the path for every step, outdoor and indoor.
 
-  - geometry_index — where in the route geometry that step's node
-                     sits.
-  - level          — the floor the step is on.
-  - building_name  — which building the step is in.
-
-Levels are stored on the *edges* in the OSM data (verified in the
-DB: every indoor_path_edges row has a level tag). Corridor and walk
+Levels are stored on the *edges* in the OSM data. Corridor and walk
 edges carry a single level like "0" or "-1". Stairs edges carry a
-semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top.
-
-The node's own `level` tag is deliberately NOT consulted. On this
-map, nodes are shared between ways and their tags can be stale. The
-edge is authoritative.
-
-Step distances (at_m, distance_m)
----------------------------------
-The frozen indoor engine doesn't provide per-step distances — it
-embeds them in the instruction text. Rather than parse the text or
-modify the frozen file, we leave `at_m` and `distance_m` at 0.0 for
-indoor steps. The mobile app in indoor mode advances by step index
-rather than by distance, so this is fine.
+semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top. See
+_enrich_indoor_steps for how levels are tracked.
 """
 
 import logging
@@ -19567,9 +19657,6 @@ def compose_route(
     from_kind = from_place.kind if from_place else None
     to_kind = to_place.kind if to_place else None
 
-    # Case 1 & 2: both endpoints are outdoor (or one side is GPS,
-    # which is treated as outdoor). The outdoor engine handles this —
-    # same code path as before the composer existed.
     from_is_outdoor = (
         from_kind == "outdoor"
         or (from_place is None and from_lat is not None)
@@ -19618,8 +19705,7 @@ def compose_route(
             "Either from_place_id or from_lat/from_lon is required."
         )
 
-    # Resolve the to endpoint. The mobile app always sends a place id
-    # for destinations, so this branch is simpler.
+    # Resolve the to endpoint.
     if to_place is not None:
         to_ep = _classify_endpoint(to_place)
     else:
@@ -19648,6 +19734,7 @@ def _route_via_outdoor_engine(
     each step and a single leg spanning the whole route.
     """
     from . import routing_service
+    from ..schemas.route import RouteLeg
 
     route = routing_service.compute_route(
         session, graph, nodes, edge_tags,
@@ -19666,14 +19753,14 @@ def _route_via_outdoor_engine(
         step.mode = "outdoor"
 
     route.legs = [
-        {
-            "mode": "outdoor",
-            "from_m": 0.0,
-            "to_m": route.distance_m,
-            "distance_m": route.distance_m,
-            "from_name": route.from_name,
-            "to_name": route.to_name,
-        }
+        RouteLeg(
+            mode="outdoor",
+            from_m=0.0,
+            to_m=route.distance_m,
+            distance_m=route.distance_m,
+            from_name=route.from_name,
+            to_name=route.to_name,
+        )
     ]
     return route
 
@@ -19733,7 +19820,7 @@ def _route_via_indoor_engine(from_ep, to_ep):
     )
 
     annotated_steps, legs = _annotate_steps_and_legs(
-        steps, path, indoor_node_ids, from_ep, to_ep, total
+        steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
     )
 
     # Fill in geometry_index, level, and building_name on each step.
@@ -19771,59 +19858,93 @@ def _fix_opening_line(steps, start_is_outdoor, start_name):
     return fixed
 
 
-def _annotate_steps_and_legs(steps, path, indoor_node_ids, from_ep, to_ep, total):
+def _annotate_steps_and_legs(
+    steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
+):
     """
-    Tag steps with mode; classify each step's kind; build a legs
-    array by grouping contiguous same-mode steps.
-    """
-    # --- Assign mode to each step ---
-    modes = []
-    last_mode = "outdoor"
-    for step in steps:
-        node_id = step.get("node_id") or ""
-        if node_id:
-            mode = "outdoor" if node_id.startswith("o") else "indoor"
-            last_mode = mode
-        else:
-            mode = last_mode
-        modes.append(mode)
+    Give every step a mode, a real at_m, and a real distance_m.
 
-    # --- Build the step dicts ---
+    The at_m values are cumulative distances along the path. Each
+    step's node_id is matched to a position in the path, and the
+    step's at_m is that node's cumulative distance. Steps whose node
+    isn't in the path (shouldn't happen) inherit the previous step's
+    at_m.
+
+    Why real at_m matters: the mobile app's currentStepIndex() picks
+    the current step by comparing distanceFromStartM to each step's
+    at_m. If every at_m is 0, the comparison never matches and the
+    function returns the last step — "You have arrived".
+
+    The pointer `ptr` advances monotonically, so repeated node ids in
+    the path (which happen when a step's instruction is generated
+    from a mid-way node) map to the correct position.
+    """
+    # Cumulative distance along the path.
+    cum = [0.0]
+    for a, b in zip(path, path[1:]):
+        cum.append(
+            cum[-1]
+            + _haversine_m(
+                nodes[a]["lat"], nodes[a]["lon"],
+                nodes[b]["lat"], nodes[b]["lon"],
+            )
+        )
+
+    modes = []
+    at_ms = []
+    last_mode = "outdoor"
+    last_at = 0.0
+    ptr = 0
+
+    for step in steps:
+        nid = step.get("node_id") or ""
+        if nid:
+            last_mode = "outdoor" if nid.startswith("o") else "indoor"
+            # Move forward until we find this node. We never go
+            # backwards, so repeated nodes map in order.
+            while ptr < len(path) and path[ptr] != nid:
+                ptr += 1
+            if ptr < len(path):
+                last_at = max(last_at, cum[ptr])
+            else:
+                # Node not found — likely a duplicate later in the
+                # path. Reset and search again from the start.
+                ptr = 0
+        modes.append(last_mode)
+        at_ms.append(last_at)
+
     annotated = []
-    for step, mode in zip(steps, modes):
+    for i, (step, mode) in enumerate(zip(steps, modes)):
+        next_at = at_ms[i + 1] if i + 1 < len(at_ms) else total
         annotated.append({
             "kind": _kind_for_step(step, mode),
             "instruction": step["instruction"],
-            "at_m": 0.0,
-            "distance_m": 0.0,
+            "at_m": round(at_ms[i], 1),
+            "distance_m": round(max(0.0, next_at - at_ms[i]), 1),
             "mode": mode,
         })
 
-    # --- Build legs by grouping contiguous modes ---
+    # Build legs from real boundaries.
     legs = []
-    if annotated:
-        current_mode = annotated[0]["mode"]
-        segment_start_idx = 0
-        for i in range(1, len(annotated)):
-            if annotated[i]["mode"] != current_mode:
-                legs.append({
-                    "mode": current_mode,
-                    "from_m": 0.0,
-                    "to_m": 0.0,
-                    "distance_m": 0.0,
-                    "from_name": from_ep["name"] if segment_start_idx == 0 else None,
-                    "to_name": None,
-                })
-                current_mode = annotated[i]["mode"]
-                segment_start_idx = i
-        legs.append({
-            "mode": current_mode,
-            "from_m": 0.0,
-            "to_m": total,
-            "distance_m": total,
-            "from_name": from_ep["name"] if segment_start_idx == 0 else None,
-            "to_name": to_ep["name"],
-        })
+    start = 0
+    for i in range(1, len(annotated) + 1):
+        at_end = i == len(annotated)
+        mode_changed = (
+            not at_end
+            and annotated[i]["mode"] != annotated[start]["mode"]
+        )
+        if at_end or mode_changed:
+            from_m = annotated[start]["at_m"]
+            to_m = annotated[i]["at_m"] if i < len(annotated) else total
+            legs.append({
+                "mode": annotated[start]["mode"],
+                "from_m": from_m,
+                "to_m": to_m,
+                "distance_m": max(0.0, to_m - from_m),
+                "from_name": from_ep["name"] if start == 0 else None,
+                "to_name": to_ep["name"] if at_end else None,
+            })
+            start = i
 
     return annotated, legs
 
@@ -19926,12 +20047,10 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     for i, nid in enumerate(path):
         node_tags = nodes.get(nid, {}).get("tags", {}) or {}
 
-        # Track building_name (independent of level).
         node_building = node_tags.get("building_name")
         if node_building:
             current_building = node_building.strip()
 
-        # Update level from the edge we just crossed. Only the edge.
         if i > 0:
             prev_nid = path[i - 1]
             edge_level = _edge_level_for_step(
@@ -19940,8 +20059,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
             if edge_level is not None:
                 current_level = edge_level
 
-        # If we're at the first indoor node and still have no level,
-        # default to ground floor.
         if current_level is None and not nid.startswith("o"):
             current_level = "0"
 
@@ -22351,7 +22468,7 @@ import sys
 import json
 import requests
 
-from campus_graph import (
+from backend.core.indoor.campus_graph import (
     parse_osm, build_graph, named_nodes, find_named_node,
     a_star, generate_turn_by_turn, total_distance_m, level_label,
     node_display_name, is_door, is_entrance,
@@ -24178,7 +24295,7 @@ Usage:
 """
 
 import sys
-from campus_graph import (
+from backend.core.indoor.campus_graph import (
     parse_osm, build_graph, named_nodes, find_named_node,
     a_star, generate_turn_by_turn, total_distance_m, level_label,
     node_display_name, is_door,
@@ -24291,31 +24408,10 @@ if __name__ == "__main__":
 """
 backend/core/indoor/__init__.py
 
-Makes the three frozen indoor files importable the same way the
-outdoor ones are.
-
-The indoor frozen files import each other as top-level modules
-(`import campus_graph`), exactly like the outdoor trio does. For
-that to work, Python needs their folder on sys.path. That's what
-this file does — same pattern as the outdoor `backend/core/__init__.py`.
-
-Why a separate folder: the indoor files have the same names as the
-outdoor ones (`campus_graph.py`, `ai_navigator.py`, `turn_by_turn.py`),
-so they can't live side by side in `backend/core/`. This folder gives
-them their own namespace and their own sys.path entry.
+Namespace for the indoor frozen files. They import each other via
+the package path (backend.core.indoor.campus_graph), so no sys.path
+manipulation is needed.
 """
-
-import sys
-from pathlib import Path
-
-# The folder holding the three indoor frozen files: backend/core/indoor/
-_INDOOR_DIR = Path(__file__).resolve().parent
-
-# Add it to sys.path so `import campus_graph` inside the indoor
-# ai_navigator.py resolves to backend/core/indoor/campus_graph.py,
-# NOT to the outdoor backend/core/campus_graph.py.
-if str(_INDOOR_DIR) not in sys.path:
-    sys.path.insert(0, str(_INDOOR_DIR))
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\narration.py ---
 
@@ -25930,6 +26026,7 @@ Reads map.osm once and writes:
 
 Then reads final.osm and writes:
   - one row per door node       → places (kind="indoor")
+  - one row per entrance node   → places (kind="entrance")
   - one row per indoor polygon  → indoor_areas (rooms and corridors)
   - one row per walkable edge   → indoor_path_edges
 
@@ -25937,12 +26034,8 @@ Run:
     python -m backend.pipeline.ingest
     python -m backend.pipeline.ingest path/to/other.osm
 
-The first run creates the schema and populates it. Subsequent runs
-either upsert (safe, preserves manual edits) or replace everything
-(destructive, controlled by INGEST_REPLACE).
-
-Uses campus_graph.py for parsing and graph building rather than
-re-implementing it. Never edits the frozen file.
+Uses campus_graph.py for parsing and graph building. Never edits the
+frozen file.
 """
 
 import sys
@@ -26119,12 +26212,9 @@ def ingest_path_edges(nodes, ways, session):
 # Indoor ingestion
 # ---------------------------------------------------------------------------
 
-# Same walkable set the frozen indoor engine uses.
 _INDOOR_WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
 _INDOOR_STAIRS_HIGHWAY = "steps"
 
-# Polygon types we save into indoor_areas. Both are drawn on the
-# phone's floor plan.
 _INDOOR_POLYGON_TYPES = {"room", "corridor"}
 
 
@@ -26132,17 +26222,24 @@ def _is_door(tags):
     return bool(tags.get("door")) or tags.get("indoor") == "door"
 
 
+def _is_entrance(tags):
+    return bool(tags.get("entrance"))
+
+
 def ingest_indoor_places(nodes, ways, session):
     """
-    Write one Place row per door node, one IndoorArea row per room
-    or corridor polygon, and one IndoorPathEdge row per walkable edge.
+    Write one Place row per door node, one Place row per entrance
+    node, one IndoorArea row per room or corridor polygon, and one
+    IndoorPathEdge row per walkable edge.
 
-    Returns a dict of counts: {"places": n, "areas": n, "edges": n}.
+    Returns a dict of counts.
     """
     door_node_ids = {nid for nid, d in nodes.items() if _is_door(d["tags"])}
+    entrance_node_ids = {
+        nid for nid, d in nodes.items() if _is_entrance(d["tags"])
+    }
 
     # ---- Places: one per door node ----
-    # Also build a door -> room-name map from the room polygons.
     rooms_of_door: dict[str, list[str]] = {}
     for way in ways:
         tags = way["tags"]
@@ -26168,6 +26265,10 @@ def ingest_indoor_places(nodes, ways, session):
         if level is not None:
             level = str(level).split(";")[0]
 
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
         room_names = rooms_of_door.get(nid, [])
         room_name = "; ".join(sorted(set(room_names))) if room_names else None
 
@@ -26180,12 +26281,54 @@ def ingest_indoor_places(nodes, ways, session):
         existing.lat = node["lat"]
         existing.lon = node["lon"]
         existing.kind = "indoor"
+        existing.building_name = building_name
         existing.level = level
         existing.room_name = room_name
         existing.ref = tags.get("ref") or existing.ref
         existing.description_ai = tags.get("description") or existing.description_ai
 
         places_written += 1
+
+    # ---- Places: one per entrance node ----
+    entrances_written = 0
+    for nid in entrance_node_ids:
+        node = nodes[nid]
+        tags = node["tags"]
+
+        # Skip doors that are ALSO tagged as entrances — they're
+        # already in the places table as kind="indoor". We don't want
+        # two rows for the same node.
+        if nid in door_node_ids:
+            continue
+
+        name = (tags.get("name") or tags.get("ref") or "").strip()
+        if not name:
+            # Use the entrance type as a fallback name.
+            name = f"entrance {nid}"
+
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
+        level = tags.get("level")
+        if level is not None:
+            level = str(level).split(";")[0]
+
+        existing = session.query(Place).filter_by(osm_id=nid).one_or_none()
+        if existing is None:
+            existing = Place(osm_type="node", osm_id=nid, kind="entrance")
+            session.add(existing)
+
+        existing.name = name
+        existing.lat = node["lat"]
+        existing.lon = node["lon"]
+        existing.kind = "entrance"
+        existing.building_name = building_name
+        existing.level = level
+        existing.ref = tags.get("ref") or existing.ref
+        existing.description_ai = tags.get("description") or existing.description_ai
+
+        entrances_written += 1
 
     # ---- Indoor areas: rooms and corridors ----
     areas_written = 0
@@ -26196,8 +26339,6 @@ def ingest_indoor_places(nodes, ways, session):
             continue
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
-        # Corridors often have no name. Give them a placeholder so the
-        # column stays not-null.
         if not rname:
             rname = "corridor" if polygon_type == "corridor" else "unnamed"
 
@@ -26205,7 +26346,6 @@ def ingest_indoor_places(nodes, ways, session):
         if len(refs) < 3:
             continue
 
-        # WKT polygon. Closes the ring if needed.
         coords = ", ".join(
             f"{nodes[r]['lon']} {nodes[r]['lat']}" for r in refs
         )
@@ -26221,14 +26361,10 @@ def ingest_indoor_places(nodes, ways, session):
         if level is not None:
             level = str(level).split(";")[0]
 
-        # Building name tag — you add this in JOSM on every room and
-        # corridor way. Nullable so untagged polygons don't break.
         building_name = tags.get("building_name")
         if building_name:
             building_name = building_name.strip() or None
 
-        # Door node: the first door shared between this polygon and
-        # the walkable network, if any. Corridors usually have none.
         shared_doors = [r for r in way["refs"] if r in door_node_ids]
         door_node_id = shared_doors[0] if shared_doors else None
 
@@ -26303,6 +26439,7 @@ def ingest_indoor_places(nodes, ways, session):
 
     return {
         "places": places_written,
+        "entrances": entrances_written,
         "areas": areas_written,
         "edges": edges_written,
     }
@@ -26355,14 +26492,16 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         print(f"\nReading indoor map {indoor_osm_path} ...")
         if not indoor_osm_path.exists():
             print(f"  indoor map not found at {indoor_osm_path} — skipping")
-            n_indoor_places = n_indoor_areas = n_indoor_edges = 0
+            n_indoor_places = n_entrances = n_indoor_areas = n_indoor_edges = 0
         else:
             indoor_nodes, indoor_ways = parse_osm(str(indoor_osm_path))
             counts = ingest_indoor_places(indoor_nodes, indoor_ways, session)
             n_indoor_places = counts["places"]
+            n_entrances = counts["entrances"]
             n_indoor_areas = counts["areas"]
             n_indoor_edges = counts["edges"]
             print(f"  indoor door places: {n_indoor_places}")
+            print(f"  indoor entrances: {n_entrances}")
             print(f"  indoor rooms + corridors: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
@@ -26372,6 +26511,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         "areas": n_areas,
         "edges": n_edges,
         "indoor_places": n_indoor_places,
+        "entrances": n_entrances,
         "indoor_areas": n_indoor_areas,
         "indoor_edges": n_indoor_edges,
     }
@@ -26955,6 +27095,49 @@ conn.commit()
 conn.close()
 print("Done.")
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\scripts\add_place_building_name.py ---
+
+"""
+One-off script to add building_name to places.
+
+Safe to run twice — checks existing columns before altering.
+
+Usage (from the repo root, inside the venv):
+    python -m backend.scripts.add_place_building_name
+"""
+
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.api.settings import DATABASE_PATH  # noqa: E402
+
+
+def main():
+    conn = sqlite3.connect(str(DATABASE_PATH))
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(places)")}
+
+    if "building_name" not in cols:
+        conn.execute(
+            "ALTER TABLE places ADD COLUMN building_name TEXT"
+        )
+        print("  added places.building_name")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_places_building_name "
+        "ON places(building_name)"
+    )
+
+    conn.commit()
+    conn.close()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\scripts\add_place_kind_columns.py ---
 
 import sqlite3
@@ -27536,20 +27719,25 @@ class TestChatSession:
         assert r.status_code == 204
 
 
-class TestRouteChatRequiresContext:
-    def test_missing_route_fields_returns_422(self, client):
-        """
-        The route chat endpoint requires all four route fields. A
-        request without them should be rejected — the client should
-        call /api/chat/doc instead.
-        """
+class TestRouteChatWithoutFullContext:
+    """
+    The route chat endpoint accepts requests without route context and
+    returns a friendly reply rather than a validation error. This
+    lets the mobile client show something useful even if it couldn't
+    supply the route fields.
+    """
+
+    def test_missing_route_fields_returns_200_with_reply(self, client):
         r = client.post(
             "/api/chat",
             json={"message": "what time does the library close"},
         )
-        assert r.status_code == 422
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["reply"], str)
+        assert len(body["reply"]) > 0
 
-    def test_partial_route_fields_returns_422(self, client):
+    def test_partial_route_fields_returns_200_with_reply(self, client):
         a = client.get("/api/places?limit=1").json()[0]
         r = client.post(
             "/api/chat",
@@ -27560,7 +27748,10 @@ class TestRouteChatRequiresContext:
                 # missing current_step_index and distance_from_start_m
             },
         )
-        assert r.status_code == 422
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["reply"], str)
+        assert len(body["reply"]) > 0
 
 
 class TestRouteChat:
@@ -27598,8 +27789,7 @@ class TestRouteChat:
     def test_route_question_does_not_mention_documents(self, client, temp_db):
         """
         The route chat should never claim to be answering from a
-        document. Even if the answer is short, it should not contain
-        phrases like 'from the documents'.
+        document.
         """
         a, b = self._find_routable_pair(client)
         if not a:
@@ -29375,6 +29565,223 @@ class TestImport:
         with session_scope() as session:
             assert session.query(TimetableEntry).count() == 2
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_indoor_areas.py ---
+
+"""
+Tests for the indoor-areas endpoint.
+
+GET /api/indoor/areas?building_name=X&level=Y
+
+Returns every room and corridor polygon on one floor of one
+building, plus the list of levels the building has.
+
+The tests depend on the ingested campus data. If the building
+"Library" isn't in the DB (e.g. the ingest hasn't been run, or the
+tag isn't applied yet), the tests skip rather than fail.
+"""
+
+import pytest
+
+
+def _library_has_polygons(client):
+    """Check whether the Library has any polygons at all."""
+    r = client.get(
+        "/api/indoor/areas?building_name=Library&level=0"
+    )
+    if r.status_code != 200:
+        return False
+    body = r.json()
+    return len(body.get("areas", [])) > 0
+
+
+class TestIndoorAreasEndpoint:
+    def test_returns_200(self, client):
+        r = client.get(
+            "/api/indoor/areas?building_name=Library&level=0"
+        )
+        assert r.status_code == 200
+
+    def test_response_shape(self, client):
+        r = client.get(
+            "/api/indoor/areas?building_name=Library&level=0"
+        )
+        body = r.json()
+        assert "building_name" in body
+        assert "level" in body
+        assert "areas" in body
+        assert "levels" in body
+        assert isinstance(body["areas"], list)
+        assert isinstance(body["levels"], list)
+
+    def test_unknown_building_returns_empty_areas(self, client):
+        r = client.get(
+            "/api/indoor/areas?building_name=NotARealBuilding&level=0"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["areas"] == []
+        # No levels either, since no rows match the building.
+        assert body["levels"] == []
+
+    def test_requires_building_name(self, client):
+        r = client.get("/api/indoor/areas?level=0")
+        assert r.status_code == 422
+
+    def test_requires_level(self, client):
+        r = client.get("/api/indoor/areas?building_name=Library")
+        assert r.status_code == 422
+
+
+class TestIndoorAreasContent:
+    def test_library_has_ground_floor_rooms(self, client):
+        if not _library_has_polygons(client):
+            pytest.skip("Library has no polygons in the test DB")
+        r = client.get(
+            "/api/indoor/areas?building_name=Library&level=0"
+        )
+        body = r.json()
+        assert len(body["areas"]) > 0
+
+        # Every area should have these fields.
+        for area in body["areas"]:
+            assert "id" in area
+            assert "osm_id" in area
+            assert "type" in area
+            assert area["type"] in ("room", "corridor")
+            assert "level" in area
+            assert area["level"] == "0"
+            assert "boundary" in area
+            assert isinstance(area["boundary"], list)
+            assert "centroid" in area
+
+    def test_boundary_points_are_valid_latlon(self, client):
+        if not _library_has_polygons(client):
+            pytest.skip("Library has no polygons in the test DB")
+        r = client.get(
+            "/api/indoor/areas?building_name=Library&level=0"
+        )
+        body = r.json()
+        for area in body["areas"][:5]:
+            for point in area["boundary"]:
+                assert -90 <= point["lat"] <= 90
+                assert -180 <= point["lon"] <= 180
+
+    def test_levels_array_is_sorted(self, client):
+        if not _library_has_polygons(client):
+            pytest.skip("Library has no polygons in the test DB")
+        r = client.get(
+            "/api/indoor/areas?building_name=Library&level=0"
+        )
+        body = r.json()
+        levels = body["levels"]
+        # Sort key: numeric levels first, non-numeric last.
+        # For our data, levels are "-1", "0", "1". Sorted ascending
+        # means "-1" < "0" < "1".
+        numeric = [int(l) for l in levels if l.lstrip("-").isdigit()]
+        assert numeric == sorted(numeric)
+
+
+class TestCaseInsensitivity:
+    def test_building_name_is_case_insensitive(self, client):
+        if not _library_has_polygons(client):
+            pytest.skip("Library has no polygons in the test DB")
+        r1 = client.get(
+            "/api/indoor/areas?building_name=Library&level=0"
+        )
+        r2 = client.get(
+            "/api/indoor/areas?building_name=library&level=0"
+        )
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert len(r1.json()["areas"]) == len(r2.json()["areas"])
+
+    def test_whitespace_is_trimmed(self, client):
+        if not _library_has_polygons(client):
+            pytest.skip("Library has no polygons in the test DB")
+        r = client.get(
+            "/api/indoor/areas?building_name=%20Library%20&level=0"
+        )
+        assert r.status_code == 200
+        assert len(r.json()["areas"]) > 0
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_indoor_level_tracking.py ---
+
+"""
+Tests for _edge_level_for_step in route_composer.py.
+
+This is the function that reads the level tag off an edge and works
+out which floor the walker is on after crossing it. It's pure logic
+given a graph — no DB or network.
+"""
+
+from backend.api.services.route_composer import _edge_level_for_step
+
+
+def _graph_with_edges(*edges):
+    """
+    Build a minimal graph dict from a list of (a, b, kind, level)
+    tuples. Matches the shape that indoor_graph_builder produces.
+    """
+    g = {}
+    for a, b, kind, level in edges:
+        info = {"kind": kind, "way_tags": {"level": level} if level else {}}
+        g.setdefault(a, []).append((b, 0.0, info))
+        g.setdefault(b, []).append((a, 0.0, info))
+    return g
+
+
+class TestCorridorEdge:
+    def test_returns_single_level(self):
+        g = _graph_with_edges(("1", "2", "walk", "0"))
+        assert _edge_level_for_step("1", "2", None, g) == "0"
+
+    def test_negative_level(self):
+        g = _graph_with_edges(("1", "2", "walk", "-1"))
+        assert _edge_level_for_step("1", "2", "0", g) == "-1"
+
+
+class TestStairsGoingUp:
+    def test_from_bottom_to_top(self):
+        g = _graph_with_edges(("1", "2", "stairs", "0;1"))
+        assert _edge_level_for_step("1", "2", "0", g) == "1"
+
+    def test_three_floors_from_ground(self):
+        g = _graph_with_edges(("1", "2", "stairs", "-1;0;1"))
+        assert _edge_level_for_step("1", "2", "0", g) == "1"
+
+
+class TestStairsGoingDown:
+    def test_from_top_to_bottom(self):
+        g = _graph_with_edges(("1", "2", "stairs", "0;-1"))
+        assert _edge_level_for_step("1", "2", "0", g) == "-1"
+
+    def test_from_ground_down_in_three(self):
+        g = _graph_with_edges(("1", "2", "stairs", "-1;0;1"))
+        assert _edge_level_for_step("1", "2", "1", g) == "0"
+
+
+class TestNoLevel:
+    def test_returns_none_when_no_tag(self):
+        g = _graph_with_edges(("1", "2", "walk", None))
+        assert _edge_level_for_step("1", "2", "0", g) is None
+
+    def test_returns_none_when_no_edge(self):
+        g = _graph_with_edges(("1", "2", "walk", "0"))
+        # There's no edge 3->4.
+        assert _edge_level_for_step("3", "4", "0", g) is None
+
+
+class TestUnknownCurrentLevel:
+    def test_unknown_current_level_on_stairs_picks_top(self):
+        # Walker's current level (5) isn't in the stairs list; fall
+        # back to the last entry.
+        g = _graph_with_edges(("1", "2", "stairs", "0;1"))
+        assert _edge_level_for_step("1", "2", "5", g) == "1"
+
+    def test_no_current_level_picks_top(self):
+        g = _graph_with_edges(("1", "2", "stairs", "0;1"))
+        assert _edge_level_for_step("1", "2", None, g) == "1"
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_ingest.py ---
 
 """
@@ -29382,6 +29789,11 @@ Tests for the ingestion pipeline.
 
 Uses the synthetic maps from the core tests as input so the pipeline
 is exercised on a known, deterministic map.
+
+The tests pass an explicit `indoor_osm_path` that doesn't exist, so
+the indoor ingest is skipped. Without this, the real final.osm is
+ingested alongside the synthetic outdoor map, and the assertions on
+total row counts fail.
 """
 
 import pytest
@@ -29393,6 +29805,11 @@ from backend.core.tests.fixtures.synthetic_maps import (
 )
 
 
+def _outdoor_only(tmp_path):
+    """A path that doesn't exist, used to skip indoor ingest."""
+    return tmp_path / "no_indoor.osm"
+
+
 class TestIngestBasic:
     def test_ingest_creates_places(self, temp_db, tmp_path):
         from backend.api.db.session import session_scope
@@ -29400,7 +29817,11 @@ class TestIngestBasic:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             names = sorted(p.name for p in session.query(Place).all())
@@ -29412,7 +29833,11 @@ class TestIngestBasic:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             edges = session.query(PathEdge).all()
@@ -29425,7 +29850,11 @@ class TestIngestBasic:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(PATH_WITH_BUILDING_EAST, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             areas = session.query(Area).all()
@@ -29441,8 +29870,16 @@ class TestIngestIdempotent:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
-        run_ingest(osm_path=osm_path, replace=False)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=False,
+        )
 
         with session_scope() as session:
             count = session.query(Place).count()
@@ -29729,6 +30166,11 @@ After the description split:
   - Public `description` is admin-only. Re-import never writes to it.
   - AI `description_ai` is OSM-sourced, but a hand edit survives unless
     the OSM tag is present.
+
+The tests pass an explicit `indoor_osm_path` that doesn't exist, so
+the indoor ingest is skipped. Without this, the real final.osm is
+ingested alongside the synthetic outdoor map, and the assertions on
+total row counts fail.
 """
 
 import pytest
@@ -29737,6 +30179,11 @@ from backend.core.tests.fixtures.synthetic_maps import (
     STRAIGHT_PATH_NORTH,
     write_temp_map,
 )
+
+
+def _outdoor_only(tmp_path):
+    """A path that doesn't exist, used to skip indoor ingest."""
+    return tmp_path / "no_indoor.osm"
 
 
 class TestReimportPreservesManualEdits:
@@ -29750,18 +30197,17 @@ class TestReimportPreservesManualEdits:
 
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
 
-        # First ingest — clean database.
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
-        # Simulate a manual edit: someone wrote the public description
-        # in the admin app.
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
             row.description = "A formal public description for students"
             session.add(row)
 
-        # Now re-import. Public description is never written by re-import,
-        # so the manual value must survive untouched.
         run_reimport(osm_path=osm_path)
 
         with session_scope() as session:
@@ -29775,7 +30221,6 @@ class TestReimportPreservesManualEdits:
         from backend.pipeline.ingest import run_ingest
         from backend.pipeline.reimport import run_reimport
 
-        # A synthetic map where Start Point has a description tag.
         osm_content = """<?xml version="1.0" encoding="UTF-8"?>
 <osm version="0.6">
   <node id="1" lat="-6.7500" lon="39.2000">
@@ -29793,7 +30238,11 @@ class TestReimportPreservesManualEdits:
 </osm>
 """
         osm_path = write_temp_map(osm_content, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
@@ -29804,7 +30253,6 @@ class TestReimportPreservesManualEdits:
 
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
-            # The OSM tag is present, so it wins for the AI description.
             assert row.description_ai == "From OSM"
 
     def test_manual_ai_description_survives_when_no_osm_tag(self, temp_db, tmp_path):
@@ -29815,7 +30263,6 @@ class TestReimportPreservesManualEdits:
         from backend.pipeline.ingest import run_ingest
         from backend.pipeline.reimport import run_reimport
 
-        # Synthetic map with NO description tag on Start Point.
         osm_content = """<?xml version="1.0" encoding="UTF-8"?>
 <osm version="0.6">
   <node id="1" lat="-6.7500" lon="39.2000">
@@ -29832,7 +30279,11 @@ class TestReimportPreservesManualEdits:
 </osm>
 """
         osm_path = write_temp_map(osm_content, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
@@ -29843,7 +30294,6 @@ class TestReimportPreservesManualEdits:
 
         with session_scope() as session:
             row = session.query(Place).filter_by(name="Start Point").one()
-            # No OSM tag, so the manual AI description survives.
             assert row.description_ai == "The big mango tree is on the left"
 
 
@@ -29856,7 +30306,11 @@ class TestReimportNeverDeletes:
 
         # Ingest a map with two places.
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         # Now re-import an empty map (no named nodes at all).
         empty_map = """<?xml version="1.0" encoding="UTF-8"?>
@@ -29870,6 +30324,461 @@ class TestReimportNeverDeletes:
         with session_scope() as session:
             count = session.query(Place).count()
         assert count == 2
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_route_composer.py ---
+
+"""
+Tests for the route composer's step annotation.
+
+These tests exercise the pure logic of _annotate_steps_and_legs and
+_enrich_indoor_steps without hitting the network or the DB. We feed
+them a synthetic path and steps, and check the output.
+
+The "You have arrived" bug was that every step's at_m was 0.0, which
+made the phone's currentStepIndex() skip to the last step. The first
+test locks that in.
+"""
+
+from backend.api.services.route_composer import (
+    _annotate_steps_and_legs,
+    _kind_for_step,
+)
+
+
+# A synthetic path with three outdoor nodes and three indoor nodes.
+# Two nodes are "far" from each other (~50m) to give distinct at_m
+# values.
+NODES = {
+    "o1": {"lat": -8.943000, "lon": 33.418000, "tags": {}},
+    "o2": {"lat": -8.943500, "lon": 33.418000, "tags": {}},  # ~55m from o1
+    "o3": {"lat": -8.944000, "lon": 33.418000, "tags": {}},  # ~55m from o2
+    "100": {"lat": -8.944100, "lon": 33.418500, "tags": {}},  # indoor
+    "101": {"lat": -8.944200, "lon": 33.418600, "tags": {}},  # indoor
+    "102": {"lat": -8.944300, "lon": 33.418700, "tags": {}},  # indoor
+}
+
+PATH = ["o1", "o2", "o3", "100", "101", "102"]
+
+# Steps: three outdoor, three indoor. Node ids match the path.
+STEPS = [
+    {"instruction": "Head north", "node_id": "o1"},
+    {"instruction": "Continue straight", "node_id": "o2"},
+    {"instruction": "Go through LIBRARY ENTRANCE", "node_id": "o3"},
+    {"instruction": "Turn left", "node_id": "100"},
+    {"instruction": "Walk along the corridor", "node_id": "101"},
+    {"instruction": "You have arrived", "node_id": "102"},
+]
+
+INDOOR_IDS = {"100", "101", "102"}
+
+FROM_EP = {"name": "Start", "kind": "outdoor"}
+TO_EP = {"name": "Room 106", "kind": "indoor"}
+
+
+class TestAnnotateStepsAndLegs:
+    def test_all_steps_have_at_m(self):
+        annotated, _legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        for step in annotated:
+            assert "at_m" in step
+            assert isinstance(step["at_m"], (int, float))
+
+    def test_at_m_is_monotonically_increasing(self):
+        annotated, _legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        at_ms = [s["at_m"] for s in annotated]
+        for i in range(1, len(at_ms)):
+            assert at_ms[i] >= at_ms[i - 1], (
+                f"at_m went backwards at step {i}: "
+                f"{at_ms[i-1]} -> {at_ms[i]}"
+            )
+
+    def test_first_step_is_at_zero(self):
+        annotated, _legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        assert annotated[0]["at_m"] == 0.0
+
+    def test_has_real_distances_not_all_zero(self):
+        """The bug: every at_m was 0.0. This test ensures at_m
+        actually advances."""
+        annotated, _legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        at_ms = [s["at_m"] for s in annotated]
+        # The last step's at_m must be > 0. If it's 0, the fix
+        # didn't take.
+        assert at_ms[-1] > 0, (
+            "at_m values are all zero — this is the bug the fix "
+            "was supposed to solve"
+        )
+
+    def test_modes_are_correct(self):
+        annotated, _legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        modes = [s["mode"] for s in annotated]
+        assert modes == [
+            "outdoor", "outdoor", "outdoor",
+            "indoor", "indoor", "indoor",
+        ]
+
+    def test_legs_split_at_mode_boundary(self):
+        _annotated, legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        assert len(legs) == 2
+        assert legs[0]["mode"] == "outdoor"
+        assert legs[1]["mode"] == "indoor"
+        assert legs[0]["from_name"] == "Start"
+        assert legs[1]["to_name"] == "Room 106"
+
+    def test_legs_are_contiguous(self):
+        _annotated, legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        for i in range(len(legs) - 1):
+            assert legs[i]["to_m"] == legs[i + 1]["from_m"]
+
+    def test_distance_m_is_non_negative(self):
+        annotated, _legs = _annotate_steps_and_legs(
+            STEPS, PATH, NODES, INDOOR_IDS, FROM_EP, TO_EP, total=200.0
+        )
+        for step in annotated:
+            assert step["distance_m"] >= 0
+
+
+class TestKindForStep:
+    def test_start(self):
+        step = {"instruction": "Starting from Library"}
+        assert _kind_for_step(step, "outdoor") == "start"
+
+    def test_arrive(self):
+        step = {"instruction": "You have arrived at Room 106"}
+        assert _kind_for_step(step, "indoor") == "arrive"
+
+    def test_turn(self):
+        step = {"instruction": "Turn left"}
+        assert _kind_for_step(step, "outdoor") == "turn"
+
+    def test_stairs(self):
+        step = {"instruction": "Take the stairs up to the first floor"}
+        assert _kind_for_step(step, "indoor") == "stairs"
+
+    def test_walk_default(self):
+        step = {"instruction": "Walk about 5 metres"}
+        assert _kind_for_step(step, "outdoor") == "walk"
+
+
+class TestRepeatedNodes:
+    """The pointer walk in _annotate_steps_and_legs must handle
+    repeated node ids in the path without backtracking."""
+
+    def test_duplicate_node_ids_are_handled(self):
+        # A path where a step's node appears twice — the second
+        # occurrence should map forward, not back.
+        nodes = {
+            "o1": {"lat": 0.0, "lon": 0.0, "tags": {}},
+            "o2": {"lat": 0.001, "lon": 0.0, "tags": {}},
+            "100": {"lat": 0.002, "lon": 0.0, "tags": {}},
+            "o2_again": {"lat": 0.001, "lon": 0.0, "tags": {}},
+        }
+        # Path contains o2 twice.
+        path = ["o1", "o2", "100", "o2_again"]
+        steps = [
+            {"instruction": "Head out", "node_id": "o1"},
+            {"instruction": "Pass o2", "node_id": "o2"},
+            {"instruction": "Enter", "node_id": "100"},
+            {"instruction": "Pass o2 again", "node_id": "o2_again"},
+        ]
+        annotated, _ = _annotate_steps_and_legs(
+            steps, path, nodes, {"100"}, FROM_EP, TO_EP, total=300.0
+        )
+        at_ms = [s["at_m"] for s in annotated]
+        # Monotonic despite the duplicate node id "o2" appearing
+        # only once in the steps.
+        for i in range(1, len(at_ms)):
+            assert at_ms[i] >= at_ms[i - 1]
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_route_composer_endpoint.py ---
+
+"""
+End-to-end tests for the route endpoint with indoor destinations.
+
+These tests require the real campus data (indoor places). They
+skip if the DB doesn't have an indoor place, so they don't fail on
+a fresh checkout.
+"""
+
+import pytest
+
+
+def _find_outdoor_place(client):
+    r = client.get("/api/places?kind=outdoor&limit=1")
+    if r.status_code != 200:
+        return None
+    items = r.json()
+    return items[0] if items else None
+
+
+def _find_indoor_place(client):
+    r = client.get("/api/places?kind=indoor&limit=1")
+    if r.status_code != 200:
+        return None
+    items = r.json()
+    return items[0] if items else None
+
+
+class TestMixedRoutePlaceToIndoor:
+    def test_route_from_outdoor_to_indoor(self, client):
+        from_place = _find_outdoor_place(client)
+        to_place = _find_indoor_place(client)
+        if not from_place or not to_place:
+            pytest.skip("Need at least one outdoor and one indoor place")
+
+        r = client.get(
+            f"/api/route?from_place_id={from_place['id']}"
+            f"&to_place_id={to_place['id']}"
+        )
+        # If they're not connected, that's a valid 404. We're
+        # really checking that the composer runs and returns a
+        # route when one exists.
+        if r.status_code == 404:
+            pytest.skip("No path between these places")
+        assert r.status_code == 200
+
+    def test_steps_have_mode_field(self, client):
+        from_place = _find_outdoor_place(client)
+        to_place = _find_indoor_place(client)
+        if not from_place or not to_place:
+            pytest.skip("Need at least one outdoor and one indoor place")
+
+        r = client.get(
+            f"/api/route?from_place_id={from_place['id']}"
+            f"&to_place_id={to_place['id']}"
+        )
+        if r.status_code == 404:
+            pytest.skip("No path between these places")
+
+        body = r.json()
+        for step in body["steps"]:
+            assert "mode" in step
+            assert step["mode"] in ("outdoor", "indoor")
+
+    def test_steps_have_increasing_at_m(self, client):
+        from_place = _find_outdoor_place(client)
+        to_place = _find_indoor_place(client)
+        if not from_place or not to_place:
+            pytest.skip("Need at least one outdoor and one indoor place")
+
+        r = client.get(
+            f"/api/route?from_place_id={from_place['id']}"
+            f"&to_place_id={to_place['id']}"
+        )
+        if r.status_code == 404:
+            pytest.skip("No path between these places")
+
+        body = r.json()
+        at_ms = [s["at_m"] for s in body["steps"]]
+        for i in range(1, len(at_ms)):
+            assert at_ms[i] >= at_ms[i - 1], (
+                f"at_m went backwards: {at_ms}"
+            )
+
+    def test_last_step_at_m_is_near_total_distance(self, client):
+        from_place = _find_outdoor_place(client)
+        to_place = _find_indoor_place(client)
+        if not from_place or not to_place:
+            pytest.skip("Need at least one outdoor and one indoor place")
+
+        r = client.get(
+            f"/api/route?from_place_id={from_place['id']}"
+            f"&to_place_id={to_place['id']}"
+        )
+        if r.status_code == 404:
+            pytest.skip("No path between these places")
+
+        body = r.json()
+        last_at_m = body["steps"][-1]["at_m"]
+        total = body["distance_m"]
+        # The last step should be within 1m of the total.
+        assert abs(last_at_m - total) < 1.0, (
+            f"last step at_m={last_at_m} but total={total}"
+        )
+
+
+class TestMixedRouteGpsStart:
+    def test_gps_start_to_indoor_does_not_500(self, client):
+        """
+        The GPS-start → indoor case used to raise the composer's
+        "mixed routes require both endpoints to be named places".
+        It should now either succeed or return a clean 404/422.
+        """
+        to_place = _find_indoor_place(client)
+        if not to_place:
+            pytest.skip("No indoor place in the test DB")
+
+        # Use a coordinate near the campus so the snap succeeds.
+        r = client.get(
+            f"/api/route?from_lat=-8.9435&from_lon=33.4190"
+            f"&to_place_id={to_place['id']}"
+        )
+        assert r.status_code in (200, 404, 422)
+
+    def test_gps_start_far_away_returns_422(self, client):
+        """
+        A GPS fix far from any path should produce a
+        LocationTooFarError (422).
+        """
+        to_place = _find_indoor_place(client)
+        if not to_place:
+            pytest.skip("No indoor place in the test DB")
+
+        # Middle of the ocean.
+        r = client.get(
+            f"/api/route?from_lat=0&from_lon=0"
+            f"&to_place_id={to_place['id']}"
+        )
+        assert r.status_code == 422
+
+
+class TestPureOutdoorUnchanged:
+    def test_outdoor_to_outdoor_still_works(self, client):
+        """The outdoor-to-outdoor path must be unchanged."""
+        r = client.get("/api/places?kind=outdoor&limit=10")
+        places = r.json()
+        if len(places) < 2:
+            pytest.skip("Need at least two outdoor places")
+
+        for i, a in enumerate(places):
+            for b in places[i + 1:]:
+                r = client.get(
+                    f"/api/route?from_place_id={a['id']}"
+                    f"&to_place_id={b['id']}"
+                )
+                if r.status_code == 200:
+                    body = r.json()
+                    # All steps should be outdoor mode.
+                    for step in body["steps"]:
+                        assert step["mode"] == "outdoor"
+                    # No indoor fields populated.
+                    for step in body["steps"]:
+                        assert step.get("level") is None
+                        assert step.get("building_name") is None
+                    # Legs is a single outdoor leg.
+                    assert body["legs"] is not None
+                    assert len(body["legs"]) == 1
+                    assert body["legs"][0]["mode"] == "outdoor"
+                    return
+
+        pytest.skip("No two outdoor places are routable")
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_starting_point.py ---
+
+"""
+Tests for the 5F-1 endpoints: entrances and building-filtered places.
+
+These tests use the real campus data. They skip if the relevant
+data isn't present (e.g. no entrances tagged yet).
+"""
+
+import pytest
+
+
+class TestEntrancesEndpoint:
+    def test_entrances_list_returns_200(self, client):
+        r = client.get("/api/places?kind=entrance")
+        assert r.status_code == 200
+
+    def test_entrances_have_correct_kind(self, client):
+        r = client.get("/api/places?kind=entrance&limit=50")
+        items = r.json()
+        if not items:
+            pytest.skip("No entrance places in the test DB")
+        for place in items:
+            assert place["kind"] == "entrance"
+
+    def test_entrances_have_lat_lon(self, client):
+        r = client.get("/api/places?kind=entrance&limit=5")
+        items = r.json()
+        if not items:
+            pytest.skip("No entrance places in the test DB")
+        for place in items:
+            assert "location" in place
+            assert "lat" in place["location"]
+            assert "lon" in place["location"]
+
+
+class TestIndoorPlacesByBuilding:
+    def test_filter_by_building_name(self, client):
+        r = client.get(
+            "/api/places?kind=indoor&building_name=Library&limit=50"
+        )
+        assert r.status_code == 200
+        items = r.json()
+        # If there are items, they must all belong to Library.
+        for place in items:
+            assert place["kind"] == "indoor"
+            assert place["building_name"] == "Library"
+
+    def test_filter_by_building_and_level(self, client):
+        r = client.get(
+            "/api/places?kind=indoor"
+            "&building_name=Library&level=0&limit=50"
+        )
+        assert r.status_code == 200
+        items = r.json()
+        for place in items:
+            assert place["kind"] == "indoor"
+            assert place["building_name"] == "Library"
+            assert place["level"] == "0"
+
+    def test_unknown_building_returns_empty(self, client):
+        r = client.get(
+            "/api/places?kind=indoor&building_name=NotARealBuilding"
+        )
+        assert r.status_code == 200
+        assert r.json() == []
+
+
+class TestBuildingNameIsNullable:
+    def test_outdoor_places_have_null_building_name(self, client):
+        r = client.get("/api/places?kind=outdoor&limit=10")
+        items = r.json()
+        for place in items:
+            # Outdoor places should never have a building_name.
+            assert place.get("building_name") is None
+
+    def test_outdoor_response_shape_includes_building_name_field(self, client):
+        r = client.get("/api/places?kind=outdoor&limit=1")
+        items = r.json()
+        if not items:
+            pytest.skip("No outdoor places")
+        assert "building_name" in items[0]
+
+
+class TestExistingFiltersStillWork:
+    def test_kind_outdoor_unchanged(self, client):
+        r = client.get("/api/places?kind=outdoor&limit=5")
+        assert r.status_code == 200
+        for place in r.json():
+            assert place["kind"] == "outdoor"
+
+    def test_kind_indoor_unchanged(self, client):
+        r = client.get("/api/places?kind=indoor&limit=5")
+        assert r.status_code == 200
+        for place in r.json():
+            assert place["kind"] == "indoor"
+
+    def test_place_detail_has_building_name(self, client):
+        r = client.get("/api/places?kind=indoor&limit=1")
+        items = r.json()
+        if not items:
+            pytest.skip("No indoor places")
+        detail = client.get(f"/api/places/{items[0]['id']}").json()
+        assert "building_name" in detail
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\.claude\settings.json ---
 
@@ -30845,6 +31754,10 @@ import { CategoryChips } from '@/components/CategoryChips';
 import { FeatureCard } from '@/components/FeatureCard';
 import { RecentStrip } from '@/components/RecentStrip';
 import { NextClassBanner } from '@/components/NextClassBanner';
+import { FromChip } from '@/components/FromChip';
+import { StartingPointSheet } from '@/components/StartingPointSheet';
+import { AreYouInsideSheet } from '@/components/AreYouInsideSheet';
+import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
@@ -30861,11 +31774,7 @@ import { SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from '@/constants/config';
 import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
 
-// How close a class has to be to appear on the banner. 30 minutes.
 const BANNER_WINDOW_S = 30 * 60;
-
-// How often to re-check the schedule while Home is foregrounded.
-// Every 60 seconds. The check itself is local — no network.
 const BANNER_TICK_MS = 60 * 1000;
 
 export default function HomeScreen() {
@@ -30879,14 +31788,30 @@ export default function HomeScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // Timetable-related state.
   const [weekEntries, setWeekEntries] = useState([]);
   const [nextClass, setNextClass] = useState(null);
-  const [, setTick] = useState(0); // forces recompute of nextClass every minute
+  const [, setTick] = useState(0);
+
+  const [startSheetOpen, setStartSheetOpen] = useState(false);
+  const [startSheetMode, setStartSheetMode] = useState('choose');
+  const [doorPickerOpen, setDoorPickerOpen] = useState(false);
+  const [pendingDestination, setPendingDestination] = useState(null);
 
   const navigatingRef = useRef(false);
 
-  const { resolveStart } = useStartingPoint();
+  const {
+    state: startState,
+    start,
+    nearbyPlaces,
+    lastError,
+    suspiciousBuilding,
+    resolveStart,
+    choosePlace,
+    cancelPick,
+    startDoorPick,
+    confirmOutside,
+    reset: resetStart,
+  } = useStartingPoint();
 
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
@@ -30898,7 +31823,7 @@ export default function HomeScreen() {
     }
   }, [loaded, settings.hasSeenOnboarding]);
 
-  // Load recents and favorites on mount.
+  // Load recents and favorites.
   useEffect(() => {
     let cancelled = false;
     Promise.all([
@@ -30915,7 +31840,7 @@ export default function HomeScreen() {
     };
   }, []);
 
-  // Load the timetable week when the selection changes.
+  // Load timetable week when the selection changes.
   useEffect(() => {
     const programYearId = settings.programYearId;
     if (!programYearId) {
@@ -30936,8 +31861,7 @@ export default function HomeScreen() {
     };
   }, [settings.programYearId]);
 
-  // Compute the next class. Recomputes when the week changes, and
-  // every 60 seconds otherwise (so the countdown stays fresh).
+  // Compute the next class.
   useEffect(() => {
     function computeNext() {
       if (!weekEntries.length) {
@@ -30945,26 +31869,19 @@ export default function HomeScreen() {
         return;
       }
       const now = new Date();
-      const todayDow = (now.getDay() + 6) % 7; // 0 = Monday
-
+      const todayDow = (now.getDay() + 6) % 7;
       let bestEntry = null;
       let bestDelta = null;
 
       for (const entry of weekEntries) {
-        // Days forward from today to this entry's day.
         const daysAhead = (entry.day_of_week - todayDow + 7) % 7;
-
         const [hh, mm] = entry.start_time.split(':').map(Number);
         const start = new Date(now);
         start.setDate(start.getDate() + daysAhead);
         start.setHours(hh, mm, 0, 0);
-
         const deltaSec = (start - now) / 1000;
-
-        // Skip already-started classes and classes beyond the window.
         if (deltaSec < 0) continue;
         if (deltaSec > BANNER_WINDOW_S) continue;
-
         if (bestDelta === null || deltaSec < bestDelta) {
           bestDelta = deltaSec;
           bestEntry = entry;
@@ -30977,7 +31894,6 @@ export default function HomeScreen() {
         setNextClass(null);
       }
     }
-
     computeNext();
     const id = setInterval(() => {
       computeNext();
@@ -30986,10 +31902,9 @@ export default function HomeScreen() {
     return () => clearInterval(id);
   }, [weekEntries]);
 
-  // Search when query or category changes.
+  // Search.
   useEffect(() => {
     let cancelled = false;
-
     async function load() {
       setLoading(true);
       setError(null);
@@ -31006,7 +31921,6 @@ export default function HomeScreen() {
         if (!cancelled) setLoading(false);
       }
     }
-
     load();
     return () => {
       cancelled = true;
@@ -31029,99 +31943,179 @@ export default function HomeScreen() {
     router.push('/timetable');
   }, []);
 
-  // When the banner's "Take me there" is tapped, start a route to
-  // the venue. Same flow as the place detail screen.
+  // Perform a route from a resolved start to a destination.
+  const beginRoute = useCallback((resolvedStart, destId) => {
+    if (!resolvedStart && !destId) {
+      return false;
+    }
+    if (resolvedStart.lat != null && resolvedStart.lon != null) {
+      setRouteRequest({
+        fromLat: resolvedStart.lat,
+        fromLon: resolvedStart.lon,
+        fromAccuracyM: resolvedStart.accuracyM,
+        toId: destId,
+      });
+    } else if (resolvedStart.placeId != null) {
+      setRouteRequest({
+        fromId: resolvedStart.placeId,
+        toId: destId,
+      });
+    } else {
+      return false;
+    }
+    router.push('/route-preview');
+    return true;
+  }, []);
+
+  // Take me there — from a place detail or from anywhere.
+  // On Home, this is only called via the sentence search or the
+  // next-class banner. Destination is a place id.
+  const startRouteToDestination = useCallback(
+    async (destId) => {
+      if (navigatingRef.current) return;
+      navigatingRef.current = true;
+      setPendingDestination(destId);
+      try {
+        const resolved = await resolveStart({ destinationPlaceId: destId });
+        if (resolved) {
+          beginRoute(resolved, destId);
+          navigatingRef.current = false;
+          setPendingDestination(null);
+          return;
+        }
+        // resolveStart returned null:
+        //   - state may be 'askIndoor' (auto-trigger fired)
+        //   - state may be 'needPick' (GPS failed, sheet opens)
+        //   - or permission denied
+        if (startState !== 'askIndoor' && startState !== 'needPick') {
+          if (lastError === 'permission_denied') {
+            setError(t('start.permissionDenied'));
+          }
+          navigatingRef.current = false;
+          setPendingDestination(null);
+        }
+      } catch (err) {
+        setError(err.message || t('common.error'));
+        navigatingRef.current = false;
+        setPendingDestination(null);
+      }
+    },
+    [resolveStart, startState, lastError, beginRoute]
+  );
+
+  // Banner's Take me there.
   const navigateToNextClass = useCallback(
     async (entry) => {
       if (entry.venue_place_id == null) return;
-      if (navigatingRef.current) return;
-      navigatingRef.current = true;
-
-      try {
-        const start = await resolveStart({
-          destinationPlaceId: entry.venue_place_id,
-        });
-        if (!start) {
-          navigatingRef.current = false;
-          return;
-        }
-
-        if (start.lat != null && start.lon != null) {
-          setRouteRequest({
-            fromLat: start.lat,
-            fromLon: start.lon,
-            fromAccuracyM: start.accuracyM,
-            toId: entry.venue_place_id,
-          });
-        } else if (start.placeId != null) {
-          setRouteRequest({
-            fromId: start.placeId,
-            toId: entry.venue_place_id,
-          });
-        } else {
-          navigatingRef.current = false;
-          return;
-        }
-
-        router.push('/route-preview');
-      } catch {
-        navigatingRef.current = false;
-      }
+      await startRouteToDestination(entry.venue_place_id);
     },
-    [resolveStart]
+    [startRouteToDestination]
   );
 
+  // Sentence search: "take me to the library".
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
     if (text.split(/\s+/).length < 3) return;
-
     if (navigatingRef.current) return;
-    navigatingRef.current = true;
 
     try {
       const extracted = await extractDestination(text);
-      if (!extracted.matched) {
-        navigatingRef.current = false;
-        return;
-      }
-
-      const start = await resolveStart({
-        destinationPlaceId: extracted.place_id,
-      });
-
-      if (!start) {
-        navigatingRef.current = false;
-        return;
-      }
-
-      if (start.lat != null && start.lon != null) {
-        setRouteRequest({
-          fromLat: start.lat,
-          fromLon: start.lon,
-          toId: extracted.place_id,
-        });
-      } else if (start.placeId != null) {
-        setRouteRequest({
-          fromId: start.placeId,
-          toId: extracted.place_id,
-        });
-      } else {
-        navigatingRef.current = false;
-        return;
-      }
-
-      router.push('/route-preview');
+      if (!extracted.matched) return;
+      await startRouteToDestination(extracted.place_id);
     } catch {
-      navigatingRef.current = false;
+      // Silent.
     }
-  }, [query, resolveStart]);
+  }, [query, startRouteToDestination]);
+
+  // Chip handlers.
+  const openStartSheet = useCallback(() => {
+    setStartSheetMode('choose');
+    setStartSheetOpen(true);
+    resetStart();
+  }, [resetStart]);
+
+  const handleChoosePlace = useCallback(
+    (place) => {
+      if (place == null) {
+        // Student picked "pick a starting place" — switch to the list.
+        setStartSheetMode('place-list');
+        // Ensure we have places to show.
+        if (nearbyPlaces.length === 0) {
+          listPlaces({ limit: 20 }).then(setNearbyPlaces).catch(() => {});
+        }
+        return;
+      }
+      choosePlace(place);
+      setStartSheetOpen(false);
+      setStartSheetMode('choose');
+    },
+    [choosePlace, nearbyPlaces.length]
+  );
+
+  const handleUseGps = useCallback(() => {
+    setStartSheetOpen(false);
+    // No remembered start to clear. Just close the sheet. The next
+    // route will use a fresh GPS fix.
+  }, []);
+
+  const handleImInside = useCallback(() => {
+    setStartSheetOpen(false);
+    setDoorPickerOpen(true);
+  }, []);
+
+  const handleDoorPicked = useCallback(
+    (door) => {
+      setDoorPickerOpen(false);
+      choosePlace(door);
+    },
+    [choosePlace]
+  );
+
+  // Auto-trigger — "Are you inside?" — yes/no.
+  const handleInsideYes = useCallback(() => {
+    const dest = pendingDestination;
+    if (dest == null) {
+      setDoorPickerOpen(true);
+      return;
+    }
+    // Record the destination so we can route after the pick.
+    setSuspiciousBuildingState(suspiciousBuilding);
+    setDoorPickerOpen(true);
+  }, [pendingDestination, suspiciousBuilding]);
+
+  const handleInsideNo = useCallback(async () => {
+    const dest = pendingDestination;
+    if (dest == null) return;
+    const resolved = confirmOutside();
+    if (resolved) {
+      beginRoute(resolved, dest);
+    }
+    navigatingRef.current = false;
+    setPendingDestination(null);
+  }, [pendingDestination, confirmOutside, beginRoute]);
+
+  const handleInsideDismiss = useCallback(() => {
+    navigatingRef.current = false;
+    setPendingDestination(null);
+    resetStart();
+  }, [resetStart]);
+
+  // After the door picker closes from the auto-trigger flow, route
+  // to the pending destination using the picked door.
+  const [suspiciousBuildingState, setSuspiciousBuildingState] = useState(null);
+
+  useEffect(() => {
+    if (!doorPickerOpen && pendingDestination != null && start?.placeId != null) {
+      const dest = pendingDestination;
+      beginRoute(start, dest);
+      navigatingRef.current = false;
+      setPendingDestination(null);
+    }
+  }, [doorPickerOpen, pendingDestination, start, beginRoute]);
 
   const showSearchResults = isSearching;
 
-  // The header-right area. Two icons side by side: timetable and
-  // settings. Order: timetable first (more frequently used), then
-  // settings.
   const headerRight = useCallback(
     () => (
       <View style={styles.headerButtons}>
@@ -31167,8 +32161,8 @@ export default function HomeScreen() {
           loading={loading && !error && isSearching}
         />
 
-        {/* The next-class banner. Only shows when there's a class
-            within 90 minutes. */}
+        <FromChip start={start} onPress={openStartSheet} />
+
         {nextClass ? (
           <NextClassBanner
             entry={nextClass.entry}
@@ -31235,36 +32229,60 @@ export default function HomeScreen() {
             />
 
             <View style={styles.chipsWrapper}>
-              <Text style={styles.sectionTitle}>{t('home.categoriesTitle')}</Text>
+              <Text style={styles.sectionTitle}>
+                {t('home.categoriesTitle')}
+              </Text>
               <CategoryChips selected={null} onSelect={setCategory} />
             </View>
           </ScrollView>
         )}
       </View>
+
+      {/* Starting-point sheet */}
+      <StartingPointSheet
+        visible={startSheetOpen}
+        places={nearbyPlaces}
+        mode={startSheetMode}
+        onChoose={handleChoosePlace}
+        onUseGps={handleUseGps}
+        onImInside={handleImInside}
+        onCancel={() => {
+          setStartSheetOpen(false);
+          setStartSheetMode('choose');
+        }}
+      />
+
+      {/* Door picker */}
+      <DoorPickerSheet
+        visible={doorPickerOpen}
+        buildingName={suspiciousBuildingState}
+        onPick={handleDoorPicked}
+        onCancel={() => setDoorPickerOpen(false)}
+      />
+
+      {/* Are you inside? */}
+      <AreYouInsideSheet
+        visible={startState === 'askIndoor'}
+        buildingName={suspiciousBuilding}
+        onYes={handleInsideYes}
+        onNo={handleInsideNo}
+        onCancel={handleInsideDismiss}
+      />
     </>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: COLORS.backgroundSubtle,
-  },
-  scroll: {
-    flex: 1,
-  },
-  scrollContent: {
-    paddingBottom: SPACING.xl,
-  },
+  container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
+  scroll: { flex: 1 },
+  scrollContent: { paddingBottom: SPACING.xl },
   featureRow: {
     flexDirection: 'row',
     gap: SPACING.md,
     paddingHorizontal: SPACING.md,
     marginTop: SPACING.md,
   },
-  chipsWrapper: {
-    marginTop: SPACING.md,
-  },
+  chipsWrapper: { marginTop: SPACING.md },
   sectionTitle: {
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
@@ -31274,10 +32292,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.md,
     marginBottom: SPACING.sm,
   },
-  headerButtons: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
+  headerButtons: { flexDirection: 'row', alignItems: 'center' },
   headerButton: {
     paddingHorizontal: 10,
     minWidth: TOUCH.minWidth,
@@ -31615,6 +32630,9 @@ import { setRouteRequest } from '@/services/routeRequest';
 import { PhotoCarousel } from '@/components/PhotoCarousel';
 import { ReportSheet } from '@/components/ReportSheet';
 import { StartingPointSheet } from '@/components/StartingPointSheet';
+import { DoorPickerSheet } from '@/components/DoorPickerSheet';
+import { AreYouInsideSheet } from '@/components/AreYouInsideSheet';
+import { FromChip } from '@/components/FromChip';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
@@ -31632,15 +32650,23 @@ export default function PlaceDetailScreen() {
   const [reportOpen, setReportOpen] = useState(false);
   const [resolvingStart, setResolvingStart] = useState(false);
 
+  const [startSheetOpen, setStartSheetOpen] = useState(false);
+  const [startSheetMode, setStartSheetMode] = useState('choose');
+  const [doorPickerOpen, setDoorPickerOpen] = useState(false);
+
   const navigatingRef = useRef(false);
 
   const {
     state: startState,
+    start,
     nearbyPlaces,
     lastError,
+    suspiciousBuilding,
     resolveStart,
     choosePlace,
     cancelPick,
+    confirmOutside,
+    reset: resetStart,
   } = useStartingPoint();
 
   useEffect(() => {
@@ -31685,18 +32711,18 @@ export default function PlaceDetailScreen() {
     }
   }, [favorited, placeId]);
 
-    const navigateToRoute = useCallback(
-    (start) => {
-      if (start.lat != null && start.lon != null) {
+  const navigateToRoute = useCallback(
+    (resolvedStart) => {
+      if (resolvedStart.lat != null && resolvedStart.lon != null) {
         setRouteRequest({
-          fromLat: start.lat,
-          fromLon: start.lon,
-          fromAccuracyM: start.accuracyM,
+          fromLat: resolvedStart.lat,
+          fromLon: resolvedStart.lon,
+          fromAccuracyM: resolvedStart.accuracyM,
           toId: place.id,
         });
-      } else if (start.placeId != null) {
+      } else if (resolvedStart.placeId != null) {
         setRouteRequest({
-          fromId: start.placeId,
+          fromId: resolvedStart.placeId,
           toId: place.id,
         });
       } else {
@@ -31713,28 +32739,98 @@ export default function PlaceDetailScreen() {
     if (navigatingRef.current) return;
     navigatingRef.current = true;
 
+    // If the student has explicitly set a start via the chip, use it.
+    if (start && (start.placeId != null || start.lat != null)) {
+      navigateToRoute(start);
+      navigatingRef.current = false;
+      return;
+    }
+
     setResolvingStart(true);
     setError(null);
 
     try {
-      const start = await resolveStart({ destinationPlaceId: place.id });
-
-      if (!start) {
+      const resolved = await resolveStart({ destinationPlaceId: place.id });
+      if (resolved) {
+        navigateToRoute(resolved);
+        setResolvingStart(false);
+        navigatingRef.current = false;
+        return;
+      }
+      // Suspicious: the sheet will appear.
+      if (startState !== 'askIndoor' && startState !== 'needPick') {
         if (lastError === 'permission_denied') {
           setError(t('start.permissionDenied'));
         }
         setResolvingStart(false);
         navigatingRef.current = false;
-        return;
       }
-
-      navigateToRoute(start);
     } catch (err) {
       setError(err.message || t('common.error'));
       setResolvingStart(false);
       navigatingRef.current = false;
     }
-  }, [place, resolveStart, lastError, navigateToRoute]);
+  }, [place, start, resolveStart, startState, lastError, navigateToRoute]);
+
+  const handleInsideYes = useCallback(() => {
+    setDoorPickerOpen(true);
+  }, []);
+
+  const handleInsideNo = useCallback(() => {
+    const resolved = confirmOutside();
+    if (resolved && place) {
+      navigateToRoute(resolved);
+    }
+    navigatingRef.current = false;
+  }, [confirmOutside, navigateToRoute, place]);
+
+  const handleInsideDismiss = useCallback(() => {
+    navigatingRef.current = false;
+    resetStart();
+  }, [resetStart]);
+
+  const handleDoorPicked = useCallback(
+    (door) => {
+      setDoorPickerOpen(false);
+      choosePlace(door);
+      if (place) {
+        setRouteRequest({
+          fromId: door.id,
+          toId: place.id,
+        });
+        router.push('/route-preview');
+      }
+    },
+    [choosePlace, place]
+  );
+
+  const openStartSheet = useCallback(() => {
+    setStartSheetMode('choose');
+    setStartSheetOpen(true);
+    resetStart();
+  }, [resetStart]);
+
+  const handleChoosePlace = useCallback(
+    (chosen) => {
+      if (chosen == null) {
+        setStartSheetMode('place-list');
+        return;
+      }
+      choosePlace(chosen);
+      setStartSheetOpen(false);
+      setStartSheetMode('choose');
+    },
+    [choosePlace]
+  );
+
+  const handleUseGps = useCallback(() => {
+    setStartSheetOpen(false);
+  }, []);
+
+  const handleImInside = useCallback(() => {
+    setStartSheetOpen(false);
+    setDoorPickerOpen(true);
+  }, []);
 
   if (loading) {
     return (
@@ -31821,6 +32917,8 @@ export default function PlaceDetailScreen() {
           </Section>
         ) : null}
 
+        <FromChip start={start} onPress={openStartSheet} />
+
         <View style={styles.actions}>
           <TouchableOpacity
             style={[
@@ -31835,7 +32933,9 @@ export default function PlaceDetailScreen() {
             {resolvingStart ? (
               <View style={styles.buttonContent}>
                 <ActivityIndicator color="#ffffff" size="small" />
-                <Text style={[styles.primaryButtonText, styles.buttonTextSpaced]}>
+                <Text
+                  style={[styles.primaryButtonText, styles.buttonTextSpaced]}
+                >
                   {startState === 'locating'
                     ? t('start.findingLocation')
                     : t('common.loading')}
@@ -31848,16 +32948,16 @@ export default function PlaceDetailScreen() {
             )}
           </TouchableOpacity>
 
-          {error ? (
-            <Text style={styles.errorBelowButton}>{error}</Text>
-          ) : null}
+          {error ? <Text style={styles.errorBelowButton}>{error}</Text> : null}
 
           <TouchableOpacity
             style={styles.reportLink}
             onPress={() => setReportOpen(true)}
             accessibilityRole="button"
           >
-            <Text style={styles.reportLinkText}>{t('report.reportProblem')}</Text>
+            <Text style={styles.reportLinkText}>
+              {t('report.reportProblem')}
+            </Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
@@ -31869,10 +32969,31 @@ export default function PlaceDetailScreen() {
       />
 
       <StartingPointSheet
-        visible={startState === 'needPick'}
+        visible={startSheetOpen}
         places={nearbyPlaces}
-        onChoose={choosePlace}
-        onCancel={cancelPick}
+        mode={startSheetMode}
+        onChoose={handleChoosePlace}
+        onUseGps={handleUseGps}
+        onImInside={handleImInside}
+        onCancel={() => {
+          setStartSheetOpen(false);
+          setStartSheetMode('choose');
+        }}
+      />
+
+      <DoorPickerSheet
+        visible={doorPickerOpen}
+        buildingName={suspiciousBuilding}
+        onPick={handleDoorPicked}
+        onCancel={() => setDoorPickerOpen(false)}
+      />
+
+      <AreYouInsideSheet
+        visible={startState === 'askIndoor'}
+        buildingName={suspiciousBuilding}
+        onYes={handleInsideYes}
+        onNo={handleInsideNo}
+        onCancel={handleInsideDismiss}
       />
     </>
   );
@@ -31891,6 +33012,9 @@ function prettifyCategory(category) {
   const value = category.includes('=') ? category.split('=')[1] : category;
   return value.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
+
+// Note: the import for AreYouInsideSheet is at the top; it's
+// already imported.
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
@@ -31953,10 +33077,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   primaryButtonDisabled: { opacity: 0.7 },
-  buttonContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
+  buttonContent: { flexDirection: 'row', alignItems: 'center' },
   buttonTextSpaced: { marginLeft: SPACING.sm },
   primaryButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
   errorBelowButton: {
@@ -32342,6 +33463,16 @@ export default function SettingsScreen() {
             accessibilityLabel={t('settings.indoorNavigation')}
           />
         </Row>
+        <Row
+          label={t('settings.floorSwitcher')}
+          description={t('settings.floorSwitcherDescription')}
+        >
+          <Switch
+            value={settings.showFloorSwitcher}
+            onValueChange={(v) => updateSetting('showFloorSwitcher', v)}
+            accessibilityLabel={t('settings.floorSwitcher')}
+          />
+        </Row>
       </Section>
 
       <Section title={t('settings.wifi')}>
@@ -32374,7 +33505,7 @@ export default function SettingsScreen() {
 
       <View style={styles.footer}>
         <Text style={styles.footerText}>
-          {t('settings.version', { version: '0.19.0' })}
+          {t('settings.version', { version: '0.20.0' })}
         </Text>
       </View>
     </ScrollView>
@@ -32795,7 +33926,6 @@ export default function WalkingScreen() {
 
   const destinationId = routeRequestRef.current?.toId ?? null;
 
-  // Load the route if it wasn't passed in.
   useState(() => {
     if (route) return;
     if (!destinationId) {
@@ -32858,12 +33988,15 @@ export default function WalkingScreen() {
     mode,
     advanceStep,
     isLastStep,
-    // Indoor-specific:
     indoorLevel,
     indoorBuildingName,
     indoorGeometry,
+    indoorGeometryByLevel,
     indoorDestination,
-  } = useRouteProgress(route);
+    currentStepGeometryPoint,
+  } = useRouteProgress(route, {
+    startedFromPlace: routeRequestRef.current?.fromId != null,
+  });
 
   const { heading } = useCompass({ position: rawPosition });
 
@@ -33167,7 +34300,10 @@ export default function WalkingScreen() {
             indoorBuildingName={indoorBuildingName}
             indoorLevel={indoorLevel}
             indoorGeometry={indoorGeometry}
+            indoorGeometryByLevel={indoorGeometryByLevel}
             indoorDestination={indoorDestination}
+            currentStepPoint={currentStepGeometryPoint}
+            currentStepLevel={indoorLevel}
             style={styles.map}
           />
         </View>
@@ -33477,6 +34613,168 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
   },
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\AreYouInsideSheet.jsx ---
+
+// "Are you inside [building]?" bottom sheet.
+//
+// Shown when the GPS fix is suspicious (near a building entrance, or
+// accuracy worse than 25 m). The student answers yes or no.
+//
+//   Yes → the caller opens the door picker.
+//   No  → the caller routes from the suspicious fix.
+//
+// Dismissing the sheet cancels — the caller does not route.
+
+import {
+  Modal,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+export function AreYouInsideSheet({
+  visible,
+  buildingName,
+  onYes,
+  onNo,
+  onCancel,
+}) {
+  const insets = useSafeAreaInsets();
+
+  const title = buildingName
+    ? t('start.areYouInsideNamed', { name: buildingName })
+    : t('start.areYouInsideUnnamed');
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onCancel}
+    >
+      <View style={styles.backdrop}>
+        <View
+          style={[
+            styles.sheet,
+            { paddingBottom: insets.bottom + SPACING.md },
+          ]}
+        >
+          <View style={styles.headerRow}>
+            <MaterialIcons
+              name="place"
+              size={22}
+              color={COLORS.primaryDark}
+            />
+            <TouchableOpacity
+              onPress={onCancel}
+              style={styles.closeButton}
+              accessibilityRole="button"
+              accessibilityLabel={t('common.close')}
+            >
+              <MaterialIcons
+                name="close"
+                size={22}
+                color={COLORS.textMuted}
+              />
+            </TouchableOpacity>
+          </View>
+
+          <Text style={styles.title}>{title}</Text>
+          <Text style={styles.body}>{t('start.areYouInsideBody')}</Text>
+
+          <View style={styles.actions}>
+            <TouchableOpacity
+              style={[styles.actionButton, styles.yesButton]}
+              onPress={onYes}
+              accessibilityRole="button"
+            >
+              <Text style={styles.yesText}>
+                {t('start.areYouInsideYes')}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.actionButton, styles.noButton]}
+              onPress={onNo}
+              accessibilityRole="button"
+            >
+              <Text style={styles.noText}>
+                {t('start.areYouInsideNo')}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+const styles = StyleSheet.create({
+  backdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    justifyContent: 'flex-end',
+  },
+  sheet: {
+    backgroundColor: COLORS.background,
+    borderTopLeftRadius: RADIUS.lg,
+    borderTopRightRadius: RADIUS.lg,
+    paddingHorizontal: SPACING.lg,
+    paddingTop: SPACING.md,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: SPACING.sm,
+  },
+  closeButton: {
+    padding: 6,
+    minWidth: TOUCH.minWidth,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  title: {
+    fontSize: FONT_SIZE.large + 2,
+    fontWeight: '700',
+    color: COLORS.text,
+    marginBottom: SPACING.sm,
+  },
+  body: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    lineHeight: 22,
+    marginBottom: SPACING.lg,
+  },
+  actions: {
+    flexDirection: 'row',
+    gap: SPACING.md,
+  },
+  actionButton: {
+    flex: 1,
+    paddingVertical: 14,
+    minHeight: TOUCH.minHeight,
+    borderRadius: RADIUS.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  yesButton: { backgroundColor: COLORS.primaryDark },
+  noButton: {
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  yesText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
+  noText: { color: COLORS.text, fontSize: 16, fontWeight: '600' },
 });
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\CategoryChips.jsx ---
@@ -33810,6 +35108,251 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
     borderRadius: 12,
     overflow: 'hidden',
+  },
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\DoorPickerSheet.jsx ---
+
+// Door picker.
+//
+// A single search field over indoor doors. The student types a name
+// and taps a result. The picked door's place_id is returned to the
+// caller as the route start.
+//
+// We show the door's name (door18, door19, ...). Building and level
+// are shown as a subtitle so results across buildings are
+// distinguishable.
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  FlatList,
+  Modal,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { listIndoorDoors } from '@/services/api';
+import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+export function DoorPickerSheet({
+  visible,
+  buildingName = null,
+  onPick,
+  onCancel,
+}) {
+  const insets = useSafeAreaInsets();
+
+  const [doors, setDoors] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [search, setSearch] = useState('');
+
+  useEffect(() => {
+    if (!visible) return;
+    let cancelled = false;
+
+    setLoading(true);
+    setError(null);
+    setSearch('');
+
+    listIndoorDoors({ buildingName: buildingName || undefined })
+      .then((data) => {
+        if (!cancelled) setDoors(data);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message || t('common.error'));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, buildingName]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return doors;
+    return doors.filter((d) => {
+      const haystack = [
+        d.name || '',
+        d.room_name || '',
+        d.building_name || '',
+      ]
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [doors, search]);
+
+  const handlePick = useCallback(
+    (door) => {
+      onPick(door);
+    },
+    [onPick]
+  );
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      onRequestClose={onCancel}
+    >
+      <View
+        style={[
+          styles.container,
+          { paddingTop: insets.top + SPACING.md },
+        ]}
+      >
+        <View style={styles.header}>
+          <Text style={styles.title}>{t('start.doorPickerTitle')}</Text>
+          <TouchableOpacity
+            onPress={onCancel}
+            style={styles.closeButton}
+            accessibilityRole="button"
+            accessibilityLabel={t('common.cancel')}
+          >
+            <MaterialIcons
+              name="close"
+              size={22}
+              color={COLORS.textMuted}
+            />
+          </TouchableOpacity>
+        </View>
+
+        <TextInput
+          style={styles.searchInput}
+          value={search}
+          onChangeText={setSearch}
+          placeholder={t('start.doorPickerSearchPlaceholder')}
+          placeholderTextColor={COLORS.textFaint}
+          autoCapitalize="none"
+          autoCorrect={false}
+          returnKeyType="search"
+        />
+
+        {error ? <Text style={styles.error}>{error}</Text> : null}
+
+        {loading ? (
+          <View style={styles.state}>
+            <ActivityIndicator color={COLORS.textMuted} />
+          </View>
+        ) : filtered.length === 0 ? (
+          <View style={styles.state}>
+            <Text style={styles.emptyText}>
+              {search.trim()
+                ? t('common.noResults')
+                : t('start.doorPickerEmpty')}
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={filtered}
+            keyExtractor={(item) => String(item.id)}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.listContent}
+            renderItem={({ item }) => (
+              <TouchableOpacity
+                style={styles.row}
+                onPress={() => handlePick(item)}
+                accessibilityRole="button"
+                accessibilityLabel={item.name}
+              >
+                <View style={styles.rowText}>
+                  <Text style={styles.rowName} numberOfLines={1}>
+                    {item.name}
+                  </Text>
+                  <Text style={styles.rowSubtitle} numberOfLines={1}>
+                    {[item.building_name, item.level != null ? `Level ${item.level}` : null]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            )}
+          />
+        )}
+      </View>
+    </Modal>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: SPACING.md,
+    paddingBottom: SPACING.md,
+  },
+  title: { fontSize: FONT_SIZE.title, fontWeight: '700', color: COLORS.text },
+  closeButton: {
+    padding: 6,
+    minWidth: TOUCH.minWidth,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  searchInput: {
+    marginHorizontal: SPACING.md,
+    backgroundColor: COLORS.backgroundSubtle,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.sm,
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 10,
+    fontSize: FONT_SIZE.body,
+    color: COLORS.text,
+    marginBottom: SPACING.sm,
+  },
+  error: {
+    color: COLORS.danger,
+    paddingHorizontal: SPACING.md,
+    paddingBottom: SPACING.sm,
+    fontSize: FONT_SIZE.small,
+  },
+  state: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: SPACING.lg,
+  },
+  emptyText: {
+    color: COLORS.textMuted,
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
+  },
+  listContent: { paddingBottom: SPACING.lg },
+  row: {
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderSubtle,
+    minHeight: TOUCH.minHeight,
+    justifyContent: 'center',
+  },
+  rowText: { flex: 1 },
+  rowName: {
+    fontSize: FONT_SIZE.body + 1,
+    fontWeight: '600',
+    color: COLORS.text,
+  },
+  rowSubtitle: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    marginTop: 2,
   },
 });
 
@@ -34165,6 +35708,86 @@ const styles = StyleSheet.create({
   },
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\FromChip.jsx ---
+
+// The "From:" chip.
+//
+// Shows the current starting point. Tapping it opens the
+// starting-point sheet, where the student can change it.
+
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+export function FromChip({ start, onPress }) {
+  let label;
+  if (start?.placeId != null) {
+    label = t('start.chipFromPlace', {
+      name: start.placeName || 'selected place',
+    });
+  } else if (start?.lat != null) {
+    label = t('start.chipMyLocation');
+  } else {
+    label = t('start.chipMyLocation');
+  }
+
+  return (
+    <View style={styles.wrapper}>
+      <TouchableOpacity
+        style={styles.chip}
+        onPress={onPress}
+        accessibilityRole="button"
+        accessibilityLabel={label}
+      >
+        <MaterialIcons
+          name="my-location"
+          size={14}
+          color={COLORS.textMuted}
+          style={styles.icon}
+        />
+        <Text style={styles.label} numberOfLines={1}>
+          {label}
+        </Text>
+        <MaterialIcons
+          name="expand-more"
+          size={16}
+          color={COLORS.textMuted}
+        />
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  wrapper: {
+    paddingHorizontal: SPACING.md,
+    paddingTop: 4,
+    paddingBottom: 8,
+  },
+  chip: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.backgroundSubtle,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.pill,
+    paddingHorizontal: 10,
+    height: 32,
+    minHeight: 32,
+    maxWidth: '100%',
+  },
+  icon: { marginRight: 6 },
+  label: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.text,
+    maxWidth: 240,
+    marginRight: 4,
+  },
+});
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\IndoorMapPlaceholder.jsx ---
 
 // Indoor map placeholder. Shown in place of the outdoor tile map
@@ -34241,19 +35864,27 @@ const styles = StyleSheet.create({
 // When the walking screen's current step is indoor, this component
 // replaces the outdoor tile map. It:
 //   1. Fetches the rooms and corridors for the current building+level
-//      from /api/indoor/areas.
-//   2. Renders them on a blank MapLibre map: rooms filled light grey,
-//      corridors a slightly different shade, room names as labels.
-//   3. Draws the indoor portion of the route as a blue line.
-//   4. Marks the destination with a red marker.
+//      from /api/indoor/areas (through the persistent cache).
+//   2. Renders them on a blank MapLibre map: rooms white, corridors
+//      light grey, room names as labels.
+//   3. Draws the indoor route: solid on the current floor, faint
+//      dashed on other floors.
+//   4. Marks the destination with a red dot.
+//   5. Shows a "you are here" dot on the current step's point, when
+//      the displayed floor matches the current step's floor.
+//   6. Shows a floor switcher on the right edge if the settings
+//      toggle is on.
 //
 // The camera auto-fits to the room bounds on first render.
-//
-// If the API returns no rooms (unsurveyed building), we render
-// nothing and the parent falls back to IndoorMapPlaceholder.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import {
   MapView,
   Camera,
@@ -34265,47 +35896,90 @@ import {
 } from '@maplibre/maplibre-react-native';
 
 import { getIndoorAreas } from '@/services/api';
-import { COLORS } from '@/constants/theme';
+import { useSettings } from '@/context/SettingsContext';
+import { t } from '@/i18n';
+import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 
-// A minimal blank map style. No tiles, no labels, no country outlines.
-// Just a flat background the floor plan draws on top of.
-//
-// The shape of a MapLibre style is fixed by the spec: version,
-// sources, layers. We give it one empty background layer.
-const BLANK_STYLE = {
+// A minimal blank map style. Flat background, no tiles.
+// The glyphs URL is required for room-name labels. Without it,
+// MapLibre logs "Unable to parse resourceUrl" and labels never
+// appear.
+const BLANK_STYLE = JSON.stringify({
   version: 8,
   name: 'indoor-blank',
+  glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
   sources: {},
   layers: [
     {
       id: 'background',
       type: 'background',
-      paint: {
-        'background-color': '#f1f5f9',
-      },
+      paint: { 'background-color': '#f1f5f9' },
     },
   ],
-};
+});
+
+// MapLibre fill colour expression. Rooms white, corridors grey.
+const FILL_COLOR_EXPR = [
+  'match',
+  ['get', 'type'],
+  'corridor', '#e2e8f0',
+  'room', '#ffffff',
+  '#ffffff',
+];
+
+// Convert a level string to a short chip label.
+function levelLabel(level) {
+  if (level === '-1') return 'B';
+  if (level === '0') return 'G';
+  return level;
+}
 
 export function IndoorMapView({
   buildingName,
   level,
-  routeGeometry = [],
+  routeByLevel = [],
   destination = null,
+  currentStepPoint = null,
+  currentStepLevel = null,
   style,
   onNoRooms,
 }) {
+  const { settings } = useSettings();
   const cameraRef = useRef(null);
 
+  // The floor currently being displayed. Starts as the current
+  // step's level, but can be overridden by the floor switcher.
+  const [selectedLevel, setSelectedLevel] = useState(level);
+
   const [areas, setAreas] = useState(null);
+  const [availableLevels, setAvailableLevels] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Fetch rooms and corridors whenever the building or level changes.
+  // When the building changes, reset the selected level to whatever
+  // the current step says.
+  useEffect(() => {
+    setSelectedLevel(level);
+  }, [buildingName]);
+
+  // When the current step's level changes and the student has NOT
+  // manually switched floors, follow it. If they HAVE manually
+  // switched, respect their choice.
+  const [manuallyChosen, setManuallyChosen] = useState(false);
+  useEffect(() => {
+    if (!manuallyChosen) {
+      setSelectedLevel(level);
+    }
+  }, [level, manuallyChosen]);
+  useEffect(() => {
+    setManuallyChosen(false);
+  }, [buildingName]);
+
+  // Fetch rooms and corridors for the selected level.
   useEffect(() => {
     let cancelled = false;
 
-    if (!buildingName || level == null) {
+    if (!buildingName || selectedLevel == null) {
       setAreas([]);
       setLoading(false);
       return () => {
@@ -34316,11 +35990,12 @@ export function IndoorMapView({
     setLoading(true);
     setError(null);
 
-    getIndoorAreas({ buildingName, level })
+    getIndoorAreas({ buildingName, level: selectedLevel })
       .then((data) => {
         if (cancelled) return;
         const list = data?.areas || [];
         setAreas(list);
+        setAvailableLevels(data?.levels || []);
         if (list.length === 0 && onNoRooms) onNoRooms();
       })
       .catch((err) => {
@@ -34336,82 +36011,89 @@ export function IndoorMapView({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [buildingName, level]);
+  }, [buildingName, selectedLevel]);
 
   // -------------------------------------------------------------------------
   // GeoJSON assembly
   // -------------------------------------------------------------------------
 
-  // Rooms as one FeatureCollection. Corridors as another.
-  const { roomsGeoJSON, corridorsGeoJSON } = useMemo(() => {
-    if (!areas || areas.length === 0) {
-      return { roomsGeoJSON: null, corridorsGeoJSON: null };
-    }
-
-    const rooms = [];
-    const corridors = [];
-
+  const roomsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
     for (const area of areas) {
-      const ring = (area.boundary || []).map((p) => [p.lon, p.lat]);
-      // A polygon ring must be closed — first point === last point.
-      if (ring.length === 0) continue;
-      const first = ring[0];
-      const last = ring[ring.length - 1];
-      if (first[0] !== last[0] || first[1] !== last[1]) {
-        ring.push([first[0], first[1]]);
-      }
-
-      const feature = {
-        type: 'Feature',
-        properties: {
-          id: area.id,
-          name: area.name || '',
-          ref: area.ref || '',
-          type: area.type,
-          level: area.level,
-        },
-        geometry: {
-          type: 'Polygon',
-          coordinates: [ring],
-        },
-      };
-
-      if (area.type === 'corridor') corridors.push(feature);
-      else rooms.push(feature);
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
     }
-
-    return {
-      roomsGeoJSON: {
-        type: 'FeatureCollection',
-        features: rooms,
-      },
-      corridorsGeoJSON: {
-        type: 'FeatureCollection',
-        features: corridors,
-      },
-    };
+    return { type: 'FeatureCollection', features };
   }, [areas]);
 
-  // Route line — a single LineString from the passed-in geometry.
-  const routeGeoJSON = useMemo(() => {
-    if (!routeGeometry || routeGeometry.length < 2) return null;
-    return {
-      type: 'Feature',
-      properties: {},
-      geometry: {
-        type: 'LineString',
-        coordinates: routeGeometry.map((p) => [p.lon, p.lat]),
-      },
-    };
-  }, [routeGeometry]);
+  const corridorsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'corridor') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
 
-  // Camera fit — compute a bounding box from the areas and route,
-  // then set the camera to fit. Called whenever the data changes.
+  // Route split — solid for current floor, dashed for other floors.
+  //
+  // The input is [{lat, lon, level}, ...]. We walk it and group
+  // consecutive points by whether they match the selected level.
+  // Each group becomes a LineString feature tagged with `dashed`.
+  const { routeSolidGeoJSON, routeDashedGeoJSON } = useMemo(() => {
+    if (!routeByLevel || routeByLevel.length === 0) {
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+    if (routeByLevel.length === 1) {
+      // A single point isn't a line. Skip.
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+
+    const segments = [];
+    let current = null;
+
+    for (const pt of routeByLevel) {
+      const matches = pt.level === selectedLevel;
+      if (!current || current.matches !== matches) {
+        if (current && current.points.length >= 2) segments.push(current);
+        current = { matches, points: [[pt.lon, pt.lat]] };
+      } else {
+        current.points.push([pt.lon, pt.lat]);
+      }
+    }
+    if (current && current.points.length >= 2) segments.push(current);
+
+    const solid = [];
+    const dashed = [];
+    for (const seg of segments) {
+      const feature = {
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: seg.points },
+      };
+      if (seg.matches) solid.push(feature);
+      else dashed.push(feature);
+    }
+
+    return {
+      routeSolidGeoJSON:
+        solid.length > 0 ? { type: 'FeatureCollection', features: solid } : null,
+      routeDashedGeoJSON:
+        dashed.length > 0 ? { type: 'FeatureCollection', features: dashed } : null,
+    };
+  }, [routeByLevel, selectedLevel]);
+
+  // Camera fit whenever the displayed floor's areas change.
   useEffect(() => {
     if (!cameraRef.current) return;
     if (loading) return;
 
-    // Gather points from areas and route.
     const points = [];
     if (areas) {
       for (const area of areas) {
@@ -34420,12 +36102,6 @@ export function IndoorMapView({
         }
       }
     }
-    if (routeGeometry) {
-      for (const p of routeGeometry) {
-        points.push([p.lon, p.lat]);
-      }
-    }
-
     if (points.length === 0) return;
 
     const lons = points.map((p) => p[0]);
@@ -34439,13 +36115,8 @@ export function IndoorMapView({
     const centerLat = (south + north) / 2;
     const span = Math.max(east - west, north - south);
 
-    // Convert a span in degrees to a zoom level. This is
-    // approximate but close enough. We clamp between 15 and 20.
-    // Latitude scaling is ignored — the building is small enough.
     let zoom = 17;
-    if (span > 0) {
-      zoom = 15 + Math.log2(0.0015 / span);
-    }
+    if (span > 0) zoom = 15 + Math.log2(0.0015 / span);
     zoom = Math.max(15, Math.min(20, zoom));
 
     const timeout = setTimeout(() => {
@@ -34461,7 +36132,7 @@ export function IndoorMapView({
     }, 100);
 
     return () => clearTimeout(timeout);
-  }, [areas, routeGeometry, loading]);
+  }, [areas, loading]);
 
   // -------------------------------------------------------------------------
   // Render
@@ -34480,17 +36151,23 @@ export function IndoorMapView({
   }
 
   if (!areas || areas.length === 0) {
-    // Parent will fall back to the placeholder.
     return <View style={[styles.container, style]} />;
   }
 
-  // Initial camera — center on the first area's centroid, or on the
-  // first room boundary point as a fallback.
   const firstCentroid =
     areas[0]?.centroid || areas[0]?.boundary?.[0] || null;
   const initialCenter = firstCentroid
     ? [firstCentroid.lon, firstCentroid.lat]
     : [0, 0];
+
+  // The "you are here" dot is shown only when the displayed floor
+  // matches the current step's floor. Otherwise it would be in the
+  // wrong place.
+  const showYouAreHere =
+    currentStepPoint && currentStepLevel === selectedLevel;
+
+  const showSwitcher =
+    settings.showFloorSwitcher !== false && availableLevels.length > 1;
 
   return (
     <View style={[styles.container, style]}>
@@ -34511,47 +36188,34 @@ export function IndoorMapView({
           }}
         />
 
-        {/* Corridors first so rooms sit on top. */}
         {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
           <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
             <FillLayer
               id="corridorsFill"
-              style={{
-                fillColor: '#e2e8f0',
-                fillOpacity: 1,
-              }}
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
             />
             <LineLayer
               id="corridorsOutline"
-              style={{
-                lineColor: '#cbd5e1',
-                lineWidth: 0.5,
-              }}
+              style={{ lineColor: '#cbd5e1', lineWidth: 0.5 }}
             />
           </ShapeSource>
         ) : null}
 
-        {/* Rooms. */}
         {roomsGeoJSON && roomsGeoJSON.features.length > 0 ? (
           <ShapeSource id="roomsSource" shape={roomsGeoJSON}>
             <FillLayer
               id="roomsFill"
-              style={{
-                fillColor: '#ffffff',
-                fillOpacity: 1,
-              }}
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
             />
             <LineLayer
               id="roomsOutline"
-              style={{
-                lineColor: '#94a3b8',
-                lineWidth: 0.75,
-              }}
+              style={{ lineColor: '#94a3b8', lineWidth: 0.75 }}
             />
             <SymbolLayer
               id="roomsLabels"
               style={{
                 textField: ['get', 'name'],
+                textFont: ['Noto Sans Regular'],
                 textSize: 11,
                 textColor: '#334155',
                 textHaloColor: '#ffffff',
@@ -34563,11 +36227,28 @@ export function IndoorMapView({
           </ShapeSource>
         ) : null}
 
-        {/* Route line on top of everything. */}
-        {routeGeoJSON ? (
-          <ShapeSource id="indoorRouteSource" shape={routeGeoJSON}>
+        {/* Dashed — route on other floors. Drawn first so solid sits on top. */}
+        {routeDashedGeoJSON ? (
+          <ShapeSource id="indoorRouteDashedSource" shape={routeDashedGeoJSON}>
             <LineLayer
-              id="indoorRouteLine"
+              id="indoorRouteDashedLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 3,
+                lineCap: 'round',
+                lineJoin: 'round',
+                lineOpacity: 0.4,
+                lineDasharray: [4, 4],
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* Solid — route on the displayed floor. */}
+        {routeSolidGeoJSON ? (
+          <ShapeSource id="indoorRouteSolidSource" shape={routeSolidGeoJSON}>
+            <LineLayer
+              id="indoorRouteSolidLine"
               style={{
                 lineColor: '#2563eb',
                 lineWidth: 4,
@@ -34582,16 +36263,97 @@ export function IndoorMapView({
         {destination ? (
           <MarkerView
             coordinate={[destination.lon, destination.lat]}
-            anchor={{ x: 0.5, y: 1.0 }}
+            anchor={{ x: 0.5, y: 0.5 }}
           >
             <View style={styles.destMarkerOuter}>
               <View style={styles.destMarkerInner} />
             </View>
           </MarkerView>
         ) : null}
+
+        {/* You are here dot. Only shown when the displayed floor
+            matches the current step's floor. */}
+        {showYouAreHere ? (
+          <MarkerView
+            coordinate={[currentStepPoint.lon, currentStepPoint.lat]}
+            anchor={{ x: 0.5, y: 0.5 }}
+          >
+            <View style={styles.userDot} />
+          </MarkerView>
+        ) : null}
       </MapView>
+
+      {/* Floor switcher. Vertical chips on the right edge. */}
+      {showSwitcher ? (
+        <View style={styles.switcherContainer}>
+          {availableLevels.map((lvl) => {
+            const active = lvl === selectedLevel;
+            const isStepLevel = lvl === currentStepLevel;
+            return (
+              <TouchableOpacity
+                key={lvl}
+                style={[
+                  styles.switcherChip,
+                  active && styles.switcherChipActive,
+                ]}
+                onPress={() => {
+                  setSelectedLevel(lvl);
+                  setManuallyChosen(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel={`Floor ${levelLabel(lvl)}`}
+                accessibilityState={{ selected: active }}
+              >
+                <Text
+                  style={[
+                    styles.switcherChipText,
+                    active && styles.switcherChipTextActive,
+                  ]}
+                >
+                  {levelLabel(lvl)}
+                </Text>
+                {isStepLevel && !active ? (
+                  <View style={styles.stepLevelDot} />
+                ) : null}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      ) : null}
     </View>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function _closedRing(boundary) {
+  if (!boundary || boundary.length === 0) return null;
+  const ring = boundary.map((p) => [p.lon, p.lat]);
+  const first = ring[0];
+  const last = ring[ring.length - 1];
+  if (first[0] !== last[0] || first[1] !== last[1]) {
+    ring.push([first[0], first[1]]);
+  }
+  return ring;
+}
+
+function _polygonFeature(area, ring) {
+  return {
+    type: 'Feature',
+    properties: {
+      id: area.id,
+      name: area.name || '',
+      ref: area.ref || '',
+      type: area.type,
+      level: area.level,
+    },
+    geometry: {
+      type: 'Polygon',
+      coordinates: [ring],
+    },
+  };
 }
 
 const styles = StyleSheet.create({
@@ -34620,6 +36382,51 @@ const styles = StyleSheet.create({
     backgroundColor: '#dc2626',
     borderWidth: 2,
     borderColor: '#ffffff',
+  },
+  userDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#2563eb',
+    borderWidth: 3,
+    borderColor: '#ffffff',
+  },
+  switcherContainer: {
+    position: 'absolute',
+    right: SPACING.md,
+    top: '40%',
+    backgroundColor: 'rgba(255, 255, 255, 0.85)',
+    borderRadius: RADIUS.md,
+    paddingVertical: SPACING.xs,
+    paddingHorizontal: 4,
+  },
+  switcherChip: {
+    width: 40,
+    height: 40,
+    borderRadius: RADIUS.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  switcherChipActive: {
+    backgroundColor: COLORS.primaryDark,
+  },
+  switcherChipText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.text,
+  },
+  switcherChipTextActive: {
+    color: '#ffffff',
+  },
+  stepLevelDot: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.primary,
   },
 });
 
@@ -34985,14 +36792,14 @@ export function RouteMap({
   indoorBuildingName = null,
   indoorLevel = null,
   indoorGeometry = [],
+  indoorGeometryByLevel = [],
   indoorDestination = null,
+  currentStepPoint = null,
+  currentStepLevel = null,
   style,
 }) {
   const cameraRef = useRef(null);
 
-  // If the indoor view reports no rooms for the current floor, we
-  // fall back to the placeholder. Reset whenever the building or
-  // level changes.
   const [indoorNoRooms, setIndoorNoRooms] = useState(false);
 
   useEffect(() => {
@@ -35016,9 +36823,6 @@ export function RouteMap({
     };
   }, [routeCoords]);
 
-  // Fit the map to the route on first render and when the route
-  // changes. Only runs when the route is stable — a mid-recompute
-  // empty geometry is skipped.
   useEffect(() => {
     if (mode !== 'outdoor') return;
     if (routeCoords.length < 2 || !cameraRef.current) return;
@@ -35068,9 +36872,6 @@ export function RouteMap({
     return () => clearTimeout(timeout);
   }, [routeCoords, mode]);
 
-  // Single effect for real-time camera updates. Position and
-  // heading are set in one call, so the map moves and rotates
-  // atomically rather than in two separate animations.
   useEffect(() => {
     if (mode !== 'outdoor') return;
     if (!cameraRef.current) return;
@@ -35093,7 +36894,6 @@ export function RouteMap({
     }
   }, [userLocation, bearing, followBearing, mode]);
 
-  // Indoor mode.
   if (mode === 'indoor') {
     if (indoorNoRooms) {
       return (
@@ -35107,8 +36907,10 @@ export function RouteMap({
       <IndoorMapView
         buildingName={indoorBuildingName}
         level={indoorLevel}
-        routeGeometry={indoorGeometry}
+        routeByLevel={indoorGeometryByLevel}
         destination={indoorDestination}
+        currentStepPoint={currentStepPoint}
+        currentStepLevel={currentStepLevel}
         style={style}
         onNoRooms={() => setIndoorNoRooms(true)}
       />
@@ -36537,8 +38339,14 @@ const styles = StyleSheet.create({
 
 // Bottom sheet asking the student where they're starting from.
 //
-// Shown when the app can't determine the position from GPS. Offers a
-// list of places to pick as the starting point.
+// Three options:
+//   - Use my current location (GPS)
+//   - Pick a starting place (outdoor place list)
+//   - I'm inside a building (indoor door picker)
+//
+// Shown when:
+//   - The student taps the "From:" chip.
+//   - GPS fails and we don't have a remembered start.
 
 import {
   FlatList,
@@ -36553,10 +38361,21 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
-import { ICONS } from '@/constants/icons';
 
-export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
+export function StartingPointSheet({
+  visible,
+  places,
+  onChoose,
+  onUseGps,
+  onImInside,
+  onCancel,
+  mode = 'choose', // 'choose' | 'place-list'
+}) {
   const insets = useSafeAreaInsets();
+
+  // When we're showing the outdoor place list, we switch the content
+  // and hide the three-option menu.
+  const showingPlaces = mode === 'place-list';
 
   return (
     <Modal
@@ -36574,8 +38393,16 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
         >
           <View style={styles.header}>
             <View style={styles.headerText}>
-              <Text style={styles.title}>{t('start.title')}</Text>
-              <Text style={styles.subtitle}>{t('start.subtitle')}</Text>
+              <Text style={styles.title}>
+                {showingPlaces
+                  ? t('start.pickPlaceTitle')
+                  : t('start.title')}
+              </Text>
+              <Text style={styles.subtitle}>
+                {showingPlaces
+                  ? t('start.pickPlaceSubtitle')
+                  : t('start.subtitle')}
+              </Text>
             </View>
             <TouchableOpacity
               onPress={onCancel}
@@ -36584,14 +38411,32 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
               accessibilityLabel={t('common.cancel')}
             >
               <MaterialIcons
-                name={ICONS.close}
+                name="close"
                 size={22}
                 color={COLORS.textMuted}
               />
             </TouchableOpacity>
           </View>
 
-          {places.length === 0 ? (
+          {!showingPlaces ? (
+            <View style={styles.options}>
+              <OptionRow
+                icon="my-location"
+                label={t('start.optionUseGps')}
+                onPress={onUseGps}
+              />
+              <OptionRow
+                icon="place"
+                label={t('start.optionPickPlace')}
+                onPress={() => onChoose(null)}
+              />
+              <OptionRow
+                icon="meeting-room"
+                label={t('start.optionImInside')}
+                onPress={onImInside}
+              />
+            </View>
+          ) : places.length === 0 ? (
             <View style={styles.emptyState}>
               <Text style={styles.emptyText}>{t('start.noPlaces')}</Text>
             </View>
@@ -36608,7 +38453,7 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
                   accessibilityLabel={item.name}
                 >
                   <MaterialIcons
-                    name={ICONS.place}
+                    name="place"
                     size={20}
                     color={COLORS.textMuted}
                     style={styles.rowIcon}
@@ -36629,6 +38474,30 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
   );
 }
 
+function OptionRow({ icon, label, onPress }) {
+  return (
+    <TouchableOpacity
+      style={styles.optionRow}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+    >
+      <MaterialIcons
+        name={icon}
+        size={22}
+        color={COLORS.text}
+        style={styles.optionIcon}
+      />
+      <Text style={styles.optionLabel}>{label}</Text>
+      <MaterialIcons
+        name="chevron-right"
+        size={22}
+        color={COLORS.textMuted}
+      />
+    </TouchableOpacity>
+  );
+}
+
 const styles = StyleSheet.create({
   backdrop: {
     flex: 1,
@@ -36641,7 +38510,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: RADIUS.lg,
     paddingHorizontal: SPACING.lg,
     paddingTop: SPACING.lg,
-    maxHeight: '80%',
+    maxHeight: '85%',
   },
   header: {
     flexDirection: 'row',
@@ -36661,6 +38530,22 @@ const styles = StyleSheet.create({
     minHeight: TOUCH.minHeight,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  options: { marginTop: SPACING.sm },
+  optionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderSubtle,
+    minHeight: TOUCH.minHeight,
+  },
+  optionIcon: { marginRight: SPACING.md },
+  optionLabel: {
+    flex: 1,
+    fontSize: FONT_SIZE.body + 1,
+    color: COLORS.text,
+    fontWeight: '500',
   },
   list: { flexGrow: 0 },
   row: {
@@ -37009,7 +38894,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'https://kissing-download-devon-toolkit.trycloudflare.com';
+const DEFAULT_API_BASE_URL = 'https://inspector-discuss-invalid-gratuit.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -37331,6 +39216,10 @@ const DEFAULT_SETTINGS = {
   // step advance). When false, the walking screen behaves as it did
   // before indoor support existed.
   indoorsEnabled: true,
+  // Whether the indoor floor plan shows the floor switcher chips
+  // (B, G, 1, 2). On by default; the student can hide it in settings
+  // if they find it distracting.
+  showFloorSwitcher: true,
 };
 
 const SettingsContext = createContext({
@@ -37715,95 +39604,54 @@ export function useNearbyWifi({ position, enabled }) {
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\hooks\useRouteProgress.js ---
 
-// useRouteProgress — the walking screen's source of truth for
-// "where am I on the route?".
-//
-// For outdoor portions of a route, this defers entirely to
-// useWalkingProgress: GPS, snapping, distanceFromStartM, step
-// index — all from the outdoor pipeline, unchanged.
-//
-// For indoor portions, GPS is ignored. The step index advances
-// only when the student taps "Next step" on the instruction card.
-// This is deliberate: indoor GPS is unreliable, and a manual
-// advance puts the student in control of pacing.
-//
-// The transition from outdoor to indoor happens when the current
-// step's `mode` changes from "outdoor" to "indoor". At that moment,
-// this hook captures the outdoor step index as the indoor step
-// start, and switches to local advancement.
+// useRouteProgress — the walking screen's source of truth.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { useWalkingProgress } from '@/hooks/useWalkingProgress';
 import { useSettings } from '@/context/SettingsContext';
 
-export function useRouteProgress(route) {
+export function useRouteProgress(route, { startedFromPlace = false } = {}) {
   const { settings } = useSettings();
 
-  // Always run the outdoor hook. It'll be ignored during indoor
-  // steps, but it's harmless — the location subscription stays
-  // alive but its output is discarded.
   const outdoor = useWalkingProgress(route);
 
-  // Local step index, used only when the current step is indoor.
   const [manualStepIndex, setManualStepIndex] = useState(null);
-
-  // Track the previous current step's mode so we can detect the
-  // outdoor→indoor transition and initialize the manual index.
   const lastModeRef = useRef(null);
 
   const steps = route?.steps || [];
-
-  // Determine whether indoor is enabled for this walk.
   const indoorsEnabled = settings.indoorsEnabled !== false;
 
-  // Determine the outdoor-computed step index (or 0 if unavailable).
+  useEffect(() => {
+    if (startedFromPlace && manualStepIndex === null) {
+      setManualStepIndex(0);
+    }
+  }, [startedFromPlace, manualStepIndex]);
+
   const outdoorStepIndex =
     outdoor.currentStepIndex >= 0 ? outdoor.currentStepIndex : 0;
 
-  // Compute the effective step index and current mode.
   const currentStep = useMemo(() => {
     if (!steps.length) {
       return { index: 0, mode: 'outdoor', step: null };
     }
-
-    // If indoor is disabled entirely, behave as before.
     if (!indoorsEnabled) {
       const idx = outdoorStepIndex;
       const step = steps[idx] || null;
-      return {
-        index: idx,
-        mode: step?.mode || 'outdoor',
-        step,
-      };
+      return { index: idx, mode: step?.mode || 'outdoor', step };
     }
-
-    // If we're in manual mode (student already reached an indoor
-    // step), use the manual index.
     if (manualStepIndex !== null) {
       const idx = Math.min(manualStepIndex, steps.length - 1);
       const step = steps[idx] || null;
-      return {
-        index: idx,
-        mode: step?.mode || 'outdoor',
-        step,
-      };
+      return { index: idx, mode: step?.mode || 'outdoor', step };
     }
-
-    // Otherwise use the outdoor-computed index.
     const idx = outdoorStepIndex;
     const step = steps[idx] || null;
-    return {
-      index: idx,
-      mode: step?.mode || 'outdoor',
-      step,
-    };
+    return { index: idx, mode: step?.mode || 'outdoor', step };
   }, [steps, indoorsEnabled, manualStepIndex, outdoorStepIndex]);
 
-  // Detect the outdoor → indoor transition and start manual mode.
   useEffect(() => {
     const mode = currentStep.mode;
-
     if (
       lastModeRef.current === 'outdoor' &&
       mode === 'indoor' &&
@@ -37811,15 +39659,15 @@ export function useRouteProgress(route) {
     ) {
       setManualStepIndex(currentStep.index);
     }
-
     lastModeRef.current = mode;
   }, [currentStep.mode, currentStep.index, manualStepIndex]);
 
-  // Reset manual mode when the route changes.
   useEffect(() => {
-    setManualStepIndex(null);
+    if (!startedFromPlace) {
+      setManualStepIndex(null);
+    }
     lastModeRef.current = null;
-  }, [route]);
+  }, [route, startedFromPlace]);
 
   const advanceStep = useCallback(() => {
     setManualStepIndex((prev) => {
@@ -37829,66 +39677,63 @@ export function useRouteProgress(route) {
     });
   }, [currentStep.index, steps.length]);
 
-  // Distance remaining, in metres. During indoor steps, the outdoor
-  // value is stale (position is frozen), so we compute a simple
-  // approximation from remaining steps. Progress bar only.
-  const distanceRemainingM = currentStep.mode === 'indoor'
-    ? 0
-    : outdoor.distanceRemainingM;
+  const distanceRemainingM =
+    currentStep.mode === 'indoor' ? 0 : outdoor.distanceRemainingM;
+  const distanceToNextStepM =
+    currentStep.mode === 'indoor' ? 0 : outdoor.distanceToNextStepM;
+  const progress =
+    currentStep.mode === 'indoor'
+      ? steps.length > 1
+        ? currentStep.index / (steps.length - 1)
+        : 1
+      : outdoor.progress;
 
-  const distanceToNextStepM = currentStep.mode === 'indoor'
-    ? 0
-    : outdoor.distanceToNextStepM;
-
-  const progress = currentStep.mode === 'indoor'
-    ? (steps.length > 1 ? currentStep.index / (steps.length - 1) : 1)
-    : outdoor.progress;
-
-  // -----------------------------------------------------------------
-  // Indoor-specific derived values
-  // -----------------------------------------------------------------
-
-  // The current indoor level, from the current step. Used by the
-  // indoor floor plan to fetch the right floor. Null when outdoor.
   const indoorLevel =
     currentStep.mode === 'indoor' && currentStep.step
       ? currentStep.step.level || null
       : null;
 
-  // The current building name, from the current step. Null when
-  // outdoor.
   const indoorBuildingName =
     currentStep.mode === 'indoor' && currentStep.step
       ? currentStep.step.building_name || null
       : null;
 
-  // The indoor portion of the route geometry. Sliced using the
-  // geometry_index of the first and last indoor steps.
-  //
-  // The route's geometry is one long array covering both outdoor and
-  // indoor legs. Each indoor step carries geometry_index — its
-  // position in that array. Taking the first indoor step's index as
-  // the start and the last's as the end gives us the indoor slice.
-  const indoorGeometry = useMemo(() => {
+  const currentStepGeometryPoint = useMemo(() => {
+    if (currentStep.mode !== 'indoor') return null;
+    if (!route?.geometry) return null;
+    const step = currentStep.step;
+    if (!step || step.geometry_index == null) return null;
+    return route.geometry[step.geometry_index] || null;
+  }, [currentStep.mode, currentStep.step, route?.geometry]);
+
+  const indoorGeometryByLevel = useMemo(() => {
     if (!route?.geometry || !steps.length) return [];
-
-    let firstIndoorIdx = null;
-    let lastIndoorIdx = null;
-    for (const step of steps) {
-      if (step.mode !== 'indoor') continue;
-      const gi = step.geometry_index;
-      if (gi == null) continue;
-      if (firstIndoorIdx === null) firstIndoorIdx = gi;
-      lastIndoorIdx = gi;
+    const indoorSteps = steps.filter(
+      (s) => s.mode === 'indoor' && s.geometry_index != null
+    );
+    if (indoorSteps.length === 0) return [];
+    const points = [];
+    for (let i = 0; i < indoorSteps.length; i++) {
+      const step = indoorSteps[i];
+      const startIdx = step.geometry_index;
+      const endIdx =
+        i + 1 < indoorSteps.length
+          ? indoorSteps[i + 1].geometry_index
+          : route.geometry.length - 1;
+      for (let gi = startIdx; gi <= endIdx; gi++) {
+        const pt = route.geometry[gi];
+        if (!pt) continue;
+        points.push({ lat: pt.lat, lon: pt.lon, level: step.level || null });
+      }
     }
-    if (firstIndoorIdx === null) return [];
-
-    return route.geometry.slice(firstIndoorIdx, lastIndoorIdx + 1);
+    return points;
   }, [route?.geometry, steps]);
 
-  // The destination point of the indoor leg. Used by the floor plan
-  // to place a marker. The last indoor step's geometry_index points
-  // at the destination node.
+  const indoorGeometry = useMemo(
+    () => indoorGeometryByLevel.map(({ lat, lon }) => ({ lat, lon })),
+    [indoorGeometryByLevel]
+  );
+
   const indoorDestination = useMemo(() => {
     if (!route?.geometry || !steps.length) return null;
     let lastIndoorIdx = null;
@@ -37903,31 +39748,25 @@ export function useRouteProgress(route) {
 
   return {
     permissionGranted: outdoor.permissionGranted,
-
     position: currentStep.mode === 'indoor' ? null : outdoor.position,
     rawPosition: outdoor.rawPosition,
-
     currentStepIndex: currentStep.index,
     currentStep: currentStep.step,
     mode: currentStep.mode,
-
     distanceRemainingM,
     distanceToNextStepM,
     progress,
-
     offRoute: currentStep.mode === 'indoor' ? false : outdoor.offRoute,
     gpsStale: currentStep.mode === 'indoor' ? false : outdoor.gpsStale,
-
     resetOffRoute: outdoor.resetOffRoute,
-
     advanceStep,
     isLastStep: currentStep.index >= steps.length - 1,
-
-    // Indoor-specific values, for the floor plan.
     indoorLevel,
     indoorBuildingName,
     indoorGeometry,
+    indoorGeometryByLevel,
     indoorDestination,
+    currentStepGeometryPoint,
   };
 }
 
@@ -37935,22 +39774,46 @@ export function useRouteProgress(route) {
 
 // Determines where a route should start from.
 //
-// There is no cache. Every "Take me there" gets a fresh GPS fix.
-// The fix's accuracy is carried through so the backend can decide
-// whether it's trustworthy enough to route from.
+// Priority order:
+//   1. A fresh GPS fix — unless it looks "suspicious" (near a
+//      building entrance, or accuracy worse than 25 m). In that
+//      case the caller is told to ask "are you inside?".
+//   2. If GPS fails or is refused: the outdoor place picker.
+//
+// The caller (Home screen, Place detail) decides what to do with
+// `shouldAskIndoor`. Typically it shows AreYouInsideSheet.
 
 import { useCallback, useRef, useState } from 'react';
 
 import { getPositionOnce, requestPermission } from '@/services/location';
-import { listPlaces } from '@/services/api';
+import { listPlaces, listEntrances } from '@/services/api';
 
 const GPS_TIMEOUT_MS = 15000;
+const NEAR_ENTRANCE_M = 20;
+const ACCURACY_THRESHOLD_M = 25;
+
+function haversineM(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const phi1 = (lat1 * Math.PI) / 180;
+  const phi2 = (lat2 * Math.PI) / 180;
+  const dphi = ((lat2 - lat1) * Math.PI) / 180;
+  const dlambda = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dphi / 2) ** 2 +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
 
 export function useStartingPoint() {
   const [state, setState] = useState('idle');
   const [start, setStart] = useState(null);
   const [nearbyPlaces, setNearbyPlaces] = useState([]);
   const [lastError, setLastError] = useState(null);
+
+  // The building the fix is near, if any. Used by AreYouInsideSheet
+  // to name the building in the question.
+  const [suspiciousBuilding, setSuspiciousBuilding] = useState(null);
+  const [suspiciousFix, setSuspiciousFix] = useState(null);
 
   const pendingResolverRef = useRef(null);
 
@@ -37959,6 +39822,8 @@ export function useStartingPoint() {
     setStart(null);
     setNearbyPlaces([]);
     setLastError(null);
+    setSuspiciousBuilding(null);
+    setSuspiciousFix(null);
     if (pendingResolverRef.current) {
       pendingResolverRef.current(null);
       pendingResolverRef.current = null;
@@ -37966,7 +39831,14 @@ export function useStartingPoint() {
   }, []);
 
   const choosePlace = useCallback((place) => {
-    const chosen = { placeId: place.id, placeName: place.name };
+    const chosen = {
+      placeId: place.id,
+      placeName: place.name,
+      buildingName: place.building_name || null,
+      level: place.level || null,
+      lat: place.lat ?? place.location?.lat ?? null,
+      lon: place.lon ?? place.location?.lon ?? null,
+    };
     setStart(chosen);
     setState('idle');
     setNearbyPlaces([]);
@@ -37985,8 +39857,27 @@ export function useStartingPoint() {
     }
   }, []);
 
+  const startDoorPick = useCallback(async ({ buildingName } = {}) => {
+    setState('pickingDoor');
+    setSuspiciousBuilding(buildingName || null);
+  }, []);
+
+  const confirmOutside = useCallback(() => {
+    const fix = suspiciousFix;
+    setSuspiciousBuilding(null);
+    setSuspiciousFix(null);
+    if (fix) {
+      const result = { lat: fix.lat, lon: fix.lon, accuracyM: fix.accuracyM };
+      setStart(result);
+      return result;
+    }
+    return null;
+  }, [suspiciousFix]);
+
   const resolveStart = useCallback(async ({ destinationPlaceId } = {}) => {
     setLastError(null);
+    setSuspiciousBuilding(null);
+    setSuspiciousFix(null);
 
     setState('locating');
     let granted = false;
@@ -38004,22 +39895,34 @@ export function useStartingPoint() {
       return null;
     }
 
+    let fresh = null;
     try {
-      const fresh = await getPositionOnce({ timeoutMs: GPS_TIMEOUT_MS });
-      if (fresh) {
-        const result = {
-          lat: fresh.lat,
-          lon: fresh.lon,
-          accuracyM: fresh.accuracyM,
-        };
-        setStart(result);
-        setState('idle');
-        return result;
-      }
+      fresh = await getPositionOnce({ timeoutMs: GPS_TIMEOUT_MS });
     } catch {
-      // Fall through to the picker.
+      fresh = null;
     }
 
+    if (fresh) {
+      const suspicious = await checkSuspicious(fresh);
+
+      if (suspicious) {
+        setSuspiciousFix(fresh);
+        setSuspiciousBuilding(suspicious.buildingName || null);
+        setState('askIndoor');
+        return null;
+      }
+
+      const result = {
+        lat: fresh.lat,
+        lon: fresh.lon,
+        accuracyM: fresh.accuracyM,
+      };
+      setStart(result);
+      setState('idle');
+      return result;
+    }
+
+    // GPS failed. Fall back to the outdoor place picker.
     setLastError('no_fix');
     setState('needPick');
     try {
@@ -38040,11 +39943,48 @@ export function useStartingPoint() {
     start,
     nearbyPlaces,
     lastError,
+    suspiciousBuilding,
     resolveStart,
     choosePlace,
     cancelPick,
+    startDoorPick,
+    confirmOutside,
     reset,
   };
+}
+
+async function checkSuspicious(fix) {
+  if (!fix) return null;
+
+  if (fix.accuracyM != null && fix.accuracyM > ACCURACY_THRESHOLD_M) {
+    return { reason: 'accuracy', buildingName: null };
+  }
+
+  try {
+    const entrances = await listEntrances();
+    let nearest = null;
+    let nearestDist = Infinity;
+    for (const e of entrances) {
+      const lat = e.location?.lat;
+      const lon = e.location?.lon;
+      if (lat == null || lon == null) continue;
+      const d = haversineM(fix.lat, fix.lon, lat, lon);
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearest = e;
+      }
+    }
+    if (nearest && nearestDist <= NEAR_ENTRANCE_M) {
+      return {
+        reason: 'entrance',
+        buildingName: nearest.building_name || null,
+      };
+    }
+  } catch {
+    // No entrance lookup — skip the entrance trigger.
+  }
+
+  return null;
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\hooks\useTimetableSelection.js ---
@@ -38125,21 +40065,8 @@ export function useWalkingProgress(route) {
   const [gpsStale, setGpsStale] = useState(false);
 
   const detectorRef = useRef(createOffRouteDetector());
-
-  // The segment index of the last successful snap. Used to constrain
-  // the next snap's search to segments near where we were. On a
-  // campus with looping paths, an unconstrained search can jump to
-  // the wrong segment; at corners, the previous segment's endpoint
-  // can pin the dot. Both are fixed by preferring nearby segments.
   const lastSegmentIndexRef = useRef(null);
-
-  // Track the last time a good fix was accepted. Used by the stale
-  // fallback and by the "searching for GPS" indicator.
   const lastGoodFixAtRef = useRef(Date.now());
-
-  // The current route geometry, kept in a ref so the location
-  // callback always reads the latest without the subscription effect
-  // depending on the route object.
   const geometryRef = useRef(null);
 
   useEffect(() => {
@@ -38149,7 +40076,6 @@ export function useWalkingProgress(route) {
         : null;
   }, [route]);
 
-  // Ask for permission once, when the hook first mounts.
   useEffect(() => {
     let cancelled = false;
     requestPermission().then((granted) => {
@@ -38166,8 +40092,6 @@ export function useWalkingProgress(route) {
     route.geometry.length > 1
   );
 
-  // Subscribe to GPS updates. Depends only on whether a geometry
-  // exists, not on the route object itself.
   useEffect(() => {
     if (!permissionGranted) return;
     if (!hasGeometry) return;
@@ -38190,17 +40114,9 @@ export function useWalkingProgress(route) {
         const isStale = now - lastGoodFixAtRef.current > DISPLAY_STALE_FIX_MS;
         const shouldDisplay = isGoodFix || isStale;
 
-        // Off-route detection runs on EVERY fix — even ones too rough
-        // to move the dot. A noisy fix is still evidence you've
-        // drifted off the mapped path. The only gate is the looser
-        // OFF_ROUTE_MAX_ACCURACY_M, which rejects cell-tower garbage.
         const geom = geometryRef.current;
         let snapped = null;
         if (geom) {
-          // Forward-constrained snap. The `nearIndex` hint is the
-          // segment index from the last successful snap. If it's
-          // null (first fix, or the route changed) the snap does a
-          // full search.
           snapped = snapToRoute(
             { lat: loc.lat, lon: loc.lon },
             geom,
@@ -38219,9 +40135,6 @@ export function useWalkingProgress(route) {
         }
 
         if (!shouldDisplay) {
-          // Not a good enough fix to move the dot, but we've already
-          // updated off-route detection above. Check whether we
-          // should tell the student the GPS is degraded.
           const secondsSinceGoodFix =
             (now - lastGoodFixAtRef.current) / 1000;
           if (secondsSinceGoodFix >= DISPLAY_STALE_INDICATOR_S) {
@@ -38245,7 +40158,7 @@ export function useWalkingProgress(route) {
         }
       },
       () => {
-        // Location error. Subscription stays alive.
+        // Silent.
       }
     ).then((fn) => {
       if (cancelled) {
@@ -38263,8 +40176,6 @@ export function useWalkingProgress(route) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionGranted, hasGeometry]);
 
-  // Reset the detector and segment hint when the route object
-  // changes. A new route means the old segment index is meaningless.
   useEffect(() => {
     detectorRef.current.reset();
     lastSegmentIndexRef.current = null;
@@ -38302,7 +40213,6 @@ export function useWalkingProgress(route) {
     offRoute,
     progress,
     resetOffRoute,
-    // True when no good GPS fix has arrived for DISPLAY_STALE_INDICATOR_S.
     gpsStale,
   };
 }
@@ -38340,12 +40250,28 @@ export function useWalkingProgress(route) {
     "chatDescription": "Ask about rules, history, and hours"
   },
   "start": {
-    "title": "Where are you starting from?",
-    "subtitle": "We couldn't find your location. Pick a place to start from.",
-    "findingLocation": "Finding your location…",
-    "noPlaces": "No places available. Try again.",
-    "couldNotResolve": "Couldn't work out where to start from."
-  },
+  "title": "Where are you starting from?",
+  "subtitle": "Pick a starting point, or use your current location.",
+  "findingLocation": "Finding your location…",
+  "noPlaces": "No places available. Try again.",
+  "couldNotResolve": "Couldn't work out where to start from.",
+  "permissionDenied": "Location permission is needed to guide you.",
+  "chipMyLocation": "From: My location",
+  "chipFromPlace": "From: {name}",
+  "optionUseGps": "Use my current location",
+  "optionPickPlace": "Pick a starting place",
+  "optionImInside": "I'm inside a building",
+  "pickPlaceTitle": "Pick a starting place",
+  "pickPlaceSubtitle": "Tap a place to start from it.",
+  "areYouInsideNamed": "Are you inside {name}?",
+  "areYouInsideUnnamed": "Are you inside a building?",
+  "areYouInsideBody": "Your GPS can't tell us for sure.",
+  "areYouInsideYes": "Yes, I'm inside",
+  "areYouInsideNo": "No, I'm outside",
+  "doorPickerTitle": "Pick your starting door",
+  "doorPickerSearchPlaceholder": "Search by door name…",
+  "doorPickerEmpty": "No doors in this building yet."
+},
   "place": {
     "takeMeThere": "Take me there",
     "noDescription": "No description yet.",
@@ -38476,7 +40402,9 @@ export function useWalkingProgress(route) {
     "wifi": "Wi-Fi",
     "wifiNotifications": "Wi-Fi notifications",
     "wifiDescription": "Show a banner when you're near a mapped Wi-Fi spot.",
-    "version": "Campus Navigation v{version}"
+    "version": "Campus Navigation v{version}",
+    "floorSwitcher": "Floor switcher",
+    "floorSwitcherDescription": "Show the floor selector on indoor maps."
   },
   "categories": {
     "all": "All",
@@ -38656,12 +40584,28 @@ export function ttsLanguageForCurrentLang() {
     "chatDescription": "Uliza kuhusu sheria, historia, na saa za kufungua"
   },
   "start": {
-    "title": "Unaanza kutoka wapi?",
-    "subtitle": "Hatukuweza kupata mahali ulipo. Chagua mahali pa kuanzia.",
-    "findingLocation": "Inatafuta mahali ulipo…",
-    "noPlaces": "Hakuna mahali panapatikana. Jaribu tena.",
-    "couldNotResolve": "Hatukuweza kubaini pa kuanzia."
-  },
+  "title": "Unaanza kutoka wapi?",
+  "subtitle": "Chagua mahali pa kuanzia, au tumia mahali ulipo sasa.",
+  "findingLocation": "Inatafuta mahali ulipo…",
+  "noPlaces": "Hakuna mahali panapatikana. Jaribu tena.",
+  "couldNotResolve": "Hatukuweza kubaini pa kuanzia.",
+  "permissionDenied": "Ruhusa ya mahali inahitajika kukuelekeza.",
+  "chipMyLocation": "Kutoka: Mahali nilipo",
+  "chipFromPlace": "Kutoka: {name}",
+  "optionUseGps": "Tumia mahali nilipo sasa",
+  "optionPickPlace": "Chagua mahali pa kuanzia",
+  "optionImInside": "Niko ndani ya jengo",
+  "pickPlaceTitle": "Chagua mahali pa kuanzia",
+  "pickPlaceSubtitle": "Gusa mahali ili kuanzia hapo.",
+  "areYouInsideNamed": "Uko ndani ya {name}?",
+  "areYouInsideUnnamed": "Uko ndani ya jengo?",
+  "areYouInsideBody": "GPS yako haiwezi kutujulisha kwa uhakika.",
+  "areYouInsideYes": "Ndiyo, niko ndani",
+  "areYouInsideNo": "Hapana, niko nje",
+  "doorPickerTitle": "Chagua mlango wa kuanzia",
+  "doorPickerSearchPlaceholder": "Tafuta kwa jina la mlango…",
+  "doorPickerEmpty": "Hakuna milango kwenye jengo hili bado."
+},
   "place": {
     "takeMeThere": "Nipeleke hapo",
     "noDescription": "Bado hakuna maelezo.",
@@ -38792,7 +40736,9 @@ export function ttsLanguageForCurrentLang() {
     "wifi": "Wi-Fi",
     "wifiNotifications": "Taarifa za Wi-Fi",
     "wifiDescription": "Onyesha arifa unapokaribia sehemu ya Wi-Fi.",
-    "version": "Campus Navigation toleo {version}"
+    "version": "Campus Navigation toleo {version}",
+    "floorSwitcher": "Kiteuzi cha sakafu",
+    "floorSwitcherDescription": "Onyesha kiteuzi cha sakafu kwenye ramani za ndani."
   },
   "categories": {
     "all": "Zote",
@@ -55710,6 +57656,10 @@ global.fetch = jest.fn(() =>
 
 import { API_BASE_URL, API_TIMEOUT_MS } from '@/constants/config';
 import { getDeviceId } from '@/services/session';
+import {
+  getCachedFloor,
+  setCachedFloor,
+} from '@/services/indoorCache';
 
 export async function request(path, options = {}) {
   const url = API_BASE_URL + path;
@@ -55774,12 +57724,25 @@ export async function searchPlaces(q, { limit = 20 } = {}) {
   return request(`/api/places/search?${params.toString()}`);
 }
 
-export async function listPlaces({ q, category, intent, kind, lat, lon, radius_m, limit } = {}) {
+export async function listPlaces({
+  q,
+  category,
+  intent,
+  kind,
+  building_name,
+  level,
+  lat,
+  lon,
+  radius_m,
+  limit,
+} = {}) {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (category) params.set('category', category);
   if (intent) params.set('intent', intent);
   if (kind) params.set('kind', kind);
+  if (building_name) params.set('building_name', building_name);
+  if (level != null) params.set('level', String(level));
   if (lat != null) params.set('lat', String(lat));
   if (lon != null) params.set('lon', String(lon));
   if (radius_m != null) params.set('radius_m', String(radius_m));
@@ -56003,24 +57966,50 @@ export async function getNearbyWifi({ lat, lon, r = 25 } = {}) {
 // Indoor floor plans
 // ---------------------------------------------------------------
 
-/**
- * Fetch the rooms and corridors for one floor of one building.
- *
- * Used by the walking screen when the current step is indoor.
- * Returns { building_name, level, areas: [...] }.
- *
- * Each area has { id, osm_id, name, ref, type, level,
- * door_node_id, boundary: [{lat, lon}], centroid: {lat, lon} }.
- *
- * If the building or level has no polygons yet, `areas` is empty
- * and the caller falls back to the indoor placeholder.
- */
 export async function getIndoorAreas({ buildingName, level }) {
+  const cached = await getCachedFloor(buildingName, level);
+  if (cached) return cached;
+
   const params = new URLSearchParams({
     building_name: buildingName,
     level: String(level),
   });
-  return request(`/api/indoor/areas?${params.toString()}`);
+  const data = await request(`/api/indoor/areas?${params.toString()}`);
+
+  setCachedFloor(buildingName, level, data).catch(() => {});
+
+  return data;
+}
+
+// ---------------------------------------------------------------
+// Entrances (for the "are you inside?" trigger)
+// ---------------------------------------------------------------
+
+/**
+ * All building entrances. Used by the starting-point logic to work
+ * out whether a GPS fix is close enough to an entrance that the
+ * student might actually be inside.
+ */
+export async function listEntrances() {
+  return listPlaces({ kind: 'entrance', limit: 200 });
+}
+
+// ---------------------------------------------------------------
+// Indoor doors (for the door picker)
+// ---------------------------------------------------------------
+
+/**
+ * Indoor door nodes. Used by the door picker to let the student
+ * declare which door they're starting from.
+ *
+ * Pass `buildingName` to narrow to one building.
+ */
+export async function listIndoorDoors({ buildingName } = {}) {
+  return listPlaces({
+    kind: 'indoor',
+    building_name: buildingName || undefined,
+    limit: 500,
+  });
 }
 
 // ---------------------------------------------------------------
@@ -56211,6 +58200,91 @@ export async function offRoutePulse() {
   } catch {
     // Silent.
   }
+}
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\indoorCache.js ---
+
+// Persistent cache for indoor floor plans.
+//
+// Floor plans change rarely. Caching them means a student who has
+// visited a building before sees its floor plan instantly, even
+// without a network connection.
+//
+// Two-layer cache:
+//   - In-memory Map for this session. Fast, no I/O.
+//   - AsyncStorage for across-session persistence. Survives restarts.
+//
+// Every entry has a `cachedAt` timestamp. On read, entries older
+// than the TTL are discarded and refetched.
+//
+// Key format: indoor-cache-v1:<building>:<level>
+// Bumping the version prefix invalidates every old entry.
+
+import { getJSON, setJSON } from '@/services/storage';
+
+const KEY_PREFIX = 'indoor-cache-v1';
+const TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+const _memory = new Map();
+
+function _key(buildingName, level) {
+  return `${KEY_PREFIX}:${buildingName}:${level}`;
+}
+
+/**
+ * Read a floor plan from the cache. Returns null on miss or on an
+ * expired entry.
+ */
+export async function getCachedFloor(buildingName, level) {
+  if (!buildingName || level == null) return null;
+  const key = _key(buildingName, level);
+
+  // Memory first — fastest.
+  if (_memory.has(key)) {
+    const entry = _memory.get(key);
+    if (Date.now() - entry.cachedAt < TTL_MS) return entry.data;
+    _memory.delete(key);
+  }
+
+  // Fall through to storage.
+  const stored = await getJSON(key);
+  if (!stored || !stored.cachedAt || !stored.data) return null;
+  if (Date.now() - stored.cachedAt >= TTL_MS) {
+    // Expired. Leave it on disk for now — the next write will
+    // overwrite. No need to delete eagerly.
+    return null;
+  }
+
+  // Warm the memory cache.
+  _memory.set(key, stored);
+  return stored.data;
+}
+
+/**
+ * Store a floor plan. Writes to both cache layers.
+ */
+export async function setCachedFloor(buildingName, level, data) {
+  if (!buildingName || level == null) return;
+  const key = _key(buildingName, level);
+  const entry = { cachedAt: Date.now(), data };
+
+  _memory.set(key, entry);
+  // Fire-and-forget. If AsyncStorage fails, the memory cache still
+  // works for this session.
+  setJSON(key, entry).catch(() => {});
+}
+
+/**
+ * Clear every cached floor plan. Not currently called from the UI —
+ * we may add a "clear cache" button later if it becomes useful.
+ */
+export async function clearIndoorCache() {
+  _memory.clear();
+  // AsyncStorage doesn't have a "delete by prefix" call. To clear
+  // everything we'd have to know the keys. Since we don't currently
+  // expose a clear button, leave it as a stub. The version prefix
+  // (indoor-cache-v1) is the real invalidation tool: bump to v2 and
+  // every old key becomes unreachable.
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\location.js ---

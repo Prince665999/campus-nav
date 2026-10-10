@@ -43,20 +43,25 @@ class TestChatSession:
         assert r.status_code == 204
 
 
-class TestRouteChatRequiresContext:
-    def test_missing_route_fields_returns_422(self, client):
-        """
-        The route chat endpoint requires all four route fields. A
-        request without them should be rejected — the client should
-        call /api/chat/doc instead.
-        """
+class TestRouteChatWithoutFullContext:
+    """
+    The route chat endpoint accepts requests without route context and
+    returns a friendly reply rather than a validation error. This
+    lets the mobile client show something useful even if it couldn't
+    supply the route fields.
+    """
+
+    def test_missing_route_fields_returns_200_with_reply(self, client):
         r = client.post(
             "/api/chat",
             json={"message": "what time does the library close"},
         )
-        assert r.status_code == 422
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["reply"], str)
+        assert len(body["reply"]) > 0
 
-    def test_partial_route_fields_returns_422(self, client):
+    def test_partial_route_fields_returns_200_with_reply(self, client):
         a = client.get("/api/places?limit=1").json()[0]
         r = client.post(
             "/api/chat",
@@ -67,7 +72,10 @@ class TestRouteChatRequiresContext:
                 # missing current_step_index and distance_from_start_m
             },
         )
-        assert r.status_code == 422
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["reply"], str)
+        assert len(body["reply"]) > 0
 
 
 class TestRouteChat:
@@ -105,8 +113,7 @@ class TestRouteChat:
     def test_route_question_does_not_mention_documents(self, client, temp_db):
         """
         The route chat should never claim to be answering from a
-        document. Even if the answer is short, it should not contain
-        phrases like 'from the documents'.
+        document.
         """
         a, b = self._find_routable_pair(client)
         if not a:

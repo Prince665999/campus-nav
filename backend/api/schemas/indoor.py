@@ -5,6 +5,11 @@ Request and response shapes for the indoor-areas endpoint.
 
 The endpoint returns plain JSON with lat/lon boundary points, not
 WKT strings. The phone builds GeoJSON from this directly.
+
+The `levels` array lists every level that has polygons in this
+building. The floor switcher uses it to know what to show. It's
+computed from the DB, not hard-coded, so it always reflects what's
+actually ingested.
 """
 
 from pydantic import BaseModel, Field
@@ -36,3 +41,7 @@ class IndoorAreasResponse(BaseModel):
     building_name: str
     level: str
     areas: list[IndoorAreaItem] = Field(default_factory=list)
+
+    # Every level this building has polygons on, sorted ascending.
+    # Includes the requested level. Used by the floor switcher.
+    levels: list[str] = Field(default_factory=list)

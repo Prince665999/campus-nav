@@ -1,7 +1,13 @@
 // Bottom sheet asking the student where they're starting from.
 //
-// Shown when the app can't determine the position from GPS. Offers a
-// list of places to pick as the starting point.
+// Three options:
+//   - Use my current location (GPS)
+//   - Pick a starting place (outdoor place list)
+//   - I'm inside a building (indoor door picker)
+//
+// Shown when:
+//   - The student taps the "From:" chip.
+//   - GPS fails and we don't have a remembered start.
 
 import {
   FlatList,
@@ -16,10 +22,21 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
-import { ICONS } from '@/constants/icons';
 
-export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
+export function StartingPointSheet({
+  visible,
+  places,
+  onChoose,
+  onUseGps,
+  onImInside,
+  onCancel,
+  mode = 'choose', // 'choose' | 'place-list'
+}) {
   const insets = useSafeAreaInsets();
+
+  // When we're showing the outdoor place list, we switch the content
+  // and hide the three-option menu.
+  const showingPlaces = mode === 'place-list';
 
   return (
     <Modal
@@ -37,8 +54,16 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
         >
           <View style={styles.header}>
             <View style={styles.headerText}>
-              <Text style={styles.title}>{t('start.title')}</Text>
-              <Text style={styles.subtitle}>{t('start.subtitle')}</Text>
+              <Text style={styles.title}>
+                {showingPlaces
+                  ? t('start.pickPlaceTitle')
+                  : t('start.title')}
+              </Text>
+              <Text style={styles.subtitle}>
+                {showingPlaces
+                  ? t('start.pickPlaceSubtitle')
+                  : t('start.subtitle')}
+              </Text>
             </View>
             <TouchableOpacity
               onPress={onCancel}
@@ -47,14 +72,32 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
               accessibilityLabel={t('common.cancel')}
             >
               <MaterialIcons
-                name={ICONS.close}
+                name="close"
                 size={22}
                 color={COLORS.textMuted}
               />
             </TouchableOpacity>
           </View>
 
-          {places.length === 0 ? (
+          {!showingPlaces ? (
+            <View style={styles.options}>
+              <OptionRow
+                icon="my-location"
+                label={t('start.optionUseGps')}
+                onPress={onUseGps}
+              />
+              <OptionRow
+                icon="place"
+                label={t('start.optionPickPlace')}
+                onPress={() => onChoose(null)}
+              />
+              <OptionRow
+                icon="meeting-room"
+                label={t('start.optionImInside')}
+                onPress={onImInside}
+              />
+            </View>
+          ) : places.length === 0 ? (
             <View style={styles.emptyState}>
               <Text style={styles.emptyText}>{t('start.noPlaces')}</Text>
             </View>
@@ -71,7 +114,7 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
                   accessibilityLabel={item.name}
                 >
                   <MaterialIcons
-                    name={ICONS.place}
+                    name="place"
                     size={20}
                     color={COLORS.textMuted}
                     style={styles.rowIcon}
@@ -92,6 +135,30 @@ export function StartingPointSheet({ visible, places, onChoose, onCancel }) {
   );
 }
 
+function OptionRow({ icon, label, onPress }) {
+  return (
+    <TouchableOpacity
+      style={styles.optionRow}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+    >
+      <MaterialIcons
+        name={icon}
+        size={22}
+        color={COLORS.text}
+        style={styles.optionIcon}
+      />
+      <Text style={styles.optionLabel}>{label}</Text>
+      <MaterialIcons
+        name="chevron-right"
+        size={22}
+        color={COLORS.textMuted}
+      />
+    </TouchableOpacity>
+  );
+}
+
 const styles = StyleSheet.create({
   backdrop: {
     flex: 1,
@@ -104,7 +171,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: RADIUS.lg,
     paddingHorizontal: SPACING.lg,
     paddingTop: SPACING.lg,
-    maxHeight: '80%',
+    maxHeight: '85%',
   },
   header: {
     flexDirection: 'row',
@@ -124,6 +191,22 @@ const styles = StyleSheet.create({
     minHeight: TOUCH.minHeight,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  options: { marginTop: SPACING.sm },
+  optionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderSubtle,
+    minHeight: TOUCH.minHeight,
+  },
+  optionIcon: { marginRight: SPACING.md },
+  optionLabel: {
+    flex: 1,
+    fontSize: FONT_SIZE.body + 1,
+    color: COLORS.text,
+    fontWeight: '500',
   },
   list: { flexGrow: 0 },
   row: {

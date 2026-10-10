@@ -6,8 +6,9 @@ Endpoints for indoor floor plans.
   GET /api/indoor/areas?building_name=X&level=Y
 
 Returns every room and corridor polygon on one floor of one
-building. The phone uses this to draw the floor plan when the
-student is walking inside.
+building, plus the list of levels the building has. The phone uses
+this to draw the floor plan when the student is walking inside, and
+to show a floor switcher.
 
 Public (no admin guard) — the mobile app calls it directly, just
 like the outdoor /api/areas endpoint.
@@ -17,7 +18,6 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from ..dependencies import db_session
-from ..errors import NotFoundError
 from ..schemas.indoor import IndoorAreasResponse
 from ..services import indoor_area_service
 
@@ -32,6 +32,9 @@ def get_indoor_areas(
 ):
     """
     Every room and corridor polygon on one floor of one building.
+
+    Also returns `levels`, the list of floors this building has
+    polygons on. The phone uses it to show a floor switcher.
 
     Returns an empty `areas` list if the building or level has no
     polygons yet. The mobile app falls back to the indoor

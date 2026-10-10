@@ -21,6 +21,7 @@ class PlaceSummary(BaseModel):
     category_icon_key: str | None = None
     intents: str | None = None
     kind: str = "outdoor"
+    building_name: str | None = None
     level: str | None = None
     room_name: str | None = None
     location: LatLon
@@ -30,12 +31,7 @@ class PlaceSummary(BaseModel):
 
 class PlaceDetail(BaseModel):
     """The shape returned by /api/places/{id}. Adds fields the summary
-    doesn't need.
-
-    Note: the `description` here is the public one, read from the
-    database's `description` column. The AI-facing description lives
-    under `description_ai` and is never returned in a public response.
-    """
+    doesn't need."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -47,6 +43,7 @@ class PlaceDetail(BaseModel):
     category: str | None = None
     intents: str | None = None
     kind: str = "outdoor"
+    building_name: str | None = None
     level: str | None = None
     room_name: str | None = None
     ref: str | None = None
@@ -65,6 +62,8 @@ class PlaceListParams(BaseModel):
     category: str | None = None
     intent: str | None = None
     kind: str | None = None
+    building_name: str | None = None
+    level: str | None = None
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)

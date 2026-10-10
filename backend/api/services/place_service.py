@@ -14,9 +14,6 @@ from ..schemas.place import PlaceDetail, PlaceSummary
 from ..schemas.common import LatLon
 
 
-# Maps OSM category values to icon keys the mobile app understands.
-# The mobile side has an ICONS map with matching keys. Anything not
-# listed falls back to the default "place" icon.
 _CATEGORY_ICON_KEYS = {
     "amenity=library": "library",
     "amenity=cafe": "food",
@@ -38,10 +35,7 @@ def _icon_key_for_category(category):
 
 
 def _primary_photo_for(session, place_id):
-    """
-    Return the URL of a place's primary photo, or None. Uses the card
-    variant, which is what the app shows in grids.
-    """
+    """Return the URL of a place's primary photo, or None."""
     row = (
         session.query(Media)
         .filter_by(place_id=place_id)
@@ -63,6 +57,7 @@ def _to_summary(session, place: Place) -> PlaceSummary:
         category_icon_key=_icon_key_for_category(place.category),
         intents=place.intents,
         kind=place.kind,
+        building_name=place.building_name,
         level=place.level,
         room_name=place.room_name,
         location=LatLon(lat=place.lat, lon=place.lon),
@@ -81,6 +76,7 @@ def _to_detail(session, place: Place) -> PlaceDetail:
         category=place.category,
         intents=place.intents,
         kind=place.kind,
+        building_name=place.building_name,
         level=place.level,
         room_name=place.room_name,
         ref=place.ref,
@@ -99,6 +95,8 @@ def search_places(
     category: str | None = None,
     intent: str | None = None,
     kind: str | None = None,
+    building_name: str | None = None,
+    level: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
     radius_m: float = 500,
@@ -110,7 +108,9 @@ def search_places(
     - q: case-insensitive substring against name, name_sw, alt_names
     - category: exact match against the category column
     - intent: case-insensitive substring against the intents column
-    - kind: "outdoor" or "indoor"
+    - kind: "outdoor", "indoor", or "entrance"
+    - building_name: exact match (case-insensitive)
+    - level: exact match against the level column
     - lat/lon/radius_m: proximity filter
     """
     query = session.query(Place)
@@ -136,6 +136,15 @@ def search_places(
 
     if kind:
         query = query.filter(Place.kind == kind)
+
+    if building_name:
+        needle = building_name.strip().lower()
+        query = query.filter(
+            func.lower(func.coalesce(Place.building_name, "")) == needle
+        )
+
+    if level is not None:
+        query = query.filter(Place.level == str(level))
 
     if lat is not None and lon is not None:
         import math

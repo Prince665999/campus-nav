@@ -3,19 +3,27 @@
 // When the walking screen's current step is indoor, this component
 // replaces the outdoor tile map. It:
 //   1. Fetches the rooms and corridors for the current building+level
-//      from /api/indoor/areas.
-//   2. Renders them on a blank MapLibre map: rooms filled light grey,
-//      corridors a slightly different shade, room names as labels.
-//   3. Draws the indoor portion of the route as a blue line.
-//   4. Marks the destination with a red marker.
+//      from /api/indoor/areas (through the persistent cache).
+//   2. Renders them on a blank MapLibre map: rooms white, corridors
+//      light grey, room names as labels.
+//   3. Draws the indoor route: solid on the current floor, faint
+//      dashed on other floors.
+//   4. Marks the destination with a red dot.
+//   5. Shows a "you are here" dot on the current step's point, when
+//      the displayed floor matches the current step's floor.
+//   6. Shows a floor switcher on the right edge if the settings
+//      toggle is on.
 //
 // The camera auto-fits to the room bounds on first render.
-//
-// If the API returns no rooms (unsurveyed building), we render
-// nothing and the parent falls back to IndoorMapPlaceholder.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import {
   MapView,
   Camera,
@@ -27,19 +35,14 @@ import {
 } from '@maplibre/maplibre-react-native';
 
 import { getIndoorAreas } from '@/services/api';
-import { COLORS } from '@/constants/theme';
+import { useSettings } from '@/context/SettingsContext';
+import { t } from '@/i18n';
+import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 
-// A minimal blank map style. No tiles, no outlines, no country
-// boundaries — just a flat background for the floor plan.
-//
-// The glyphs URL is required: MapLibre downloads font glyphs from
-// here to render text in SymbolLayer. Without it, MapLibre logs
-// "Unable to parse resourceUrl" on every redraw and room labels
-// never appear.
-//
-// The style is passed as a JSON string rather than an object because
-// MapLibre RN versions differ in how they handle inline objects —
-// a string is stable across renders and avoids unnecessary reloads.
+// A minimal blank map style. Flat background, no tiles.
+// The glyphs URL is required for room-name labels. Without it,
+// MapLibre logs "Unable to parse resourceUrl" and labels never
+// appear.
 const BLANK_STYLE = JSON.stringify({
   version: 8,
   name: 'indoor-blank',
@@ -49,32 +52,73 @@ const BLANK_STYLE = JSON.stringify({
     {
       id: 'background',
       type: 'background',
-      paint: {
-        'background-color': '#f1f5f9',
-      },
+      paint: { 'background-color': '#f1f5f9' },
     },
   ],
 });
 
+// MapLibre fill colour expression. Rooms white, corridors grey.
+const FILL_COLOR_EXPR = [
+  'match',
+  ['get', 'type'],
+  'corridor', '#e2e8f0',
+  'room', '#ffffff',
+  '#ffffff',
+];
+
+// Convert a level string to a short chip label.
+function levelLabel(level) {
+  if (level === '-1') return 'B';
+  if (level === '0') return 'G';
+  return level;
+}
+
 export function IndoorMapView({
   buildingName,
   level,
-  routeGeometry = [],
+  routeByLevel = [],
   destination = null,
+  currentStepPoint = null,
+  currentStepLevel = null,
   style,
   onNoRooms,
 }) {
+  const { settings } = useSettings();
   const cameraRef = useRef(null);
 
+  // The floor currently being displayed. Starts as the current
+  // step's level, but can be overridden by the floor switcher.
+  const [selectedLevel, setSelectedLevel] = useState(level);
+
   const [areas, setAreas] = useState(null);
+  const [availableLevels, setAvailableLevels] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Fetch rooms and corridors whenever the building or level changes.
+  // When the building changes, reset the selected level to whatever
+  // the current step says.
+  useEffect(() => {
+    setSelectedLevel(level);
+  }, [buildingName]);
+
+  // When the current step's level changes and the student has NOT
+  // manually switched floors, follow it. If they HAVE manually
+  // switched, respect their choice.
+  const [manuallyChosen, setManuallyChosen] = useState(false);
+  useEffect(() => {
+    if (!manuallyChosen) {
+      setSelectedLevel(level);
+    }
+  }, [level, manuallyChosen]);
+  useEffect(() => {
+    setManuallyChosen(false);
+  }, [buildingName]);
+
+  // Fetch rooms and corridors for the selected level.
   useEffect(() => {
     let cancelled = false;
 
-    if (!buildingName || level == null) {
+    if (!buildingName || selectedLevel == null) {
       setAreas([]);
       setLoading(false);
       return () => {
@@ -85,11 +129,12 @@ export function IndoorMapView({
     setLoading(true);
     setError(null);
 
-    getIndoorAreas({ buildingName, level })
+    getIndoorAreas({ buildingName, level: selectedLevel })
       .then((data) => {
         if (cancelled) return;
         const list = data?.areas || [];
         setAreas(list);
+        setAvailableLevels(data?.levels || []);
         if (list.length === 0 && onNoRooms) onNoRooms();
       })
       .catch((err) => {
@@ -105,67 +150,85 @@ export function IndoorMapView({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [buildingName, level]);
+  }, [buildingName, selectedLevel]);
 
   // -------------------------------------------------------------------------
   // GeoJSON assembly
   // -------------------------------------------------------------------------
 
-  const { roomsGeoJSON, corridorsGeoJSON } = useMemo(() => {
-    if (!areas || areas.length === 0) {
-      return { roomsGeoJSON: null, corridorsGeoJSON: null };
-    }
-
-    const rooms = [];
-    const corridors = [];
-
+  const roomsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
     for (const area of areas) {
-      const ring = (area.boundary || []).map((p) => [p.lon, p.lat]);
-      if (ring.length === 0) continue;
-      const first = ring[0];
-      const last = ring[ring.length - 1];
-      if (first[0] !== last[0] || first[1] !== last[1]) {
-        ring.push([first[0], first[1]]);
-      }
-
-      const feature = {
-        type: 'Feature',
-        properties: {
-          id: area.id,
-          name: area.name || '',
-          ref: area.ref || '',
-          type: area.type,
-          level: area.level,
-        },
-        geometry: {
-          type: 'Polygon',
-          coordinates: [ring],
-        },
-      };
-
-      if (area.type === 'corridor') corridors.push(feature);
-      else rooms.push(feature);
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
     }
-
-    return {
-      roomsGeoJSON: { type: 'FeatureCollection', features: rooms },
-      corridorsGeoJSON: { type: 'FeatureCollection', features: corridors },
-    };
+    return { type: 'FeatureCollection', features };
   }, [areas]);
 
-  const routeGeoJSON = useMemo(() => {
-    if (!routeGeometry || routeGeometry.length < 2) return null;
-    return {
-      type: 'Feature',
-      properties: {},
-      geometry: {
-        type: 'LineString',
-        coordinates: routeGeometry.map((p) => [p.lon, p.lat]),
-      },
-    };
-  }, [routeGeometry]);
+  const corridorsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'corridor') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
 
-  // Camera fit — compute a bounding box from areas and route.
+  // Route split — solid for current floor, dashed for other floors.
+  //
+  // The input is [{lat, lon, level}, ...]. We walk it and group
+  // consecutive points by whether they match the selected level.
+  // Each group becomes a LineString feature tagged with `dashed`.
+  const { routeSolidGeoJSON, routeDashedGeoJSON } = useMemo(() => {
+    if (!routeByLevel || routeByLevel.length === 0) {
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+    if (routeByLevel.length === 1) {
+      // A single point isn't a line. Skip.
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+
+    const segments = [];
+    let current = null;
+
+    for (const pt of routeByLevel) {
+      const matches = pt.level === selectedLevel;
+      if (!current || current.matches !== matches) {
+        if (current && current.points.length >= 2) segments.push(current);
+        current = { matches, points: [[pt.lon, pt.lat]] };
+      } else {
+        current.points.push([pt.lon, pt.lat]);
+      }
+    }
+    if (current && current.points.length >= 2) segments.push(current);
+
+    const solid = [];
+    const dashed = [];
+    for (const seg of segments) {
+      const feature = {
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: seg.points },
+      };
+      if (seg.matches) solid.push(feature);
+      else dashed.push(feature);
+    }
+
+    return {
+      routeSolidGeoJSON:
+        solid.length > 0 ? { type: 'FeatureCollection', features: solid } : null,
+      routeDashedGeoJSON:
+        dashed.length > 0 ? { type: 'FeatureCollection', features: dashed } : null,
+    };
+  }, [routeByLevel, selectedLevel]);
+
+  // Camera fit whenever the displayed floor's areas change.
   useEffect(() => {
     if (!cameraRef.current) return;
     if (loading) return;
@@ -176,11 +239,6 @@ export function IndoorMapView({
         for (const p of area.boundary || []) {
           points.push([p.lon, p.lat]);
         }
-      }
-    }
-    if (routeGeometry) {
-      for (const p of routeGeometry) {
-        points.push([p.lon, p.lat]);
       }
     }
     if (points.length === 0) return;
@@ -197,9 +255,7 @@ export function IndoorMapView({
     const span = Math.max(east - west, north - south);
 
     let zoom = 17;
-    if (span > 0) {
-      zoom = 15 + Math.log2(0.0015 / span);
-    }
+    if (span > 0) zoom = 15 + Math.log2(0.0015 / span);
     zoom = Math.max(15, Math.min(20, zoom));
 
     const timeout = setTimeout(() => {
@@ -215,7 +271,7 @@ export function IndoorMapView({
     }, 100);
 
     return () => clearTimeout(timeout);
-  }, [areas, routeGeometry, loading]);
+  }, [areas, loading]);
 
   // -------------------------------------------------------------------------
   // Render
@@ -243,6 +299,15 @@ export function IndoorMapView({
     ? [firstCentroid.lon, firstCentroid.lat]
     : [0, 0];
 
+  // The "you are here" dot is shown only when the displayed floor
+  // matches the current step's floor. Otherwise it would be in the
+  // wrong place.
+  const showYouAreHere =
+    currentStepPoint && currentStepLevel === selectedLevel;
+
+  const showSwitcher =
+    settings.showFloorSwitcher !== false && availableLevels.length > 1;
+
   return (
     <View style={[styles.container, style]}>
       <MapView
@@ -262,42 +327,28 @@ export function IndoorMapView({
           }}
         />
 
-        {/* Corridors first, so rooms sit on top. */}
         {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
           <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
             <FillLayer
               id="corridorsFill"
-              style={{
-                fillColor: '#e2e8f0',
-                fillOpacity: 1,
-              }}
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
             />
             <LineLayer
               id="corridorsOutline"
-              style={{
-                lineColor: '#cbd5e1',
-                lineWidth: 0.5,
-              }}
+              style={{ lineColor: '#cbd5e1', lineWidth: 0.5 }}
             />
           </ShapeSource>
         ) : null}
 
-        {/* Rooms. */}
         {roomsGeoJSON && roomsGeoJSON.features.length > 0 ? (
           <ShapeSource id="roomsSource" shape={roomsGeoJSON}>
             <FillLayer
               id="roomsFill"
-              style={{
-                fillColor: '#ffffff',
-                fillOpacity: 1,
-              }}
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
             />
             <LineLayer
               id="roomsOutline"
-              style={{
-                lineColor: '#94a3b8',
-                lineWidth: 0.75,
-              }}
+              style={{ lineColor: '#94a3b8', lineWidth: 0.75 }}
             />
             <SymbolLayer
               id="roomsLabels"
@@ -315,11 +366,28 @@ export function IndoorMapView({
           </ShapeSource>
         ) : null}
 
-        {/* Route line on top of everything. */}
-        {routeGeoJSON ? (
-          <ShapeSource id="indoorRouteSource" shape={routeGeoJSON}>
+        {/* Dashed — route on other floors. Drawn first so solid sits on top. */}
+        {routeDashedGeoJSON ? (
+          <ShapeSource id="indoorRouteDashedSource" shape={routeDashedGeoJSON}>
             <LineLayer
-              id="indoorRouteLine"
+              id="indoorRouteDashedLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 3,
+                lineCap: 'round',
+                lineJoin: 'round',
+                lineOpacity: 0.4,
+                lineDasharray: [4, 4],
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* Solid — route on the displayed floor. */}
+        {routeSolidGeoJSON ? (
+          <ShapeSource id="indoorRouteSolidSource" shape={routeSolidGeoJSON}>
+            <LineLayer
+              id="indoorRouteSolidLine"
               style={{
                 lineColor: '#2563eb',
                 lineWidth: 4,
@@ -334,16 +402,97 @@ export function IndoorMapView({
         {destination ? (
           <MarkerView
             coordinate={[destination.lon, destination.lat]}
-            anchor={{ x: 0.5, y: 1.0 }}
+            anchor={{ x: 0.5, y: 0.5 }}
           >
             <View style={styles.destMarkerOuter}>
               <View style={styles.destMarkerInner} />
             </View>
           </MarkerView>
         ) : null}
+
+        {/* You are here dot. Only shown when the displayed floor
+            matches the current step's floor. */}
+        {showYouAreHere ? (
+          <MarkerView
+            coordinate={[currentStepPoint.lon, currentStepPoint.lat]}
+            anchor={{ x: 0.5, y: 0.5 }}
+          >
+            <View style={styles.userDot} />
+          </MarkerView>
+        ) : null}
       </MapView>
+
+      {/* Floor switcher. Vertical chips on the right edge. */}
+      {showSwitcher ? (
+        <View style={styles.switcherContainer}>
+          {availableLevels.map((lvl) => {
+            const active = lvl === selectedLevel;
+            const isStepLevel = lvl === currentStepLevel;
+            return (
+              <TouchableOpacity
+                key={lvl}
+                style={[
+                  styles.switcherChip,
+                  active && styles.switcherChipActive,
+                ]}
+                onPress={() => {
+                  setSelectedLevel(lvl);
+                  setManuallyChosen(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel={`Floor ${levelLabel(lvl)}`}
+                accessibilityState={{ selected: active }}
+              >
+                <Text
+                  style={[
+                    styles.switcherChipText,
+                    active && styles.switcherChipTextActive,
+                  ]}
+                >
+                  {levelLabel(lvl)}
+                </Text>
+                {isStepLevel && !active ? (
+                  <View style={styles.stepLevelDot} />
+                ) : null}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      ) : null}
     </View>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function _closedRing(boundary) {
+  if (!boundary || boundary.length === 0) return null;
+  const ring = boundary.map((p) => [p.lon, p.lat]);
+  const first = ring[0];
+  const last = ring[ring.length - 1];
+  if (first[0] !== last[0] || first[1] !== last[1]) {
+    ring.push([first[0], first[1]]);
+  }
+  return ring;
+}
+
+function _polygonFeature(area, ring) {
+  return {
+    type: 'Feature',
+    properties: {
+      id: area.id,
+      name: area.name || '',
+      ref: area.ref || '',
+      type: area.type,
+      level: area.level,
+    },
+    geometry: {
+      type: 'Polygon',
+      coordinates: [ring],
+    },
+  };
 }
 
 const styles = StyleSheet.create({
@@ -372,5 +521,50 @@ const styles = StyleSheet.create({
     backgroundColor: '#dc2626',
     borderWidth: 2,
     borderColor: '#ffffff',
+  },
+  userDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#2563eb',
+    borderWidth: 3,
+    borderColor: '#ffffff',
+  },
+  switcherContainer: {
+    position: 'absolute',
+    right: SPACING.md,
+    top: '40%',
+    backgroundColor: 'rgba(255, 255, 255, 0.85)',
+    borderRadius: RADIUS.md,
+    paddingVertical: SPACING.xs,
+    paddingHorizontal: 4,
+  },
+  switcherChip: {
+    width: 40,
+    height: 40,
+    borderRadius: RADIUS.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  switcherChipActive: {
+    backgroundColor: COLORS.primaryDark,
+  },
+  switcherChipText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.text,
+  },
+  switcherChipTextActive: {
+    color: '#ffffff',
+  },
+  stepLevelDot: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.primary,
   },
 });

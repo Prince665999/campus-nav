@@ -8,6 +8,7 @@ Reads map.osm once and writes:
 
 Then reads final.osm and writes:
   - one row per door node       → places (kind="indoor")
+  - one row per entrance node   → places (kind="entrance")
   - one row per indoor polygon  → indoor_areas (rooms and corridors)
   - one row per walkable edge   → indoor_path_edges
 
@@ -15,12 +16,8 @@ Run:
     python -m backend.pipeline.ingest
     python -m backend.pipeline.ingest path/to/other.osm
 
-The first run creates the schema and populates it. Subsequent runs
-either upsert (safe, preserves manual edits) or replace everything
-(destructive, controlled by INGEST_REPLACE).
-
-Uses campus_graph.py for parsing and graph building rather than
-re-implementing it. Never edits the frozen file.
+Uses campus_graph.py for parsing and graph building. Never edits the
+frozen file.
 """
 
 import sys
@@ -197,12 +194,9 @@ def ingest_path_edges(nodes, ways, session):
 # Indoor ingestion
 # ---------------------------------------------------------------------------
 
-# Same walkable set the frozen indoor engine uses.
 _INDOOR_WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
 _INDOOR_STAIRS_HIGHWAY = "steps"
 
-# Polygon types we save into indoor_areas. Both are drawn on the
-# phone's floor plan.
 _INDOOR_POLYGON_TYPES = {"room", "corridor"}
 
 
@@ -210,17 +204,24 @@ def _is_door(tags):
     return bool(tags.get("door")) or tags.get("indoor") == "door"
 
 
+def _is_entrance(tags):
+    return bool(tags.get("entrance"))
+
+
 def ingest_indoor_places(nodes, ways, session):
     """
-    Write one Place row per door node, one IndoorArea row per room
-    or corridor polygon, and one IndoorPathEdge row per walkable edge.
+    Write one Place row per door node, one Place row per entrance
+    node, one IndoorArea row per room or corridor polygon, and one
+    IndoorPathEdge row per walkable edge.
 
-    Returns a dict of counts: {"places": n, "areas": n, "edges": n}.
+    Returns a dict of counts.
     """
     door_node_ids = {nid for nid, d in nodes.items() if _is_door(d["tags"])}
+    entrance_node_ids = {
+        nid for nid, d in nodes.items() if _is_entrance(d["tags"])
+    }
 
     # ---- Places: one per door node ----
-    # Also build a door -> room-name map from the room polygons.
     rooms_of_door: dict[str, list[str]] = {}
     for way in ways:
         tags = way["tags"]
@@ -246,6 +247,10 @@ def ingest_indoor_places(nodes, ways, session):
         if level is not None:
             level = str(level).split(";")[0]
 
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
         room_names = rooms_of_door.get(nid, [])
         room_name = "; ".join(sorted(set(room_names))) if room_names else None
 
@@ -258,12 +263,54 @@ def ingest_indoor_places(nodes, ways, session):
         existing.lat = node["lat"]
         existing.lon = node["lon"]
         existing.kind = "indoor"
+        existing.building_name = building_name
         existing.level = level
         existing.room_name = room_name
         existing.ref = tags.get("ref") or existing.ref
         existing.description_ai = tags.get("description") or existing.description_ai
 
         places_written += 1
+
+    # ---- Places: one per entrance node ----
+    entrances_written = 0
+    for nid in entrance_node_ids:
+        node = nodes[nid]
+        tags = node["tags"]
+
+        # Skip doors that are ALSO tagged as entrances — they're
+        # already in the places table as kind="indoor". We don't want
+        # two rows for the same node.
+        if nid in door_node_ids:
+            continue
+
+        name = (tags.get("name") or tags.get("ref") or "").strip()
+        if not name:
+            # Use the entrance type as a fallback name.
+            name = f"entrance {nid}"
+
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
+        level = tags.get("level")
+        if level is not None:
+            level = str(level).split(";")[0]
+
+        existing = session.query(Place).filter_by(osm_id=nid).one_or_none()
+        if existing is None:
+            existing = Place(osm_type="node", osm_id=nid, kind="entrance")
+            session.add(existing)
+
+        existing.name = name
+        existing.lat = node["lat"]
+        existing.lon = node["lon"]
+        existing.kind = "entrance"
+        existing.building_name = building_name
+        existing.level = level
+        existing.ref = tags.get("ref") or existing.ref
+        existing.description_ai = tags.get("description") or existing.description_ai
+
+        entrances_written += 1
 
     # ---- Indoor areas: rooms and corridors ----
     areas_written = 0
@@ -274,8 +321,6 @@ def ingest_indoor_places(nodes, ways, session):
             continue
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
-        # Corridors often have no name. Give them a placeholder so the
-        # column stays not-null.
         if not rname:
             rname = "corridor" if polygon_type == "corridor" else "unnamed"
 
@@ -283,7 +328,6 @@ def ingest_indoor_places(nodes, ways, session):
         if len(refs) < 3:
             continue
 
-        # WKT polygon. Closes the ring if needed.
         coords = ", ".join(
             f"{nodes[r]['lon']} {nodes[r]['lat']}" for r in refs
         )
@@ -299,14 +343,10 @@ def ingest_indoor_places(nodes, ways, session):
         if level is not None:
             level = str(level).split(";")[0]
 
-        # Building name tag — you add this in JOSM on every room and
-        # corridor way. Nullable so untagged polygons don't break.
         building_name = tags.get("building_name")
         if building_name:
             building_name = building_name.strip() or None
 
-        # Door node: the first door shared between this polygon and
-        # the walkable network, if any. Corridors usually have none.
         shared_doors = [r for r in way["refs"] if r in door_node_ids]
         door_node_id = shared_doors[0] if shared_doors else None
 
@@ -381,6 +421,7 @@ def ingest_indoor_places(nodes, ways, session):
 
     return {
         "places": places_written,
+        "entrances": entrances_written,
         "areas": areas_written,
         "edges": edges_written,
     }
@@ -433,14 +474,16 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         print(f"\nReading indoor map {indoor_osm_path} ...")
         if not indoor_osm_path.exists():
             print(f"  indoor map not found at {indoor_osm_path} — skipping")
-            n_indoor_places = n_indoor_areas = n_indoor_edges = 0
+            n_indoor_places = n_entrances = n_indoor_areas = n_indoor_edges = 0
         else:
             indoor_nodes, indoor_ways = parse_osm(str(indoor_osm_path))
             counts = ingest_indoor_places(indoor_nodes, indoor_ways, session)
             n_indoor_places = counts["places"]
+            n_entrances = counts["entrances"]
             n_indoor_areas = counts["areas"]
             n_indoor_edges = counts["edges"]
             print(f"  indoor door places: {n_indoor_places}")
+            print(f"  indoor entrances: {n_entrances}")
             print(f"  indoor rooms + corridors: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
@@ -450,6 +493,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         "areas": n_areas,
         "edges": n_edges,
         "indoor_places": n_indoor_places,
+        "entrances": n_entrances,
         "indoor_areas": n_indoor_areas,
         "indoor_edges": n_indoor_edges,
     }

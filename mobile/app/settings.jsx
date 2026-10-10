@@ -89,6 +89,16 @@ export default function SettingsScreen() {
             accessibilityLabel={t('settings.indoorNavigation')}
           />
         </Row>
+        <Row
+          label={t('settings.floorSwitcher')}
+          description={t('settings.floorSwitcherDescription')}
+        >
+          <Switch
+            value={settings.showFloorSwitcher}
+            onValueChange={(v) => updateSetting('showFloorSwitcher', v)}
+            accessibilityLabel={t('settings.floorSwitcher')}
+          />
+        </Row>
       </Section>
 
       <Section title={t('settings.wifi')}>
@@ -121,7 +131,7 @@ export default function SettingsScreen() {
 
       <View style={styles.footer}>
         <Text style={styles.footerText}>
-          {t('settings.version', { version: '0.19.0' })}
+          {t('settings.version', { version: '0.20.0' })}
         </Text>
       </View>
     </ScrollView>

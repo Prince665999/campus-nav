@@ -30,10 +30,26 @@
   },
   "start": {
     "title": "Unaanza kutoka wapi?",
-    "subtitle": "Hatukuweza kupata mahali ulipo. Chagua mahali pa kuanzia.",
+    "subtitle": "Chagua mahali pa kuanzia, au tumia mahali ulipo sasa.",
     "findingLocation": "Inatafuta mahali ulipo…",
     "noPlaces": "Hakuna mahali panapatikana. Jaribu tena.",
-    "couldNotResolve": "Hatukuweza kubaini pa kuanzia."
+    "couldNotResolve": "Hatukuweza kubaini pa kuanzia.",
+    "permissionDenied": "Ruhusa ya mahali inahitajika kukuelekeza.",
+    "chipMyLocation": "Kutoka: Mahali nilipo",
+    "chipFromPlace": "Kutoka: {name}",
+    "optionUseGps": "Tumia mahali nilipo sasa",
+    "optionPickPlace": "Chagua mahali pa kuanzia",
+    "optionImInside": "Niko ndani ya jengo",
+    "pickPlaceTitle": "Chagua mahali pa kuanzia",
+    "pickPlaceSubtitle": "Gusa mahali ili kuanzia hapo.",
+    "areYouInsideNamed": "Uko ndani ya {name}?",
+    "areYouInsideUnnamed": "Uko ndani ya jengo?",
+    "areYouInsideBody": "GPS yako haiwezi kutujulisha kwa uhakika.",
+    "areYouInsideYes": "Ndiyo, niko ndani",
+    "areYouInsideNo": "Hapana, niko nje",
+    "doorPickerTitle": "Chagua mlango wa kuanzia",
+    "doorPickerSearchPlaceholder": "Tafuta kwa jina la mlango…",
+    "doorPickerEmpty": "Hakuna milango kwenye jengo hili bado."
   },
   "place": {
     "takeMeThere": "Nipeleke hapo",
@@ -56,7 +72,10 @@
     "estimatedTime": "Dakika {minutes}",
     "turnByTurn": "Maelekezo ya hatua kwa hatua",
     "narration": "Maelezo ya safari",
-    "noRoute": "Hakuna njia kati ya mahali hapo."
+    "noRoute": "Hakuna njia kati ya mahali hapo.",
+    "locationTooFarTitle": "Hatuwezi kubaini mahali ulipo",
+    "locationTooFarBody": "GPS yako iko mbali sana na njia za kutembea. Kama uko ndani ya jengo, chagua mlango ulio karibu nawe.",
+    "locationTooFarButton": "Chagua ulipo"
   },
   "walking": {
     "title": "Kutembea",
@@ -165,7 +184,9 @@
     "wifi": "Wi-Fi",
     "wifiNotifications": "Taarifa za Wi-Fi",
     "wifiDescription": "Onyesha arifa unapokaribia sehemu ya Wi-Fi.",
-    "version": "Campus Navigation toleo {version}"
+    "version": "Campus Navigation toleo {version}",
+    "floorSwitcher": "Kiteuzi cha sakafu",
+    "floorSwitcherDescription": "Onyesha kiteuzi cha sakafu kwenye ramani za ndani."
   },
   "categories": {
     "all": "Zote",

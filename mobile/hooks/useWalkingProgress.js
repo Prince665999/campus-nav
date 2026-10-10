@@ -32,21 +32,8 @@ export function useWalkingProgress(route) {
   const [gpsStale, setGpsStale] = useState(false);
 
   const detectorRef = useRef(createOffRouteDetector());
-
-  // The segment index of the last successful snap. Used to constrain
-  // the next snap's search to segments near where we were. On a
-  // campus with looping paths, an unconstrained search can jump to
-  // the wrong segment; at corners, the previous segment's endpoint
-  // can pin the dot. Both are fixed by preferring nearby segments.
   const lastSegmentIndexRef = useRef(null);
-
-  // Track the last time a good fix was accepted. Used by the stale
-  // fallback and by the "searching for GPS" indicator.
   const lastGoodFixAtRef = useRef(Date.now());
-
-  // The current route geometry, kept in a ref so the location
-  // callback always reads the latest without the subscription effect
-  // depending on the route object.
   const geometryRef = useRef(null);
 
   useEffect(() => {
@@ -56,7 +43,6 @@ export function useWalkingProgress(route) {
         : null;
   }, [route]);
 
-  // Ask for permission once, when the hook first mounts.
   useEffect(() => {
     let cancelled = false;
     requestPermission().then((granted) => {
@@ -73,8 +59,6 @@ export function useWalkingProgress(route) {
     route.geometry.length > 1
   );
 
-  // Subscribe to GPS updates. Depends only on whether a geometry
-  // exists, not on the route object itself.
   useEffect(() => {
     if (!permissionGranted) return;
     if (!hasGeometry) return;
@@ -97,17 +81,9 @@ export function useWalkingProgress(route) {
         const isStale = now - lastGoodFixAtRef.current > DISPLAY_STALE_FIX_MS;
         const shouldDisplay = isGoodFix || isStale;
 
-        // Off-route detection runs on EVERY fix — even ones too rough
-        // to move the dot. A noisy fix is still evidence you've
-        // drifted off the mapped path. The only gate is the looser
-        // OFF_ROUTE_MAX_ACCURACY_M, which rejects cell-tower garbage.
         const geom = geometryRef.current;
         let snapped = null;
         if (geom) {
-          // Forward-constrained snap. The `nearIndex` hint is the
-          // segment index from the last successful snap. If it's
-          // null (first fix, or the route changed) the snap does a
-          // full search.
           snapped = snapToRoute(
             { lat: loc.lat, lon: loc.lon },
             geom,
@@ -126,9 +102,6 @@ export function useWalkingProgress(route) {
         }
 
         if (!shouldDisplay) {
-          // Not a good enough fix to move the dot, but we've already
-          // updated off-route detection above. Check whether we
-          // should tell the student the GPS is degraded.
           const secondsSinceGoodFix =
             (now - lastGoodFixAtRef.current) / 1000;
           if (secondsSinceGoodFix >= DISPLAY_STALE_INDICATOR_S) {
@@ -152,7 +125,7 @@ export function useWalkingProgress(route) {
         }
       },
       () => {
-        // Location error. Subscription stays alive.
+        // Silent.
       }
     ).then((fn) => {
       if (cancelled) {
@@ -170,8 +143,6 @@ export function useWalkingProgress(route) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionGranted, hasGeometry]);
 
-  // Reset the detector and segment hint when the route object
-  // changes. A new route means the old segment index is meaningless.
   useEffect(() => {
     detectorRef.current.reset();
     lastSegmentIndexRef.current = null;
@@ -209,7 +180,6 @@ export function useWalkingProgress(route) {
     offRoute,
     progress,
     resetOffRoute,
-    // True when no good GPS fix has arrived for DISPLAY_STALE_INDICATOR_S.
     gpsStale,
   };
 }

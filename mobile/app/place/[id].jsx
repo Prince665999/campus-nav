@@ -23,6 +23,9 @@ import { setRouteRequest } from '@/services/routeRequest';
 import { PhotoCarousel } from '@/components/PhotoCarousel';
 import { ReportSheet } from '@/components/ReportSheet';
 import { StartingPointSheet } from '@/components/StartingPointSheet';
+import { DoorPickerSheet } from '@/components/DoorPickerSheet';
+import { AreYouInsideSheet } from '@/components/AreYouInsideSheet';
+import { FromChip } from '@/components/FromChip';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
@@ -40,15 +43,23 @@ export default function PlaceDetailScreen() {
   const [reportOpen, setReportOpen] = useState(false);
   const [resolvingStart, setResolvingStart] = useState(false);
 
+  const [startSheetOpen, setStartSheetOpen] = useState(false);
+  const [startSheetMode, setStartSheetMode] = useState('choose');
+  const [doorPickerOpen, setDoorPickerOpen] = useState(false);
+
   const navigatingRef = useRef(false);
 
   const {
     state: startState,
+    start,
     nearbyPlaces,
-    lastError,
+    suspiciousBuilding,
     resolveStart,
     choosePlace,
-    cancelPick,
+    confirmOutside,
+    loadOutdoorPlaces,
+    forgetStart,
+    reset: resetStart,
   } = useStartingPoint();
 
   useEffect(() => {
@@ -93,18 +104,19 @@ export default function PlaceDetailScreen() {
     }
   }, [favorited, placeId]);
 
-    const navigateToRoute = useCallback(
-    (start) => {
-      if (start.lat != null && start.lon != null) {
+  const navigateToRoute = useCallback(
+    (resolvedStart) => {
+      if (!place) return;
+      if (resolvedStart.lat != null && resolvedStart.lon != null) {
         setRouteRequest({
-          fromLat: start.lat,
-          fromLon: start.lon,
-          fromAccuracyM: start.accuracyM,
+          fromLat: resolvedStart.lat,
+          fromLon: resolvedStart.lon,
+          fromAccuracyM: resolvedStart.accuracyM,
           toId: place.id,
         });
-      } else if (start.placeId != null) {
+      } else if (resolvedStart.placeId != null) {
         setRouteRequest({
-          fromId: start.placeId,
+          fromId: resolvedStart.placeId,
           toId: place.id,
         });
       } else {
@@ -121,28 +133,124 @@ export default function PlaceDetailScreen() {
     if (navigatingRef.current) return;
     navigatingRef.current = true;
 
+    // If the student has explicitly chosen a start via the chip,
+    // use it directly.
+    if (start && start.placeId != null) {
+      navigateToRoute(start);
+      navigatingRef.current = false;
+      return;
+    }
+
     setResolvingStart(true);
     setError(null);
 
     try {
-      const start = await resolveStart({ destinationPlaceId: place.id });
+      const result = await resolveStart({ destinationPlaceId: place.id });
 
-      if (!start) {
-        if (lastError === 'permission_denied') {
-          setError(t('start.permissionDenied'));
-        }
-        setResolvingStart(false);
-        navigatingRef.current = false;
-        return;
+      switch (result.status) {
+        case 'ok':
+        case 'ok_place':
+          navigateToRoute(result.start);
+          setResolvingStart(false);
+          navigatingRef.current = false;
+          return;
+
+        case 'ask':
+          // AreYouInsideSheet will show; the student's answer
+          // drives the rest.
+          setResolvingStart(false);
+          return;
+
+        case 'pick':
+          setStartSheetMode('place-list');
+          setStartSheetOpen(true);
+          setResolvingStart(false);
+          return;
+
+        case 'denied':
+          if (result.reason === 'permission_denied') {
+            setError(t('start.permissionDenied'));
+          } else {
+            setError(t('common.error'));
+          }
+          setResolvingStart(false);
+          navigatingRef.current = false;
+          return;
+
+        default:
+          setResolvingStart(false);
+          navigatingRef.current = false;
+          return;
       }
-
-      navigateToRoute(start);
     } catch (err) {
       setError(err.message || t('common.error'));
       setResolvingStart(false);
       navigatingRef.current = false;
     }
-  }, [place, resolveStart, lastError, navigateToRoute]);
+  }, [place, start, resolveStart, navigateToRoute]);
+
+  const handleInsideYes = useCallback(() => {
+    setDoorPickerOpen(true);
+  }, []);
+
+  const handleInsideNo = useCallback(() => {
+    const resolved = confirmOutside();
+    if (resolved && place) {
+      navigateToRoute(resolved);
+    }
+    navigatingRef.current = false;
+  }, [confirmOutside, navigateToRoute, place]);
+
+  const handleInsideDismiss = useCallback(() => {
+    navigatingRef.current = false;
+    resetStart();
+  }, [resetStart]);
+
+  const handleDoorPicked = useCallback(
+    (door) => {
+      setDoorPickerOpen(false);
+      if (!place) return;
+      // The picked door IS the start. Route straight to this place.
+      setRouteRequest({
+        fromId: door.id,
+        toId: place.id,
+      });
+      router.push('/route-preview');
+    },
+    [place]
+  );
+
+  const openStartSheet = useCallback(() => {
+    setStartSheetMode('choose');
+    setStartSheetOpen(true);
+    resetStart();
+  }, [resetStart]);
+
+  const handleChoosePlace = useCallback(
+    (chosen) => {
+      if (chosen == null) {
+        setStartSheetMode('place-list');
+        if (nearbyPlaces.length === 0) {
+          loadOutdoorPlaces({ excludePlaceId: place?.id ?? null });
+        }
+        return;
+      }
+      choosePlace(chosen);
+      setStartSheetOpen(false);
+      setStartSheetMode('choose');
+    },
+    [choosePlace, nearbyPlaces.length, loadOutdoorPlaces, place]
+  );
+
+  const handleUseGps = useCallback(() => {
+    setStartSheetOpen(false);
+    forgetStart();
+  }, [forgetStart]);
+
+  const handleImInside = useCallback(() => {
+    setStartSheetOpen(false);
+    setDoorPickerOpen(true);
+  }, []);
 
   if (loading) {
     return (
@@ -229,6 +337,8 @@ export default function PlaceDetailScreen() {
           </Section>
         ) : null}
 
+        <FromChip start={start} onPress={openStartSheet} />
+
         <View style={styles.actions}>
           <TouchableOpacity
             style={[
@@ -243,7 +353,9 @@ export default function PlaceDetailScreen() {
             {resolvingStart ? (
               <View style={styles.buttonContent}>
                 <ActivityIndicator color="#ffffff" size="small" />
-                <Text style={[styles.primaryButtonText, styles.buttonTextSpaced]}>
+                <Text
+                  style={[styles.primaryButtonText, styles.buttonTextSpaced]}
+                >
                   {startState === 'locating'
                     ? t('start.findingLocation')
                     : t('common.loading')}
@@ -256,16 +368,16 @@ export default function PlaceDetailScreen() {
             )}
           </TouchableOpacity>
 
-          {error ? (
-            <Text style={styles.errorBelowButton}>{error}</Text>
-          ) : null}
+          {error ? <Text style={styles.errorBelowButton}>{error}</Text> : null}
 
           <TouchableOpacity
             style={styles.reportLink}
             onPress={() => setReportOpen(true)}
             accessibilityRole="button"
           >
-            <Text style={styles.reportLinkText}>{t('report.reportProblem')}</Text>
+            <Text style={styles.reportLinkText}>
+              {t('report.reportProblem')}
+            </Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
@@ -277,10 +389,31 @@ export default function PlaceDetailScreen() {
       />
 
       <StartingPointSheet
-        visible={startState === 'needPick'}
+        visible={startSheetOpen}
         places={nearbyPlaces}
-        onChoose={choosePlace}
-        onCancel={cancelPick}
+        mode={startSheetMode}
+        onChoose={handleChoosePlace}
+        onUseGps={handleUseGps}
+        onImInside={handleImInside}
+        onCancel={() => {
+          setStartSheetOpen(false);
+          setStartSheetMode('choose');
+        }}
+      />
+
+      <DoorPickerSheet
+        visible={doorPickerOpen}
+        buildingName={suspiciousBuilding}
+        onPick={handleDoorPicked}
+        onCancel={() => setDoorPickerOpen(false)}
+      />
+
+      <AreYouInsideSheet
+        visible={startState === 'askIndoor'}
+        buildingName={suspiciousBuilding}
+        onYes={handleInsideYes}
+        onNo={handleInsideNo}
+        onCancel={handleInsideDismiss}
       />
     </>
   );
@@ -361,10 +494,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   primaryButtonDisabled: { opacity: 0.7 },
-  buttonContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
+  buttonContent: { flexDirection: 'row', alignItems: 'center' },
   buttonTextSpaced: { marginLeft: SPACING.sm },
   primaryButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
   errorBelowButton: {

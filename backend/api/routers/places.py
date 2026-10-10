@@ -21,7 +21,16 @@ def list_places(
     category: str | None = Query(None),
     intent: str | None = Query(None, description="Substring match on intents"),
     kind: str | None = Query(
-        None, description="Filter by kind: 'outdoor' or 'indoor'"
+        None,
+        description="Filter by kind: 'outdoor', 'indoor', or 'entrance'",
+    ),
+    building_name: str | None = Query(
+        None,
+        description="Filter by building name (indoor and entrance places)",
+    ),
+    level: str | None = Query(
+        None,
+        description="Filter by level (indoor places)",
     ),
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
@@ -29,14 +38,18 @@ def list_places(
     limit: int = Query(50, gt=0, le=200),
     session: Session = Depends(db_session),
 ):
-    """List places, optionally filtered by query, category, intent,
-    kind, or proximity."""
+    """
+    List places, optionally filtered by query, category, intent, kind,
+    building, level, or proximity.
+    """
     return place_service.search_places(
         session,
         q=q,
         category=category,
         intent=intent,
         kind=kind,
+        building_name=building_name,
+        level=level,
         lat=lat,
         lon=lon,
         radius_m=radius_m,
@@ -48,12 +61,17 @@ def list_places(
 def search_places(
     q: str = Query(..., min_length=1),
     kind: str | None = Query(None),
+    building_name: str | None = Query(None),
     limit: int = Query(20, gt=0, le=100),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
     return place_service.search_places(
-        session, q=q, kind=kind, limit=limit
+        session,
+        q=q,
+        kind=kind,
+        building_name=building_name,
+        limit=limit,
     )
 
 

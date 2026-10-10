@@ -1,4 +1,13 @@
 // Route preview screen.
+//
+// Loads a route from the pending request, shows the summary and
+// steps, and starts Walking Mode.
+//
+// Recovery path: if the backend rejects the GPS fix with
+// `LocationTooFarError`, we show a single button — "Pick where you
+// are" — that opens the door picker. Picking a door replaces the
+// request's `from` with the door's place id and re-runs the route.
+// The student never leaves this screen.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -14,6 +23,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { RouteMap } from '@/components/MapView';
 import { RouteSummary } from '@/components/RouteSummary';
+import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { computeRoute, narrateRoute } from '@/services/api';
 import { takeRouteRequest, setRouteRequest } from '@/services/routeRequest';
 import { useSettings } from '@/context/SettingsContext';
@@ -25,31 +35,38 @@ export default function RoutePreviewScreen() {
   const insets = useSafeAreaInsets();
   const { settings } = useSettings();
 
-  const [request] = useState(() => takeRouteRequest());
+  // The current route request. It starts as whatever was stashed by
+  // the previous screen, and can be replaced here when the student
+  // picks a door after a LocationTooFarError.
+  const [request, setRequest] = useState(() => takeRouteRequest());
 
   const [route, setRoute] = useState(null);
   const [narration, setNarration] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [doorPickerOpen, setDoorPickerOpen] = useState(false);
 
-  const hasFrom =
-    request != null &&
-    (request.fromId != null ||
-      (request.fromLat != null && request.fromLon != null));
+  const needsIndoorPick =
+    error != null && error.code === 'LocationTooFarError';
 
+  // Load the route whenever the request changes.
   useEffect(() => {
-    if (!hasFrom) {
-      setError(
-        'This route has no starting point. Go back and try again.'
-      );
+    if (!request) {
+      setError({
+        message: 'This route has no starting point. Go back and try again.',
+        code: null,
+      });
       setLoading(false);
       return;
     }
 
     let cancelled = false;
+
     async function load() {
       setLoading(true);
       setError(null);
+      setRoute(null);
+
       try {
         const data = await computeRoute({
           fromPlaceId: request.fromId,
@@ -61,28 +78,28 @@ export default function RoutePreviewScreen() {
         if (!cancelled) setRoute(data);
       } catch (err) {
         if (!cancelled) {
-          if (err.code === 'LocationTooFarError') {
-            setError(
-              "We couldn't confidently place your location. Move to an " +
-                'open area and try again, or pick a starting place.'
-            );
-          } else {
-            setError(err.message || t('common.error'));
-          }
+          setError({
+            message:
+              err.code === 'LocationTooFarError'
+                ? "We couldn't confidently place your location."
+                : err.message || t('common.error'),
+            code: err.code || null,
+          });
         }
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
+
     load();
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasFrom]);
+  }, [request]);
 
+  // Load narration whenever the route changes.
   useEffect(() => {
-    if (!hasFrom) return;
+    if (!route || !request) return;
     let cancelled = false;
     async function load() {
       try {
@@ -103,8 +120,7 @@ export default function RoutePreviewScreen() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasFrom, settings.language]);
+  }, [route, request, settings.language]);
 
   const startWalking = useCallback(() => {
     if (!route || !request) return;
@@ -123,22 +139,83 @@ export default function RoutePreviewScreen() {
     });
   }, [route, request]);
 
+  const handleDoorPicked = useCallback(
+    (door) => {
+      setDoorPickerOpen(false);
+      // Replace the request's from side with the picked door. The
+      // failed GPS fix is dropped.
+      setRequest({
+        fromId: door.id,
+        fromLat: null,
+        fromLon: null,
+        fromAccuracyM: null,
+        toId: request?.toId ?? null,
+      });
+    },
+    [request]
+  );
+
+  // ---- Loading ----
   if (loading) {
     return (
-      <View style={styles.state}>
-        <ActivityIndicator color={COLORS.textMuted} />
-      </View>
+      <>
+        <Stack.Screen options={{ title: t('route.title') }} />
+        <View style={styles.state}>
+          <ActivityIndicator color={COLORS.textMuted} />
+        </View>
+      </>
     );
   }
 
+  // ---- Recovery: the backend couldn't place the GPS fix ----
+  if (needsIndoorPick) {
+    return (
+      <>
+        <Stack.Screen options={{ title: t('route.title') }} />
+        <View style={styles.state}>
+          <Text style={styles.stateTitle}>
+            {t('route.locationTooFarTitle')}
+          </Text>
+          <Text style={styles.stateBody}>
+            {t('route.locationTooFarBody')}
+          </Text>
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={() => setDoorPickerOpen(true)}
+            accessibilityRole="button"
+            accessibilityLabel={t('route.locationTooFarButton')}
+          >
+            <Text style={styles.primaryButtonText}>
+              {t('route.locationTooFarButton')}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <DoorPickerSheet
+          visible={doorPickerOpen}
+          buildingName={null}
+          onPick={handleDoorPicked}
+          onCancel={() => setDoorPickerOpen(false)}
+        />
+      </>
+    );
+  }
+
+  // ---- Any other error ----
   if (error || !route) {
     return (
-      <View style={styles.state}>
-        <Text style={styles.errorText}>{error || t('route.noRoute')}</Text>
-      </View>
+      <>
+        <Stack.Screen options={{ title: t('route.title') }} />
+        <View style={styles.state}>
+          <Text style={styles.errorText}>
+            {error?.message || t('route.noRoute')}
+          </Text>
+        </View>
+      </>
     );
   }
 
+  // ---- Normal preview ----
   const seconds = estimateWalkingSeconds(route.distance_m);
 
   const markers = [
@@ -202,7 +279,9 @@ export default function RoutePreviewScreen() {
             accessibilityRole="button"
             accessibilityLabel={t('route.startButton')}
           >
-            <Text style={styles.primaryButtonText}>{t('route.startButton')}</Text>
+            <Text style={styles.primaryButtonText}>
+              {t('route.startButton')}
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -217,12 +296,27 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.backgroundSubtle,
+    padding: SPACING.xl,
+  },
+  stateTitle: {
+    fontSize: FONT_SIZE.large,
+    fontWeight: '700',
+    color: COLORS.text,
+    textAlign: 'center',
+    marginBottom: SPACING.md,
+  },
+  stateBody: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    textAlign: 'center',
+    lineHeight: 22,
+    marginBottom: SPACING.lg,
   },
   errorText: {
     color: COLORS.danger,
     fontSize: FONT_SIZE.body,
     textAlign: 'center',
-    padding: 20,
+    padding: SPACING.lg,
   },
   map: { height: 280 },
   body: { flex: 1 },
@@ -261,6 +355,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primaryDark,
     borderRadius: RADIUS.md,
     paddingVertical: 16,
+    paddingHorizontal: SPACING.xl,
     minHeight: TOUCH.minHeight,
     alignItems: 'center',
     justifyContent: 'center',

@@ -30,10 +30,26 @@
   },
   "start": {
     "title": "Where are you starting from?",
-    "subtitle": "We couldn't find your location. Pick a place to start from.",
+    "subtitle": "Pick a starting point, or use your current location.",
     "findingLocation": "Finding your location…",
     "noPlaces": "No places available. Try again.",
-    "couldNotResolve": "Couldn't work out where to start from."
+    "couldNotResolve": "Couldn't work out where to start from.",
+    "permissionDenied": "Location permission is needed to guide you.",
+    "chipMyLocation": "From: My location",
+    "chipFromPlace": "From: {name}",
+    "optionUseGps": "Use my current location",
+    "optionPickPlace": "Pick a starting place",
+    "optionImInside": "I'm inside a building",
+    "pickPlaceTitle": "Pick a starting place",
+    "pickPlaceSubtitle": "Tap a place to start from it.",
+    "areYouInsideNamed": "Are you inside {name}?",
+    "areYouInsideUnnamed": "Are you inside a building?",
+    "areYouInsideBody": "Your GPS can't tell us for sure.",
+    "areYouInsideYes": "Yes, I'm inside",
+    "areYouInsideNo": "No, I'm outside",
+    "doorPickerTitle": "Pick your starting door",
+    "doorPickerSearchPlaceholder": "Search by door name…",
+    "doorPickerEmpty": "No doors in this building yet."
   },
   "place": {
     "takeMeThere": "Take me there",
@@ -56,7 +72,10 @@
     "estimatedTime": "About {minutes} min",
     "turnByTurn": "Turn by turn",
     "narration": "Walk description",
-    "noRoute": "No route found between those places."
+    "noRoute": "No route found between those places.",
+    "locationTooFarTitle": "We can't place your location",
+    "locationTooFarBody": "Your GPS fix is too far from the walkable paths. If you're inside a building, pick the door you're nearest to.",
+    "locationTooFarButton": "Pick where you are"
   },
   "walking": {
     "title": "Walking",
@@ -165,7 +184,9 @@
     "wifi": "Wi-Fi",
     "wifiNotifications": "Wi-Fi notifications",
     "wifiDescription": "Show a banner when you're near a mapped Wi-Fi spot.",
-    "version": "Campus Navigation v{version}"
+    "version": "Campus Navigation v{version}",
+    "floorSwitcher": "Floor switcher",
+    "floorSwitcherDescription": "Show the floor selector on indoor maps."
   },
   "categories": {
     "all": "All",

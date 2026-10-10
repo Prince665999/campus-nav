@@ -2,6 +2,10 @@
 
 import { API_BASE_URL, API_TIMEOUT_MS } from '@/constants/config';
 import { getDeviceId } from '@/services/session';
+import {
+  getCachedFloor,
+  setCachedFloor,
+} from '@/services/indoorCache';
 
 export async function request(path, options = {}) {
   const url = API_BASE_URL + path;
@@ -66,12 +70,25 @@ export async function searchPlaces(q, { limit = 20 } = {}) {
   return request(`/api/places/search?${params.toString()}`);
 }
 
-export async function listPlaces({ q, category, intent, kind, lat, lon, radius_m, limit } = {}) {
+export async function listPlaces({
+  q,
+  category,
+  intent,
+  kind,
+  building_name,
+  level,
+  lat,
+  lon,
+  radius_m,
+  limit,
+} = {}) {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (category) params.set('category', category);
   if (intent) params.set('intent', intent);
   if (kind) params.set('kind', kind);
+  if (building_name) params.set('building_name', building_name);
+  if (level != null) params.set('level', String(level));
   if (lat != null) params.set('lat', String(lat));
   if (lon != null) params.set('lon', String(lon));
   if (radius_m != null) params.set('radius_m', String(radius_m));
@@ -295,24 +312,54 @@ export async function getNearbyWifi({ lat, lon, r = 25 } = {}) {
 // Indoor floor plans
 // ---------------------------------------------------------------
 
-/**
- * Fetch the rooms and corridors for one floor of one building.
- *
- * Used by the walking screen when the current step is indoor.
- * Returns { building_name, level, areas: [...] }.
- *
- * Each area has { id, osm_id, name, ref, type, level,
- * door_node_id, boundary: [{lat, lon}], centroid: {lat, lon} }.
- *
- * If the building or level has no polygons yet, `areas` is empty
- * and the caller falls back to the indoor placeholder.
- */
 export async function getIndoorAreas({ buildingName, level }) {
+  const cached = await getCachedFloor(buildingName, level);
+  if (cached) return cached;
+
   const params = new URLSearchParams({
     building_name: buildingName,
     level: String(level),
   });
-  return request(`/api/indoor/areas?${params.toString()}`);
+  const data = await request(`/api/indoor/areas?${params.toString()}`);
+
+  setCachedFloor(buildingName, level, data).catch(() => {});
+
+  return data;
+}
+
+// ---------------------------------------------------------------
+// Entrances (for the "are you inside?" trigger)
+// ---------------------------------------------------------------
+
+/**
+ * All building entrances. Used by the starting-point logic to work
+ * out whether a GPS fix is close enough to an entrance that the
+ * student might actually be inside.
+ */
+export async function listEntrances() {
+  return listPlaces({ kind: 'entrance', limit: 200 });
+}
+
+// ---------------------------------------------------------------
+// Indoor doors (for the door picker)
+// ---------------------------------------------------------------
+
+/**
+ * Indoor door nodes. Used by the door picker to let the student
+ * declare which door they're starting from.
+ *
+ * Pass `buildingName` to narrow to one building.
+ *
+ * The backend caps /api/places at limit=200, so we stay under that.
+ * A single building has far fewer than 200 doors; if a caller ever
+ * needs more, they'd need a dedicated endpoint.
+ */
+export async function listIndoorDoors({ buildingName } = {}) {
+  return listPlaces({
+    kind: 'indoor',
+    building_name: buildingName || undefined,
+    limit: 200,
+  });
 }
 
 // ---------------------------------------------------------------

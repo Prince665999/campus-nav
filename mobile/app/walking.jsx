@@ -68,7 +68,6 @@ export default function WalkingScreen() {
 
   const destinationId = routeRequestRef.current?.toId ?? null;
 
-  // Load the route if it wasn't passed in.
   useState(() => {
     if (route) return;
     if (!destinationId) {
@@ -131,12 +130,15 @@ export default function WalkingScreen() {
     mode,
     advanceStep,
     isLastStep,
-    // Indoor-specific:
     indoorLevel,
     indoorBuildingName,
     indoorGeometry,
+    indoorGeometryByLevel,
     indoorDestination,
-  } = useRouteProgress(route);
+    currentStepGeometryPoint,
+  } = useRouteProgress(route, {
+    startedFromPlace: routeRequestRef.current?.fromId != null,
+  });
 
   const { heading } = useCompass({ position: rawPosition });
 
@@ -440,7 +442,10 @@ export default function WalkingScreen() {
             indoorBuildingName={indoorBuildingName}
             indoorLevel={indoorLevel}
             indoorGeometry={indoorGeometry}
+            indoorGeometryByLevel={indoorGeometryByLevel}
             indoorDestination={indoorDestination}
+            currentStepPoint={currentStepGeometryPoint}
+            currentStepLevel={indoorLevel}
             style={styles.map}
           />
         </View>

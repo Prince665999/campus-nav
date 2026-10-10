@@ -3,6 +3,11 @@ Tests for the ingestion pipeline.
 
 Uses the synthetic maps from the core tests as input so the pipeline
 is exercised on a known, deterministic map.
+
+The tests pass an explicit `indoor_osm_path` that doesn't exist, so
+the indoor ingest is skipped. Without this, the real final.osm is
+ingested alongside the synthetic outdoor map, and the assertions on
+total row counts fail.
 """
 
 import pytest
@@ -14,6 +19,11 @@ from backend.core.tests.fixtures.synthetic_maps import (
 )
 
 
+def _outdoor_only(tmp_path):
+    """A path that doesn't exist, used to skip indoor ingest."""
+    return tmp_path / "no_indoor.osm"
+
+
 class TestIngestBasic:
     def test_ingest_creates_places(self, temp_db, tmp_path):
         from backend.api.db.session import session_scope
@@ -21,7 +31,11 @@ class TestIngestBasic:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             names = sorted(p.name for p in session.query(Place).all())
@@ -33,7 +47,11 @@ class TestIngestBasic:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             edges = session.query(PathEdge).all()
@@ -46,7 +64,11 @@ class TestIngestBasic:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(PATH_WITH_BUILDING_EAST, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
 
         with session_scope() as session:
             areas = session.query(Area).all()
@@ -62,8 +84,16 @@ class TestIngestIdempotent:
         from backend.pipeline.ingest import run_ingest
 
         osm_path = write_temp_map(STRAIGHT_PATH_NORTH, tmp_path)
-        run_ingest(osm_path=osm_path, replace=True)
-        run_ingest(osm_path=osm_path, replace=False)
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=True,
+        )
+        run_ingest(
+            osm_path=osm_path,
+            indoor_osm_path=_outdoor_only(tmp_path),
+            replace=False,
+        )
 
         with session_scope() as session:
             count = session.query(Place).count()

@@ -31,6 +31,10 @@ const DEFAULT_SETTINGS = {
   // step advance). When false, the walking screen behaves as it did
   // before indoor support existed.
   indoorsEnabled: true,
+  // Whether the indoor floor plan shows the floor switcher chips
+  // (B, G, 1, 2). On by default; the student can hide it in settings
+  // if they find it distracting.
+  showFloorSwitcher: true,
 };
 
 const SettingsContext = createContext({

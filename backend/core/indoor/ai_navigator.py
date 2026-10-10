@@ -51,7 +51,7 @@ import sys
 import json
 import requests
 
-from campus_graph import (
+from backend.core.indoor.campus_graph import (
     parse_osm, build_graph, named_nodes, find_named_node,
     a_star, generate_turn_by_turn, total_distance_m, level_label,
     node_display_name, is_door, is_entrance,

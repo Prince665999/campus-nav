@@ -7,15 +7,12 @@ is a no-op.
 Safety note
 -----------
 Some of our indexes and columns were added by Alembic migrations or
-raw-SQL scripts (e.g. add_place_kind_columns.py), not by SQLAlchemy's
-metadata. `create_all` doesn't know about them and will fail with
-"index already exists" on a database that's already migrated. Since
-`create_all` aborts on the first such error, we create tables one at
-a time so a failure on one table's index doesn't stop the rest.
+raw-SQL scripts, not by SQLAlchemy's metadata. `create_all` doesn't
+know about them and will fail with "index already exists" on a
+database that's already migrated.
 
-If a table's index already exists, we catch the error, log it, and
-move on. The table itself was created (SQLite uses CREATE TABLE IF
-NOT EXISTS under the hood), so nothing is lost.
+To make this safe to run on any DB state, we create tables one at a
+time so a failure on one table's index doesn't stop the rest.
 """
 
 import logging
@@ -38,8 +35,10 @@ def init_db():
         except OperationalError as e:
             msg = str(e).lower()
             if "already exists" in msg:
-                # The table exists; only an index was redundant.
-                logger.warning(
+                # Expected on an already-migrated database. Log at
+                # debug level — this is not a problem worth warning
+                # about on every startup.
+                logger.debug(
                     "init_db: skipped duplicate index on %s (%s)",
                     table.name,
                     e,

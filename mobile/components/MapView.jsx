@@ -51,14 +51,14 @@ export function RouteMap({
   indoorBuildingName = null,
   indoorLevel = null,
   indoorGeometry = [],
+  indoorGeometryByLevel = [],
   indoorDestination = null,
+  currentStepPoint = null,
+  currentStepLevel = null,
   style,
 }) {
   const cameraRef = useRef(null);
 
-  // If the indoor view reports no rooms for the current floor, we
-  // fall back to the placeholder. Reset whenever the building or
-  // level changes.
   const [indoorNoRooms, setIndoorNoRooms] = useState(false);
 
   useEffect(() => {
@@ -82,9 +82,6 @@ export function RouteMap({
     };
   }, [routeCoords]);
 
-  // Fit the map to the route on first render and when the route
-  // changes. Only runs when the route is stable — a mid-recompute
-  // empty geometry is skipped.
   useEffect(() => {
     if (mode !== 'outdoor') return;
     if (routeCoords.length < 2 || !cameraRef.current) return;
@@ -134,9 +131,6 @@ export function RouteMap({
     return () => clearTimeout(timeout);
   }, [routeCoords, mode]);
 
-  // Single effect for real-time camera updates. Position and
-  // heading are set in one call, so the map moves and rotates
-  // atomically rather than in two separate animations.
   useEffect(() => {
     if (mode !== 'outdoor') return;
     if (!cameraRef.current) return;
@@ -159,7 +153,6 @@ export function RouteMap({
     }
   }, [userLocation, bearing, followBearing, mode]);
 
-  // Indoor mode.
   if (mode === 'indoor') {
     if (indoorNoRooms) {
       return (
@@ -173,8 +166,10 @@ export function RouteMap({
       <IndoorMapView
         buildingName={indoorBuildingName}
         level={indoorLevel}
-        routeGeometry={indoorGeometry}
+        routeByLevel={indoorGeometryByLevel}
         destination={indoorDestination}
+        currentStepPoint={currentStepPoint}
+        currentStepLevel={currentStepLevel}
         style={style}
         onNoRooms={() => setIndoorNoRooms(true)}
       />

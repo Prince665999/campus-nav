@@ -1,7 +1,7 @@
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'https://kissing-download-devon-toolkit.trycloudflare.com';
+const DEFAULT_API_BASE_URL = 'https://inspector-discuss-invalid-gratuit.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
