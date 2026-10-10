@@ -1,7 +1,7 @@
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'https://lately-glad-isp-holdem.trycloudflare.com';
+const DEFAULT_API_BASE_URL = 'https://eliminate-diana-header-excitement.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;

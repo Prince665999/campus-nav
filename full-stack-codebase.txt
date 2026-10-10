@@ -16011,9 +16011,18 @@ class RouteResponse(BaseModel):
     profile: str = "fastest"
     from_name: str
     to_name: str
+
     # Optional for backward compatibility: mobile apps that don't read
     # it will ignore it. Newer clients use it to switch rendering.
     legs: list[RouteLeg] | None = None
+
+    # The list of merged-graph node ids walked, in order. Outdoor
+    # nodes are prefixed with 'o'; indoor nodes are not. Not part of
+    # the public mobile API — the mobile client ignores it — but the
+    # narration service reads it to split the route into runs and
+    # narrate each with the right engine. Optional so old clients
+    # don't break.
+    node_path: list[str] | None = None
 
 
 class RouteParams(BaseModel):
@@ -17782,6 +17791,245 @@ def _nearest_outdoor_node(lat, lon, candidates, outdoor_nodes_raw, max_distance_
         return None
     return best_id
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\indoor_narration_service.py ---
+
+"""
+indoor_narration_service.py
+
+Wraps the frozen indoor narration engine for use by the API.
+
+The indoor engine lives in backend/core/indoor/ (ai_navigator.py and
+campus_graph.py) and is designed to be called from a script. This
+module gives it an API-shaped entry point:
+
+    narrate_indoor_run(
+        path,             # list of indoor node ids
+        nodes,            # {node_id: {lat, lon, tags}} from the merged graph
+        graph,            # indoor routing adjacency from the merged graph
+        door_node_ids,    # set of door node ids
+        start_name,
+        end_name,
+        lang="en",
+    ) -> str
+
+Behaviour, honestly:
+
+  - With a GROQ_API_KEY set, we build the prompt the frozen engine
+    wants and call Groq. The returned text is the model's narration.
+  - Without a key, or if the Groq call fails, we return the raw
+    merged steps joined into plain sentences. No invented prose. No
+    local "narration" that pretends to be more than it is.
+
+We do NOT re-run a_star. The caller has already routed on the merged
+graph and has a path. This service narrates that path — it does not
+choose a different one.
+
+We do NOT touch the frozen files. Everything imported here is read as
+is.
+"""
+
+import logging
+
+from backend.core.indoor.ai_navigator import (
+    build_prompt,
+    call_groq,
+    corridor_notes,
+    door_count_summary,
+    landmarks_along_route,
+    merge_steps_for_narration,
+    route_door_facts,
+)
+from backend.core.indoor.campus_graph import (
+    generate_turn_by_turn,
+    level_label,
+    node_display_name,
+    total_distance_m,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def narrate_indoor_run(
+    path,
+    nodes,
+    graph,
+    door_node_ids,
+    corridor_of_door,
+    start_name,
+    end_name,
+    api_key=None,
+    lang="en",
+):
+    """
+    Produce narration for one indoor run (a contiguous slice of the
+    merged route path where every node is indoor).
+
+    path:           list of indoor node ids (no 'o' prefix)
+    nodes:          dict {node_id: {"lat", "lon", "tags"}}
+    graph:          merged adjacency — we only read indoor edges here
+    door_node_ids:  set of node ids that are doors
+    corridor_of_door: dict door_id -> corridor name (may be empty)
+    start_name:     display name for the first node
+    end_name:       display name for the last node
+    api_key:        optional Groq key. If None, only the raw steps are
+                    returned (no local fallback narration).
+
+    Returns a plain string.
+
+    Raises ValueError if the path has fewer than 2 nodes — a run of
+    one node has nothing to say.
+    """
+    if not path or len(path) < 2:
+        raise ValueError("indoor run needs at least two nodes")
+
+    # The frozen engine wants a minimal graph that only contains the
+    # run's own edges. We pass the merged graph — its indoor edges are
+    # already what the engine expects, and the outdoor edges are only
+    # consulted when generating turn-by-turn for indoor nodes, which
+    # never happens for an indoor run.
+    steps = generate_turn_by_turn(path, nodes, graph, door_node_ids, corridor_of_door)
+
+    start_tags = nodes[path[0]].get("tags", {}) or {}
+    end_tags = nodes[path[-1]].get("tags", {}) or {}
+
+    resolved_start = node_display_name(start_tags) or start_name or "your starting point"
+    resolved_end = node_display_name(end_tags) or end_name or "your destination"
+
+    start_level = str(start_tags.get("level", "0")).split(";")[0]
+    end_level = str(end_tags.get("level", "0")).split(";")[0]
+
+    total_m = total_distance_m(path, nodes)
+
+    # If there's no API key, the raw steps are the whole story. This
+    # is the deliberate no-fallback policy: we do not invent a
+    # narration. The student gets the same text the CLI tool prints.
+    if not api_key:
+        return _steps_to_plain_text(steps)
+
+    # Door facts and landmarks — same as the CLI path.
+    try:
+        door_facts = route_door_facts(path, nodes, graph, door_node_ids)
+    except Exception as e:
+        logger.warning("door fact analysis failed: %s", e)
+        door_facts = None
+
+    try:
+        landmarks = landmarks_along_route(path, nodes, door_node_ids, graph, door_facts)
+    except Exception as e:
+        logger.warning("landmark analysis failed: %s", e)
+        landmarks = []
+
+    try:
+        notes = corridor_notes(path, nodes, corridor_of_door, graph)
+    except Exception as e:
+        logger.warning("corridor notes failed: %s", e)
+        notes = []
+
+    prompt = build_prompt(
+        resolved_start,
+        resolved_end,
+        start_level,
+        end_level,
+        total_m,
+        steps,
+        landmarks,
+        notes,
+        door_facts,
+    )
+
+    try:
+        text = call_groq(prompt, api_key)
+    except Exception as e:
+        logger.warning("indoor Groq call failed, returning raw steps: %s", e)
+        return _steps_to_plain_text(steps)
+
+    if not text or not text.strip():
+        return _steps_to_plain_text(steps)
+
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Raw-steps fallback
+# ---------------------------------------------------------------------------
+
+def _steps_to_plain_text(steps):
+    """
+    Turn the frozen engine's step list into readable plain text.
+
+    The frozen engine's merge_steps_for_narration already joins
+    adjacent "turn, then walk" pairs and cancels double turn-arounds.
+    We use it, then join the moves with periods.
+
+    This is not a narration. It is the instructions, spoken plainly.
+    The point is to be honest: if there is no model, there is no
+    prose.
+    """
+    if not steps:
+        return ""
+
+    try:
+        moves = merge_steps_for_narration(steps)
+    except Exception:
+        moves = [s.get("instruction", "") for s in steps if s.get("instruction")]
+
+    if not moves:
+        return ""
+
+    sentences = []
+    for move in moves:
+        text = (move or "").strip()
+        if not text:
+            continue
+        if not text.endswith((".", "!", "?")):
+            text = text + "."
+        # Capitalise the first letter of each move.
+        text = text[0].upper() + text[1:]
+        sentences.append(text)
+
+    return " ".join(sentences)
+
+
+def describe_door_count(door_facts):
+    """
+    Human-readable door-count summary. Kept here so tests and any
+    debug endpoint can share the exact same wording the CLI uses.
+    """
+    try:
+        return door_count_summary(door_facts)
+    except Exception:
+        return "Door count: not available"
+
+
+# Re-export a couple of helpers the joiner needs without importing
+# the frozen module directly.
+def building_name_for_node(nodes, node_id):
+    """
+    Return the building_name tag on a node, or None. Used by the
+    narration joiner to name the entrance in the transition sentence.
+    """
+    if node_id not in nodes:
+        return None
+    tags = nodes[node_id].get("tags", {}) or {}
+    value = tags.get("building_name")
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def is_indoor_node(node_id):
+    """
+    Merged-graph convention: outdoor nodes are prefixed with 'o';
+    everything else is indoor. This is the same convention the
+    composer uses.
+    """
+    return not str(node_id).startswith("o")
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\knowledge_service.py ---
 
 """
@@ -18838,6 +19086,453 @@ def closest_by_bearing(media_list: list[Media], target_bearing: int) -> Media | 
 
     return min(with_bearing, key=lambda m: angular_distance(m.bearing_deg, target_bearing))
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\narration_joiner.py ---
+
+"""
+narration_joiner.py
+
+Split a merged route path into contiguous runs and narrate each one
+with the engine that understands it.
+
+The merged graph uses a prefix convention: outdoor nodes are prefixed
+with 'o', indoor nodes are not. Splitting on that prefix gives the
+runs we need, exactly:
+
+    [outdoor, ...]                         → one outdoor run
+    [indoor, ...]                          → one indoor run
+    [outdoor, ..., indoor, ...]            → outdoor run, indoor run
+    [indoor, ..., outdoor, ...]            → indoor run, outdoor run
+    [indoor, ..., outdoor, ..., indoor, ...] → three runs
+
+Between runs we insert a single template sentence naming the
+building, if the boundary node carries a building_name tag. We never
+call the AI for the transition — the sentence is deterministic.
+
+Rules applied to each run's text:
+  - The "you have arrived" line is kept only on the last run.
+  - The "starting from ..." line is kept only on the first run.
+  - Runs are joined with a single space.
+
+Outdoor runs reuse the existing outdoor narration pipeline. The
+merged graph's outdoor edges carry the same tags as map.osm's, so
+the outdoor engine sees exactly what it would for an outdoor-only
+route. The only difference is that we pass a slice of the path
+instead of a full route.
+
+IMPORTANT — id conventions
+--------------------------
+
+  - The merged graph keys everything by prefixed outdoor ids
+    ("o27836") and unprefixed indoor ids ("-27836").
+  - The frozen outdoor engine expects UNPREFIXED ids everywhere:
+    nodes keyed by "27836", edge_tags keyed by
+    frozenset({"27836", "27837"}), path entries "27836".
+  - So for every outdoor run, we strip the 'o' prefix from the path
+    AND from the keys of the nodes/graph/edge_tags subset we build.
+    We do that once, at the boundary, so the outdoor engine never
+    sees a prefixed id.
+  - For an indoor run, no prefix stripping happens — indoor ids
+    have no prefix to begin with.
+"""
+
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def join_runs(
+    path,
+    nodes,
+    graph,
+    edge_tags,
+    door_node_ids,
+    corridor_of_door,
+    start_name,
+    end_name,
+    lang="en",
+    live=False,
+    api_key=None,
+):
+    """
+    Narrate a merged route by splitting it into runs and calling the
+    right engine for each.
+
+    path:            list of node ids on the merged graph
+    nodes:           {node_id: {"lat", "lon", "tags"}} for the merged graph
+    graph:           merged adjacency (outdoor + indoor edges)
+    edge_tags:       {frozenset({a,b}): tags} for the merged graph
+    door_node_ids:   set of indoor door node ids
+    corridor_of_door: dict door_id -> corridor name
+    start_name:      display name for the first node
+    end_name:        display name for the last node
+    lang:            language code, passed to the outdoor pipeline
+    live:            if True and a key exists, use the outdoor AI path
+    api_key:         Groq key, or None
+
+    Returns the joined narration text.
+
+    Raises ValueError if the path is empty.
+    """
+    if not path:
+        raise ValueError("cannot narrate an empty route")
+
+    runs = split_runs(path)
+    if not runs:
+        raise ValueError("cannot narrate a route with no runs")
+
+    parts = []
+    for index, run in enumerate(runs):
+        is_first = index == 0
+        is_last = index == len(runs) - 1
+
+        if run["mode"] == "indoor":
+            text = _narrate_indoor_run(
+                run=run,
+                nodes=nodes,
+                graph=graph,
+                door_node_ids=door_node_ids,
+                corridor_of_door=corridor_of_door,
+                is_first=is_first,
+                is_last=is_last,
+                start_name=start_name,
+                end_name=end_name,
+                api_key=api_key,
+            )
+        else:
+            text = _narrate_outdoor_run(
+                run=run,
+                nodes=nodes,
+                graph=graph,
+                edge_tags=edge_tags,
+                is_first=is_first,
+                is_last=is_last,
+                start_name=start_name,
+                end_name=end_name,
+                lang=lang,
+                live=live,
+                api_key=api_key,
+            )
+
+        text = _strip_arrival(text) if not is_last else text
+        text = _strip_opening(text) if not is_first else text
+
+        parts.append(text.strip())
+
+        if not is_last:
+            parts.append(_transition_sentence(runs, index, nodes))
+
+    return " ".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Path splitting
+# ---------------------------------------------------------------------------
+
+def split_runs(path):
+    """
+    Split a merged path into contiguous runs by node prefix.
+
+    Returns a list of dicts:
+        {"mode": "outdoor"|"indoor",
+         "nodes": [node_id, ...],
+         "start_index": int, "end_index": int}
+
+    A run has at least one node. Consecutive runs are always of
+    different modes because the split only happens on prefix change.
+    """
+    if not path:
+        return []
+
+    runs = []
+    current_nodes = [path[0]]
+    current_mode = "outdoor" if str(path[0]).startswith("o") else "indoor"
+    current_start = 0
+
+    for i in range(1, len(path)):
+        node = path[i]
+        mode = "outdoor" if str(node).startswith("o") else "indoor"
+        if mode == current_mode:
+            current_nodes.append(node)
+        else:
+            runs.append({
+                "mode": current_mode,
+                "nodes": current_nodes,
+                "start_index": current_start,
+                "end_index": i - 1,
+            })
+            current_nodes = [node]
+            current_mode = mode
+            current_start = i
+
+    runs.append({
+        "mode": current_mode,
+        "nodes": current_nodes,
+        "start_index": current_start,
+        "end_index": len(path) - 1,
+    })
+    return runs
+
+
+# ---------------------------------------------------------------------------
+# Outdoor run
+# ---------------------------------------------------------------------------
+
+def _narrate_outdoor_run(
+    run,
+    nodes,
+    graph,
+    edge_tags,
+    is_first,
+    is_last,
+    start_name,
+    end_name,
+    lang,
+    live,
+    api_key,
+):
+    """
+    Narrate one outdoor run.
+
+    The outdoor engine expects UNPREFIXED node ids everywhere. The
+    merged graph uses 'o'-prefixed ids for outdoor nodes. So we
+    rename every key we hand to the engine:
+
+      - path nodes:  "o27836" → "27836"
+      - nodes dict:  keys "o27836" → "27836"
+      - graph dict:  keys and neighbour entries stripped
+      - edge_tags:   frozenset keys stripped
+    """
+    from . import narration_service as _outdoor
+
+    stripped_path = [_strip_o(n) for n in run["nodes"]]
+
+    # Build a stripped-id view of nodes for just this run.
+    outdoor_nodes = {}
+    for node_id in run["nodes"]:
+        if node_id in nodes:
+            outdoor_nodes[_strip_o(node_id)] = nodes[node_id]
+
+    # Adjacency keyed by stripped ids, entries stripped.
+    run_set = set(run["nodes"])
+    outdoor_graph = {}
+    for node_id in run["nodes"]:
+        neighbours = graph.get(node_id, []) or []
+        kept = []
+        for entry in neighbours:
+            if not entry:
+                continue
+            neighbour = entry[0]
+            length = entry[1] if len(entry) > 1 else 0.0
+            if neighbour in run_set:
+                kept.append((_strip_o(neighbour), length))
+        outdoor_graph[_strip_o(node_id)] = kept
+
+    # Edge tags: only edges whose both endpoints are o-prefixed, and
+    # only those within this run. Re-key with stripped ids.
+    outdoor_edge_tags = {}
+    for key, value in edge_tags.items():
+        parts = list(key)
+        if len(parts) != 2:
+            continue
+        a, b = parts[0], parts[1]
+        if not (str(a).startswith("o") and str(b).startswith("o")):
+            continue
+        if a not in run_set or b not in run_set:
+            continue
+        stripped_key = frozenset((_strip_o(a), _strip_o(b)))
+        outdoor_edge_tags[stripped_key] = value
+
+    run_start_name = start_name if is_first else ""
+    run_end_name = end_name if is_last else ""
+
+    try:
+        text = _outdoor.narrate_outdoor_segment(
+            path=stripped_path,
+            nodes=outdoor_nodes,
+            graph=outdoor_graph,
+            edge_tags=outdoor_edge_tags,
+            start_name=run_start_name,
+            end_name=run_end_name,
+            lang=lang,
+            live=live,
+            api_key=api_key,
+        )
+    except Exception as e:
+        logger.warning("outdoor run narration failed: %s", e)
+        return ""
+
+    return text or ""
+
+
+# ---------------------------------------------------------------------------
+# Indoor run
+# ---------------------------------------------------------------------------
+
+def _narrate_indoor_run(
+    run,
+    nodes,
+    graph,
+    door_node_ids,
+    corridor_of_door,
+    is_first,
+    is_last,
+    start_name,
+    end_name,
+    api_key,
+):
+    """
+    Narrate one indoor run with the indoor engine.
+
+    The indoor engine expects the merged indoor graph (it reads
+    levels, door nodes, and corridor tags from `way_tags`, all of
+    which are already present on the merged graph's edges for indoor
+    ways).
+
+    We pass the run's nodes as they are — no prefix stripping,
+    because indoor nodes have no prefix in the first place.
+
+    Note: the `nodes` and `graph` we receive here are the merged
+    graph — the same dicts the indoor engine was built against. So
+    the door ids, node ids, and way tags all line up.
+    """
+    from . import indoor_narration_service as _indoor
+
+    run_start_name = start_name if is_first else ""
+    run_end_name = end_name if is_last else ""
+
+    try:
+        return _indoor.narrate_indoor_run(
+            path=run["nodes"],
+            nodes=nodes,
+            graph=graph,
+            door_node_ids=door_node_ids,
+            corridor_of_door=corridor_of_door,
+            start_name=run_start_name,
+            end_name=run_end_name,
+            api_key=api_key,
+        )
+    except Exception as e:
+        logger.warning("indoor run narration failed: %s", e)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Transition sentence
+# ---------------------------------------------------------------------------
+
+_ENTRANCE_RE = re.compile(r"\bentrance\b", re.IGNORECASE)
+
+
+def _transition_sentence(runs, index, nodes):
+    """
+    One handover sentence between run `index` and run `index + 1`.
+
+    If the boundary node belongs to an entrance and carries a
+    building_name, we name it. Otherwise we fall back to a generic
+    sentence that mentions "the entrance" without naming a building.
+
+    The sentence is chosen from a small template set, based on the
+    mode pair. It is deterministic. No AI is called.
+    """
+    current = runs[index]
+    following = runs[index + 1]
+
+    from_mode = current["mode"]
+    to_mode = following["mode"]
+
+    # The boundary node is the last node of `current` (for
+    # indoor→outdoor, the building we're leaving) or the first node
+    # of `following` (for outdoor→indoor, the building we're
+    # entering). We check both.
+    boundary_candidates = [current["nodes"][-1], following["nodes"][0]]
+    building = None
+    for node_id in boundary_candidates:
+        if node_id not in nodes:
+            continue
+        tags = nodes[node_id].get("tags", {}) or {}
+        name = tags.get("building_name")
+        if name:
+            name = str(name).strip()
+            if name:
+                building = name
+                break
+
+    if from_mode == "outdoor" and to_mode == "indoor":
+        if building:
+            return f"When you reach the entrance of {building}, go inside."
+        return "When you reach the entrance, go inside."
+
+    if from_mode == "indoor" and to_mode == "outdoor":
+        if building:
+            return f"When you leave {building}, head outside."
+        return "When you leave the building, head outside."
+
+    # Any other combination (shouldn't happen with prefix-based
+    # splitting — runs alternate modes) — fall back to a generic
+    # sentence so the narration never breaks mid-flow.
+    return "Keep going."
+
+
+# ---------------------------------------------------------------------------
+# Text cleanup
+# ---------------------------------------------------------------------------
+
+_ARRIVAL_PATTERNS = [
+    re.compile(r"\byou have arrived\b.*?(?=\.|$)", re.IGNORECASE),
+    re.compile(r"\byou'?ve arrived\b.*?(?=\.|$)", re.IGNORECASE),
+    re.compile(r"\band (?:there it is|that'?s it)\b.*?(?=\.|$)", re.IGNORECASE),
+]
+
+_OPENING_PATTERNS = [
+    re.compile(r"\bstarting from [^.]*\.\s*", re.IGNORECASE),
+    re.compile(r"\bfrom your current position[,.]?\s*", re.IGNORECASE),
+    re.compile(r"\balright, from [^.]*\.\s*", re.IGNORECASE),
+]
+
+
+def _strip_arrival(text):
+    """Remove the arrival sentence from a non-final run."""
+    if not text:
+        return text
+    for pattern in _ARRIVAL_PATTERNS:
+        text = pattern.sub("", text)
+    return _tidy(text)
+
+
+def _strip_opening(text):
+    """Remove the opening sentence from a non-first run."""
+    if not text:
+        return text
+    for pattern in _OPENING_PATTERNS:
+        text = pattern.sub("", text)
+    return _tidy(text)
+
+
+def _tidy(text):
+    """Collapse extra whitespace and fix stray punctuation after
+    sentence removal."""
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"\s+\.", ".", text)
+    text = re.sub(r"\.\s*\.", ".", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Small helper
+# ---------------------------------------------------------------------------
+
+def _strip_o(node_id):
+    """Remove the 'o' prefix from an outdoor node id if present."""
+    s = str(node_id)
+    if s.startswith("o"):
+        return s[1:]
+    return s
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\narration_service.py ---
 
 """
@@ -18849,8 +19544,26 @@ Accepts either a place ID or coordinates for the from endpoint. When
 coordinates are given, the same snap-distance check that the route
 endpoint uses is applied — so a bad GPS fix can't silently narrate
 from a path across campus.
+
+Two paths:
+
+  - Outdoor-to-outdoor: the existing behaviour, unchanged. Uses the
+    outdoor graph loaded from map.osm (the `graph` / `nodes` /
+    `edge_tags` arguments the router passes in).
+
+  - Anything involving an indoor place or an entrance: delegate to
+    narration_joiner. The joiner works on the MERGED graph — the
+    one built by indoor_graph_builder — because the route composer
+    returns a merged node path. The outdoor parameters this function
+    receives are for the outdoor graph only, and must not be used
+    for a mixed route.
+
+We also expose narrate_outdoor_segment(), used by the joiner for
+each outdoor run of a mixed route. That function narrates a slice of
+an already-chosen path — it never re-routes.
 """
 
+import logging
 import os
 
 from sqlalchemy.orm import Session
@@ -18876,11 +19589,20 @@ from .routing_service import (
 )
 from .graph_service import get_areas
 
+logger = logging.getLogger(__name__)
 
-# Re-export so callers can do:
-#   except narration_service.UnreliableLocationError
-# without knowing it lives in routing_service.
-__all__ = ["narrate_route", "UnreliableLocationError"]
+
+__all__ = [
+    "narrate_route",
+    "narrate_outdoor_segment",
+    "UnreliableLocationError",
+]
+
+
+# Minimum length of text we consider a usable narration. Anything
+# shorter is treated as failure so the endpoint returns an honest 404
+# instead of a one-word reply.
+_MIN_USABLE_NARRATION_LEN = 20
 
 
 def _build_events(path, nodes, edge_tags, graph, distance, start_name, end_name):
@@ -18899,6 +19621,36 @@ def _build_events(path, nodes, edge_tags, graph, distance, start_name, end_name)
     return steps, events, dest_pos
 
 
+# ---------------------------------------------------------------------------
+# Mixed-route dispatch
+# ---------------------------------------------------------------------------
+
+def _place_kind(session: Session, place_id):
+    """Return the kind of a place, or None if not found."""
+    if place_id is None:
+        return None
+    from ..models.place import Place
+    row = session.query(Place).filter_by(id=place_id).one_or_none()
+    if row is None:
+        return None
+    return row.kind or "outdoor"
+
+
+def _involves_indoor(session: Session, from_place_id, to_place_id):
+    """
+    True if either endpoint is indoor or an entrance.
+
+    Entrances count because the composer links them to the indoor
+    graph via connectors. They behave like indoor endpoints for
+    routing purposes.
+    """
+    indoor_kinds = {"indoor", "entrance"}
+    return (
+        _place_kind(session, from_place_id) in indoor_kinds
+        or _place_kind(session, to_place_id) in indoor_kinds
+    )
+
+
 def narrate_route(
     session: Session,
     graph,
@@ -18911,29 +19663,179 @@ def narrate_route(
     to_place_id: int = None,
     lang: str = "en",
     live: bool = False,
-) -> NarrationResponse | None:
+):
     """
-    Compute a route and narrate it.
+    Produce narration for the route between two points.
 
-    The from endpoint can be either a place ID or coordinates. When
-    coordinates are given, the same snap-distance limit that the route
-    endpoint applies is applied here too — a fix more than the limit
-    from any path node raises UnreliableLocationError.
+    Outdoor-to-outdoor: existing behaviour, unchanged.
 
-    The to endpoint is always a place ID.
+    If either endpoint is indoor or an entrance: delegate to
+    narration_joiner. The joiner uses the merged graph and the
+    composer's node path, so narration and steps never disagree.
     """
-    # Resolve the from endpoint.
+    # --- Mixed / indoor path ---
+    if _involves_indoor(session, from_place_id, to_place_id):
+        return _narrate_mixed(
+            session,
+            graph,
+            nodes,
+            edge_tags,
+            from_place_id=from_place_id,
+            from_lat=from_lat,
+            from_lon=from_lon,
+            from_accuracy_m=from_accuracy_m,
+            to_place_id=to_place_id,
+            lang=lang,
+            live=live,
+        )
+
+    # --- Outdoor path, unchanged ---
+    return _narrate_outdoor_only(
+        session,
+        graph,
+        nodes,
+        edge_tags,
+        from_place_id=from_place_id,
+        from_lat=from_lat,
+        from_lon=from_lon,
+        from_accuracy_m=from_accuracy_m,
+        to_place_id=to_place_id,
+        lang=lang,
+        live=live,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mixed-route narration
+# ---------------------------------------------------------------------------
+
+def _narrate_mixed(
+    session,
+    graph,
+    nodes,
+    edge_tags,
+    *,
+    from_place_id,
+    from_lat,
+    from_lon,
+    from_accuracy_m,
+    to_place_id,
+    lang,
+    live,
+):
+    """
+    Narrate a route that touches indoor places.
+
+    Two things to note:
+
+      1. We call the composer to get the merged path (the same path
+         /api/route uses), then hand it to narration_joiner.
+
+      2. The `graph`, `nodes`, `edge_tags` parameters we received
+         describe the OUTDOOR graph only. The composer's path is on
+         the MERGED graph. So we must pass the merged graph to the
+         joiner — not the outdoor one. We pull the merged bundle from
+         indoor_graph_builder and use that.
+    """
+    from . import narration_joiner
+    from . import indoor_graph_builder
+    from . import route_composer
+
+    # 1. Compose the route — same code path as /api/route. The
+    #    composer internally uses the merged graph; we pass it the
+    #    outdoor params only because that's its existing signature.
+    try:
+        composed = route_composer.compose_route(
+            session, graph, nodes, edge_tags,
+            from_place_id=from_place_id,
+            from_lat=from_lat,
+            from_lon=from_lon,
+            from_accuracy_m=from_accuracy_m,
+            to_place_id=to_place_id,
+        )
+    except route_composer.RouteCompositionError:
+        return None
+    except route_composer.UnreliableLocationError:
+        raise UnreliableLocationError()
+
+    if composed is None:
+        return None
+
+    # 2. Retrieve the node path from the composer.
+    node_path = composed.get("node_path")
+    if not node_path:
+        logger.warning("composer returned a route without a node_path")
+        return None
+
+    # 3. The merged bundle — the same one the composer used. This
+    #    carries the indoor node ids, edges, and door/corridor maps.
+    bundle = indoor_graph_builder.get_indoor_graph()
+    merged_nodes = bundle["nodes"]
+    merged_graph = bundle["graph"]
+    merged_edge_tags = bundle["edge_tags"]
+
+    from_name = composed.get("from_name") or "your current location"
+    to_name = composed.get("to_name") or "your destination"
+
+    api_key = os.environ.get("GROQ_API_KEY")
+
+    text = narration_joiner.join_runs(
+        path=node_path,
+        nodes=merged_nodes,
+        graph=merged_graph,
+        edge_tags=merged_edge_tags,
+        door_node_ids=bundle.get("door_node_ids", set()),
+        corridor_of_door=bundle.get("corridor_of_door", {}),
+        start_name=from_name,
+        end_name=to_name,
+        lang=lang,
+        live=live,
+        api_key=api_key,
+    )
+
+    if not text or len(text.strip()) < _MIN_USABLE_NARRATION_LEN:
+        logger.warning(
+            "mixed narration produced no usable text (path len=%d, "
+            "text len=%d)",
+            len(node_path),
+            len(text or ""),
+        )
+        return None
+
+    source = "groq" if (live and api_key) else "local"
+    return NarrationResponse(text=text, source=source, lang=lang)
+
+
+# ---------------------------------------------------------------------------
+# Outdoor-only narration — the existing path
+# ---------------------------------------------------------------------------
+
+def _narrate_outdoor_only(
+    session,
+    graph,
+    nodes,
+    edge_tags,
+    *,
+    from_place_id,
+    from_lat,
+    from_lon,
+    from_accuracy_m,
+    to_place_id,
+    lang,
+    live,
+):
+    """
+    The original outdoor narration flow. Unchanged from before the
+    joiner existed.
+    """
     if from_place_id is not None:
         from_node, from_name = _resolve_endpoint(
             session, graph, nodes, place_id=from_place_id
         )
     elif from_lat is not None and from_lon is not None:
         from_node, from_name = _resolve_endpoint(
-            session,
-            graph,
-            nodes,
-            lat=from_lat,
-            lon=from_lon,
+            session, graph, nodes,
+            lat=from_lat, lon=from_lon,
             accuracy_m=from_accuracy_m,
             is_live_fix=True,
         )
@@ -18957,22 +19859,15 @@ def narrate_route(
         path, nodes, edge_tags, graph, distance, from_name, to_name
     )
 
-    # Cache key from the timeline.
     timeline_repr = "\n".join(
         f"{round(e[0])}|{e[1]}|{e[2]}" for e in events
     )
     r_hash = cache_service.route_hash(timeline_repr)
 
-    # Cache check.
     cached_text = cache_service.get_cached_narration(r_hash, lang=lang)
     if cached_text is not None:
-        return NarrationResponse(
-            text=cached_text,
-            source="local",
-            lang=lang,
-        )
+        return NarrationResponse(text=cached_text, source="local", lang=lang)
 
-    # Generate.
     text = narrate(
         start_name=from_name,
         end_name=to_name,
@@ -18983,12 +19878,70 @@ def narrate_route(
         lang=lang,
     )
 
-    # Write back.
     cache_service.set_cached_narration(r_hash, text, lang=lang)
 
     source = "groq" if (live and os.environ.get("GROQ_API_KEY")) else "local"
-
     return NarrationResponse(text=text, source=source, lang=lang)
+
+
+# ---------------------------------------------------------------------------
+# Outdoor segment narration — used by narration_joiner for mixed routes
+# ---------------------------------------------------------------------------
+
+def narrate_outdoor_segment(
+    path,
+    nodes,
+    graph,
+    edge_tags,
+    start_name,
+    end_name,
+    lang="en",
+    live=False,
+    api_key=None,
+):
+    """
+    Narrate an already-chosen outdoor path.
+
+    This is what narration_joiner calls for each outdoor run of a
+    mixed route. It NEVER re-routes — the path is given.
+
+    The path and its node ids are already stripped of the 'o' prefix
+    by the joiner. nodes, graph, and edge_tags are the outdoor-only
+    subset, keyed by the stripped ids. So this function is
+    essentially the same assembly the outdoor engine does in its
+    CLI, minus the routing.
+    """
+    if not path or len(path) < 2:
+        return ""
+
+    # Total length along the given path.
+    from backend.core.campus_graph import haversine_m
+    distance = 0.0
+    for i in range(len(path) - 1):
+        a = nodes[path[i]]
+        b = nodes[path[i + 1]]
+        distance += haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
+
+    try:
+        _steps, events, dest_pos = _build_events(
+            path, nodes, edge_tags, graph, distance,
+            start_name or "your starting point",
+            end_name or "your destination",
+        )
+    except Exception as e:
+        logger.warning("outdoor segment event build failed: %s", e)
+        return ""
+
+    text = narrate(
+        start_name=start_name or "your starting point",
+        end_name=end_name or "your destination",
+        distance_m=distance,
+        events=events,
+        destination_position=dest_pos,
+        api_key=api_key if live else None,
+        lang=lang,
+    )
+    return text or ""
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\place_service.py ---
 
@@ -19465,6 +20418,25 @@ For mixed routes, each step carries a `mode` field ("outdoor" or
 "indoor") so the client can switch rendering behavior at the
 boundary.
 
+New in this version
+-------------------
+Both return branches now include a `node_path` field: the list of
+merged-graph node ids the route actually walks, in order. Outdoor
+nodes are prefixed with 'o'; indoor nodes are not.
+
+The mobile app ignores this field. The narration service uses it to
+split the route into runs and narrate each with the right engine.
+
+Why node_path instead of relying on `legs` or `geometry`:
+
+  - `legs` are distance boundaries in metres, not node ids. Using
+    them to find the exact split node requires matching cumulative
+    distances, which is fragile.
+  - `geometry` is a list of lat/lon pairs, which are not node ids.
+    Reversing geometry → node id means re-searching the graph.
+  - `node_path` is exact and already known by the composer. Adding
+    it is one line in each branch.
+
 Step distances on mixed routes
 ------------------------------
 The outdoor engine provides real `at_m` values per step. The indoor
@@ -19537,6 +20509,17 @@ def _classify_endpoint(place: Place) -> dict:
             "osm_id": place.osm_id,
             "name": place.name,
         }
+    elif kind == "entrance":
+        # An entrance is on the indoor graph as a connector endpoint.
+        # Treat it the same as an indoor node for routing purposes.
+        return {
+            "engine": "indoor",
+            "place_id": place.id,
+            "kind": "entrance",
+            "node_id": place.osm_id,
+            "osm_id": place.osm_id,
+            "name": place.name,
+        }
     else:
         return {
             "engine": "outdoor",
@@ -19593,8 +20576,6 @@ def _resolve_coord_start(
     best_id = None
     best_dist = float("inf")
 
-    # Only search outdoor nodes. Indoor GPS is unreliable; the student
-    # is outdoors, so their fix should snap to an outdoor node.
     for nid in outdoor_node_ids:
         node = nodes.get(nid)
         if node is None:
@@ -19645,6 +20626,9 @@ def compose_route(
       3. Place → indoor place, or indoor place → place: indoor engine.
       4. GPS → indoor place: indoor engine, after snapping GPS to a
          nearby outdoor node on the merged graph.
+
+    Every returned route includes a "node_path" field — the list of
+    merged-graph node ids walked, in order.
     """
     from_place = None
     if from_place_id is not None:
@@ -19678,10 +20662,10 @@ def compose_route(
             to_lon=to_lon,
         )
 
-    # At least one endpoint is indoor. Route on the merged graph.
+    # At least one endpoint is indoor (or entrance). Route on the
+    # merged graph.
     bundle = indoor_graph_builder.get_indoor_graph()
 
-    # Resolve the from endpoint.
     if from_place is not None:
         from_ep = _classify_endpoint(from_place)
     elif from_lat is not None and from_lon is not None:
@@ -19705,13 +20689,28 @@ def compose_route(
             "Either from_place_id or from_lat/from_lon is required."
         )
 
-    # Resolve the to endpoint.
     if to_place is not None:
         to_ep = _classify_endpoint(to_place)
+    elif to_lat is not None and to_lon is not None:
+        node_id, display_name = _resolve_coord_start(
+            to_lat, to_lon, bundle,
+            is_live_fix=False,
+        )
+        if node_id is None:
+            raise RouteCompositionError(
+                "Could not snap the destination to the walkable network."
+            )
+        to_ep = {
+            "engine": "indoor",
+            "place_id": None,
+            "kind": "outdoor",
+            "node_id": node_id,
+            "osm_id": node_id[1:] if node_id.startswith("o") else node_id,
+            "name": display_name,
+        }
     else:
         raise RouteCompositionError(
-            "Mixed routes currently require the destination to be a "
-            "named place."
+            "Either to_place_id or to_lat/to_lon is required."
         )
 
     return _route_via_indoor_engine(from_ep, to_ep)
@@ -19731,7 +20730,8 @@ def _route_via_outdoor_engine(
     the API used before the composer existed.
 
     The returned RouteResponse is annotated with mode="outdoor" on
-    each step and a single leg spanning the whole route.
+    each step and a single leg spanning the whole route. We also
+    attach the node_path so narration can reuse it.
     """
     from . import routing_service
     from ..schemas.route import RouteLeg
@@ -19762,7 +20762,61 @@ def _route_via_outdoor_engine(
             to_name=route.to_name,
         )
     ]
+
+    # Retrieve the node path from routing_service. routing_service
+    # attaches it as a private attribute on the RouteResponse when
+    # it computes a fresh route; if the route came from a cache hit,
+    # we re-derive the path from the geometry's nodes. Simpler: we
+    # always recompute the path in the composer using the resolved
+    # endpoints. See _resolve_path_for_outdoor_route below.
+    node_path = _resolve_path_for_outdoor_route(
+        session, graph, nodes, route,
+        from_place_id=from_place_id,
+        from_lat=from_lat,
+        from_lon=from_lon,
+        to_place_id=to_place_id,
+        to_lat=to_lat,
+        to_lon=to_lon,
+    )
+    route.node_path = node_path
+
     return route
+
+
+def _resolve_path_for_outdoor_route(
+    session, graph, nodes, route,
+    *, from_place_id, from_lat, from_lon,
+    to_place_id, to_lat, to_lon,
+):
+    """
+    Return the node path for an outdoor route, in the merged-graph
+    naming convention (each id prefixed with 'o').
+
+    We re-run a_star here rather than threading the path through
+    routing_service's cache layer. a_star on the outdoor graph is
+    fast and this keeps routing_service's contract unchanged.
+    """
+    from .routing_service import _resolve_endpoint
+    from backend.core.campus_graph import a_star
+
+    from_node, _ = _resolve_endpoint(
+        session, graph, nodes,
+        place_id=from_place_id,
+        lat=from_lat, lon=from_lon,
+        is_live_fix=(from_place_id is None and from_lat is not None),
+    )
+    to_node, _ = _resolve_endpoint(
+        session, graph, nodes,
+        place_id=to_place_id,
+        lat=to_lat, lon=to_lon,
+        is_live_fix=False,
+    )
+    if from_node is None or to_node is None:
+        return []
+    path, _ = a_star(graph, nodes, from_node, to_node)
+    if not path:
+        return []
+    return ["o" + n for n in path]
 
 
 # ---------------------------------------------------------------------------
@@ -19771,9 +20825,9 @@ def _route_via_outdoor_engine(
 
 def _route_via_indoor_engine(from_ep, to_ep):
     """
-    Route from_ep["node_id"] to to_ep["node_id"] on the enriched graph.
-    Returns a dict-shaped route (not a RouteResponse object) with the
-    same keys the API returns, plus a `legs` array.
+    Route from_ep["node_id"] to to_ep["node_id"] on the enriched
+    graph. Returns a dict-shaped route with the same keys the API
+    returns, plus `legs` and `node_path`.
     """
     bundle = indoor_graph_builder.get_indoor_graph()
 
@@ -19823,7 +20877,6 @@ def _route_via_indoor_engine(from_ep, to_ep):
         steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
     )
 
-    # Fill in geometry_index, level, and building_name on each step.
     _enrich_indoor_steps(annotated_steps, path, nodes, graph)
 
     geometry = [
@@ -19839,6 +20892,7 @@ def _route_via_indoor_engine(from_ep, to_ep):
         "from_name": from_ep["name"],
         "to_name": to_ep["name"],
         "legs": legs,
+        "node_path": path,
     }
 
 
@@ -19874,12 +20928,7 @@ def _annotate_steps_and_legs(
     the current step by comparing distanceFromStartM to each step's
     at_m. If every at_m is 0, the comparison never matches and the
     function returns the last step — "You have arrived".
-
-    The pointer `ptr` advances monotonically, so repeated node ids in
-    the path (which happen when a step's instruction is generated
-    from a mid-way node) map to the correct position.
     """
-    # Cumulative distance along the path.
     cum = [0.0]
     for a, b in zip(path, path[1:]):
         cum.append(
@@ -19900,15 +20949,11 @@ def _annotate_steps_and_legs(
         nid = step.get("node_id") or ""
         if nid:
             last_mode = "outdoor" if nid.startswith("o") else "indoor"
-            # Move forward until we find this node. We never go
-            # backwards, so repeated nodes map in order.
             while ptr < len(path) and path[ptr] != nid:
                 ptr += 1
             if ptr < len(path):
                 last_at = max(last_at, cum[ptr])
             else:
-                # Node not found — likely a duplicate later in the
-                # path. Reset and search again from the start.
                 ptr = 0
         modes.append(last_mode)
         at_ms.append(last_at)
@@ -19924,7 +20969,6 @@ def _annotate_steps_and_legs(
             "mode": mode,
         })
 
-    # Build legs from real boundaries.
     legs = []
     start = 0
     for i in range(1, len(annotated) + 1):
@@ -19971,12 +21015,6 @@ def _edge_level_for_step(from_nid, to_nid, current_level, graph):
     """
     Return the level the walker arrives on after crossing the edge
     from_nid -> to_nid.
-
-    - Corridor / walk edges: single level. Return it.
-    - Stairs edges: semicolon list like "0;1" or "-1;0;1", bottom-to-top.
-      Work out which way the walker is going from their current level.
-    - No level on the edge, or no such edge: return None. Caller keeps
-      the previous level.
     """
     edge_info = None
     for nb, _d, info in graph.get(from_nid, []):
@@ -20022,21 +21060,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     """
     Mutate each step in place, adding geometry_index, level, and
     building_name for indoor steps.
-
-    Level tracking is edge-based and simple:
-
-      1. Start with current_level = None.
-      2. For each step i (i > 0), look at the edge between path[i-1]
-         and path[i].
-      3. If the edge exists and carries a level, update current_level.
-      4. If the edge has no level, hold the previous current_level.
-      5. The node's own `level` tag is never consulted — the edge is
-         authoritative.
-      6. If current_level is still None at the first indoor node,
-         default it to "0".
-
-    Then assign level_at[i] and building_at[i] to each path node, and
-    pair them up with the indoor step list in order.
     """
     level_at = [None] * len(path)
     building_at = [None] * len(path)
@@ -20065,7 +21088,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
         level_at[i] = current_level
         building_at[i] = current_building
 
-    # Pair indoor steps with indoor path nodes, in order.
     indoor_path_indices = [
         i for i, nid in enumerate(path) if not nid.startswith("o")
     ]
@@ -20080,8 +21102,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
         step["level"] = level_at[path_i] or "0"
         step["building_name"] = building_at[path_i]
 
-    # Safety net: any indoor step that didn't get paired still gets
-    # the first indoor node's data.
     if indoor_path_indices:
         first_path_i = indoor_path_indices[0]
         fallback_level = level_at[first_path_i] or "0"
@@ -30103,6 +31123,228 @@ class TestChecksNeverRaise:
 
         assert check.count == direct_count
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_mixed_narration.py ---
+
+"""
+Tests for mixed-route narration.
+
+These tests exercise the joiner and the indoor narration service
+without hitting the network. Where the AI would be called, we rely
+on the no-fallback policy: with no API key set, the indoor service
+returns the raw steps, and the joiner still produces a joined
+result.
+
+The tests use the real campus data (via the seeded_db fixture) and
+skip if the data doesn't include indoor places or entrance places.
+
+What we assert:
+
+  1. split_runs produces the right runs for the five modes.
+  2. transition_sentence names the building when it can.
+  3. narrate_route() with an indoor endpoint returns a string.
+  4. narrate_route() with an outdoor endpoint still returns the
+     existing shape (unchanged behaviour).
+  5. The mixed narration contains both an outdoor-ish phrase and an
+     indoor-ish phrase.
+"""
+
+import pytest
+
+
+def _find_outdoor_place(client):
+    r = client.get("/api/places?kind=outdoor&limit=1")
+    if r.status_code != 200:
+        return None
+    items = r.json()
+    return items[0] if items else None
+
+
+def _find_indoor_place(client):
+    r = client.get("/api/places?kind=indoor&limit=1")
+    if r.status_code != 200:
+        return None
+    items = r.json()
+    return items[0] if items else None
+
+
+def _find_entrance_place(client):
+    r = client.get("/api/places?kind=entrance&limit=1")
+    if r.status_code != 200:
+        return None
+    items = r.json()
+    return items[0] if items else None
+
+
+# ---------------------------------------------------------------------------
+# Pure unit tests — the splitter
+# ---------------------------------------------------------------------------
+
+class TestSplitRuns:
+    def test_pure_outdoor_is_one_run(self):
+        from backend.api.services.narration_joiner import split_runs
+        runs = split_runs(["o1", "o2", "o3"])
+        assert len(runs) == 1
+        assert runs[0]["mode"] == "outdoor"
+        assert runs[0]["nodes"] == ["o1", "o2", "o3"]
+
+    def test_pure_indoor_is_one_run(self):
+        from backend.api.services.narration_joiner import split_runs
+        runs = split_runs(["1", "2", "3"])
+        assert len(runs) == 1
+        assert runs[0]["mode"] == "indoor"
+
+    def test_outdoor_to_indoor(self):
+        from backend.api.services.narration_joiner import split_runs
+        runs = split_runs(["o1", "o2", "entrance", "i1", "i2"])
+        assert [r["mode"] for r in runs] == ["outdoor", "indoor"]
+        assert runs[0]["nodes"] == ["o1", "o2"]
+        assert runs[1]["nodes"] == ["entrance", "i1", "i2"]
+
+    def test_indoor_to_outdoor(self):
+        from backend.api.services.narration_joiner import split_runs
+        runs = split_runs(["i1", "entrance", "o1", "o2"])
+        assert [r["mode"] for r in runs] == ["indoor", "outdoor"]
+        assert runs[0]["nodes"] == ["i1", "entrance"]
+        assert runs[1]["nodes"] == ["o1", "o2"]
+
+    def test_cross_building(self):
+        from backend.api.services.narration_joiner import split_runs
+        runs = split_runs([
+            "a1", "a2", "entranceA",
+            "o1", "o2", "o3", "entranceB",
+            "b1", "b2",
+        ])
+        assert [r["mode"] for r in runs] == ["indoor", "outdoor", "indoor"]
+
+
+class TestTransitionSentence:
+    def test_named_building_on_outdoor_to_indoor(self):
+        from backend.api.services.narration_joiner import _transition_sentence
+        runs = [
+            {"mode": "outdoor", "nodes": ["o1", "o2"]},
+            {"mode": "indoor", "nodes": ["entrance", "i1"]},
+        ]
+        nodes = {
+            "o1": {"tags": {}},
+            "o2": {"tags": {}},
+            "entrance": {"tags": {"building_name": "Science Block"}},
+            "i1": {"tags": {}},
+        }
+        text = _transition_sentence(runs, 0, nodes)
+        assert "Science Block" in text
+        assert "inside" in text.lower()
+
+    def test_unnamed_building_falls_back(self):
+        from backend.api.services.narration_joiner import _transition_sentence
+        runs = [
+            {"mode": "outdoor", "nodes": ["o1", "o2"]},
+            {"mode": "indoor", "nodes": ["entrance", "i1"]},
+        ]
+        nodes = {
+            "o1": {"tags": {}},
+            "o2": {"tags": {}},
+            "entrance": {"tags": {}},
+            "i1": {"tags": {}},
+        }
+        text = _transition_sentence(runs, 0, nodes)
+        assert "entrance" in text.lower()
+        # No specific building name should be mentioned.
+        assert "Science Block" not in text
+
+    def test_named_building_on_indoor_to_outdoor(self):
+        from backend.api.services.narration_joiner import _transition_sentence
+        runs = [
+            {"mode": "indoor", "nodes": ["i1", "i2"]},
+            {"mode": "outdoor", "nodes": ["o1", "o2"]},
+        ]
+        nodes = {
+            "i1": {"tags": {}},
+            "i2": {"tags": {"building_name": "Library"}},
+            "o1": {"tags": {}},
+            "o2": {"tags": {}},
+        }
+        text = _transition_sentence(runs, 0, nodes)
+        assert "Library" in text
+
+
+# ---------------------------------------------------------------------------
+# Integration — through the API
+# ---------------------------------------------------------------------------
+
+class TestMixedNarrationEndpoint:
+    def test_outdoor_to_outdoor_unchanged(self, client):
+        """A pure outdoor route returns the same shape as before."""
+        places = client.get("/api/places?kind=outdoor&limit=20").json()
+        if len(places) < 2:
+            pytest.skip("Need at least two outdoor places")
+
+        for i, a in enumerate(places):
+            for b in places[i + 1 :]:
+                r = client.get(
+                    f"/api/narrate?from_place_id={a['id']}"
+                    f"&to_place_id={b['id']}"
+                )
+                if r.status_code == 200:
+                    body = r.json()
+                    assert "text" in body
+                    assert "source" in body
+                    assert body["source"] in ("local", "groq")
+                    return
+        pytest.skip("No routable pair of outdoor places")
+
+    def test_outdoor_to_indoor_returns_text(self, client, temp_db):
+        outdoor = _find_outdoor_place(client)
+        indoor = _find_indoor_place(client)
+        if not outdoor or not indoor:
+            pytest.skip("Need at least one outdoor and one indoor place")
+
+        r = client.get(
+            f"/api/narrate?from_place_id={outdoor['id']}"
+            f"&to_place_id={indoor['id']}"
+        )
+        if r.status_code == 404:
+            pytest.skip("No path between these places")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["text"], str)
+        assert len(body["text"]) > 20
+
+    def test_indoor_to_indoor_returns_text(self, client, temp_db):
+        indoor_places = client.get("/api/places?kind=indoor&limit=10").json()
+        if len(indoor_places) < 2:
+            pytest.skip("Need at least two indoor places")
+
+        a, b = indoor_places[0], indoor_places[1]
+        r = client.get(
+            f"/api/narrate?from_place_id={a['id']}&to_place_id={b['id']}"
+        )
+        if r.status_code == 404:
+            pytest.skip("No path between these indoor places")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["text"], str)
+        assert len(body["text"]) > 10
+
+    def test_indoor_to_outdoor_returns_text(self, client, temp_db):
+        indoor = _find_indoor_place(client)
+        outdoor = _find_outdoor_place(client)
+        if not indoor or not outdoor:
+            pytest.skip("Need at least one indoor and one outdoor place")
+
+        r = client.get(
+            f"/api/narrate?from_place_id={indoor['id']}"
+            f"&to_place_id={outdoor['id']}"
+        )
+        if r.status_code == 404:
+            pytest.skip("No path between these places")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["text"], str)
+        assert len(body["text"]) > 20
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_rate_limit.py ---
 
 """
@@ -31803,13 +33045,13 @@ export default function HomeScreen() {
     state: startState,
     start,
     nearbyPlaces,
-    lastError,
     suspiciousBuilding,
     resolveStart,
     choosePlace,
-    cancelPick,
     startDoorPick,
     confirmOutside,
+    loadOutdoorPlaces,
+    forgetStart,
     reset: resetStart,
   } = useStartingPoint();
 
@@ -31876,10 +33118,10 @@ export default function HomeScreen() {
       for (const entry of weekEntries) {
         const daysAhead = (entry.day_of_week - todayDow + 7) % 7;
         const [hh, mm] = entry.start_time.split(':').map(Number);
-        const start = new Date(now);
-        start.setDate(start.getDate() + daysAhead);
-        start.setHours(hh, mm, 0, 0);
-        const deltaSec = (start - now) / 1000;
+        const startTime = new Date(now);
+        startTime.setDate(startTime.getDate() + daysAhead);
+        startTime.setHours(hh, mm, 0, 0);
+        const deltaSec = (startTime - now) / 1000;
         if (deltaSec < 0) continue;
         if (deltaSec > BANNER_WINDOW_S) continue;
         if (bestDelta === null || deltaSec < bestDelta) {
@@ -31975,24 +33217,43 @@ export default function HomeScreen() {
       if (navigatingRef.current) return;
       navigatingRef.current = true;
       setPendingDestination(destId);
+
       try {
-        const resolved = await resolveStart({ destinationPlaceId: destId });
-        if (resolved) {
-          beginRoute(resolved, destId);
-          navigatingRef.current = false;
-          setPendingDestination(null);
-          return;
-        }
-        // resolveStart returned null:
-        //   - state may be 'askIndoor' (auto-trigger fired)
-        //   - state may be 'needPick' (GPS failed, sheet opens)
-        //   - or permission denied
-        if (startState !== 'askIndoor' && startState !== 'needPick') {
-          if (lastError === 'permission_denied') {
-            setError(t('start.permissionDenied'));
-          }
-          navigatingRef.current = false;
-          setPendingDestination(null);
+        const result = await resolveStart({ destinationPlaceId: destId });
+
+        switch (result.status) {
+          case 'ok':
+          case 'ok_place':
+            beginRoute(result.start, destId);
+            navigatingRef.current = false;
+            setPendingDestination(null);
+            return;
+
+          case 'ask':
+            // AreYouInsideSheet is driven by startState === 'askIndoor'.
+            // Keep navigatingRef true and pendingDestination set —
+            // the sheet's handlers will finish the flow.
+            return;
+
+          case 'pick':
+            setStartSheetMode('place-list');
+            setStartSheetOpen(true);
+            return;
+
+          case 'denied':
+            if (result.reason === 'permission_denied') {
+              setError(t('start.permissionDenied'));
+            } else {
+              setError(t('common.error'));
+            }
+            navigatingRef.current = false;
+            setPendingDestination(null);
+            return;
+
+          default:
+            navigatingRef.current = false;
+            setPendingDestination(null);
+            return;
         }
       } catch (err) {
         setError(err.message || t('common.error'));
@@ -32000,7 +33261,7 @@ export default function HomeScreen() {
         setPendingDestination(null);
       }
     },
-    [resolveStart, startState, lastError, beginRoute]
+    [resolveStart, beginRoute]
   );
 
   // Banner's Take me there.
@@ -32040,9 +33301,8 @@ export default function HomeScreen() {
       if (place == null) {
         // Student picked "pick a starting place" — switch to the list.
         setStartSheetMode('place-list');
-        // Ensure we have places to show.
         if (nearbyPlaces.length === 0) {
-          listPlaces({ limit: 20 }).then(setNearbyPlaces).catch(() => {});
+          loadOutdoorPlaces({ excludePlaceId: pendingDestination });
         }
         return;
       }
@@ -32050,14 +33310,15 @@ export default function HomeScreen() {
       setStartSheetOpen(false);
       setStartSheetMode('choose');
     },
-    [choosePlace, nearbyPlaces.length]
+    [choosePlace, nearbyPlaces.length, loadOutdoorPlaces, pendingDestination]
   );
 
   const handleUseGps = useCallback(() => {
     setStartSheetOpen(false);
-    // No remembered start to clear. Just close the sheet. The next
-    // route will use a fresh GPS fix.
-  }, []);
+    // Forget any previously chosen start so the next route does a
+    // fresh GPS read.
+    forgetStart();
+  }, [forgetStart]);
 
   const handleImInside = useCallback(() => {
     setStartSheetOpen(false);
@@ -32068,51 +33329,50 @@ export default function HomeScreen() {
     (door) => {
       setDoorPickerOpen(false);
       choosePlace(door);
+      // If there's a pending destination (auto-trigger flow), route
+      // to it now.
+      if (pendingDestination != null) {
+        beginRoute(
+          {
+            placeId: door.id,
+            placeName: door.name,
+            buildingName: door.building_name || null,
+            level: door.level || null,
+          },
+          pendingDestination
+        );
+        navigatingRef.current = false;
+        setPendingDestination(null);
+      }
     },
-    [choosePlace]
+    [choosePlace, pendingDestination, beginRoute]
   );
 
   // Auto-trigger — "Are you inside?" — yes/no.
   const handleInsideYes = useCallback(() => {
+    setDoorPickerOpen(true);
+  }, []);
+
+  const handleInsideNo = useCallback(() => {
     const dest = pendingDestination;
     if (dest == null) {
-      setDoorPickerOpen(true);
+      navigatingRef.current = false;
+      resetStart();
       return;
     }
-    // Record the destination so we can route after the pick.
-    setSuspiciousBuildingState(suspiciousBuilding);
-    setDoorPickerOpen(true);
-  }, [pendingDestination, suspiciousBuilding]);
-
-  const handleInsideNo = useCallback(async () => {
-    const dest = pendingDestination;
-    if (dest == null) return;
     const resolved = confirmOutside();
     if (resolved) {
       beginRoute(resolved, dest);
     }
     navigatingRef.current = false;
     setPendingDestination(null);
-  }, [pendingDestination, confirmOutside, beginRoute]);
+  }, [pendingDestination, confirmOutside, beginRoute, resetStart]);
 
   const handleInsideDismiss = useCallback(() => {
     navigatingRef.current = false;
     setPendingDestination(null);
     resetStart();
   }, [resetStart]);
-
-  // After the door picker closes from the auto-trigger flow, route
-  // to the pending destination using the picked door.
-  const [suspiciousBuildingState, setSuspiciousBuildingState] = useState(null);
-
-  useEffect(() => {
-    if (!doorPickerOpen && pendingDestination != null && start?.placeId != null) {
-      const dest = pendingDestination;
-      beginRoute(start, dest);
-      navigatingRef.current = false;
-      setPendingDestination(null);
-    }
-  }, [doorPickerOpen, pendingDestination, start, beginRoute]);
 
   const showSearchResults = isSearching;
 
@@ -32255,7 +33515,7 @@ export default function HomeScreen() {
       {/* Door picker */}
       <DoorPickerSheet
         visible={doorPickerOpen}
-        buildingName={suspiciousBuildingState}
+        buildingName={suspiciousBuilding}
         onPick={handleDoorPicked}
         onCancel={() => setDoorPickerOpen(false)}
       />
@@ -32660,12 +33920,12 @@ export default function PlaceDetailScreen() {
     state: startState,
     start,
     nearbyPlaces,
-    lastError,
     suspiciousBuilding,
     resolveStart,
     choosePlace,
-    cancelPick,
     confirmOutside,
+    loadOutdoorPlaces,
+    forgetStart,
     reset: resetStart,
   } = useStartingPoint();
 
@@ -32713,6 +33973,7 @@ export default function PlaceDetailScreen() {
 
   const navigateToRoute = useCallback(
     (resolvedStart) => {
+      if (!place) return;
       if (resolvedStart.lat != null && resolvedStart.lon != null) {
         setRouteRequest({
           fromLat: resolvedStart.lat,
@@ -32739,8 +34000,9 @@ export default function PlaceDetailScreen() {
     if (navigatingRef.current) return;
     navigatingRef.current = true;
 
-    // If the student has explicitly set a start via the chip, use it.
-    if (start && (start.placeId != null || start.lat != null)) {
+    // If the student has explicitly chosen a start via the chip,
+    // use it directly.
+    if (start && start.placeId != null) {
       navigateToRoute(start);
       navigatingRef.current = false;
       return;
@@ -32750,27 +34012,49 @@ export default function PlaceDetailScreen() {
     setError(null);
 
     try {
-      const resolved = await resolveStart({ destinationPlaceId: place.id });
-      if (resolved) {
-        navigateToRoute(resolved);
-        setResolvingStart(false);
-        navigatingRef.current = false;
-        return;
-      }
-      // Suspicious: the sheet will appear.
-      if (startState !== 'askIndoor' && startState !== 'needPick') {
-        if (lastError === 'permission_denied') {
-          setError(t('start.permissionDenied'));
-        }
-        setResolvingStart(false);
-        navigatingRef.current = false;
+      const result = await resolveStart({ destinationPlaceId: place.id });
+
+      switch (result.status) {
+        case 'ok':
+        case 'ok_place':
+          navigateToRoute(result.start);
+          setResolvingStart(false);
+          navigatingRef.current = false;
+          return;
+
+        case 'ask':
+          // AreYouInsideSheet will show; the student's answer
+          // drives the rest.
+          setResolvingStart(false);
+          return;
+
+        case 'pick':
+          setStartSheetMode('place-list');
+          setStartSheetOpen(true);
+          setResolvingStart(false);
+          return;
+
+        case 'denied':
+          if (result.reason === 'permission_denied') {
+            setError(t('start.permissionDenied'));
+          } else {
+            setError(t('common.error'));
+          }
+          setResolvingStart(false);
+          navigatingRef.current = false;
+          return;
+
+        default:
+          setResolvingStart(false);
+          navigatingRef.current = false;
+          return;
       }
     } catch (err) {
       setError(err.message || t('common.error'));
       setResolvingStart(false);
       navigatingRef.current = false;
     }
-  }, [place, start, resolveStart, startState, lastError, navigateToRoute]);
+  }, [place, start, resolveStart, navigateToRoute]);
 
   const handleInsideYes = useCallback(() => {
     setDoorPickerOpen(true);
@@ -32792,16 +34076,15 @@ export default function PlaceDetailScreen() {
   const handleDoorPicked = useCallback(
     (door) => {
       setDoorPickerOpen(false);
-      choosePlace(door);
-      if (place) {
-        setRouteRequest({
-          fromId: door.id,
-          toId: place.id,
-        });
-        router.push('/route-preview');
-      }
+      if (!place) return;
+      // The picked door IS the start. Route straight to this place.
+      setRouteRequest({
+        fromId: door.id,
+        toId: place.id,
+      });
+      router.push('/route-preview');
     },
-    [choosePlace, place]
+    [place]
   );
 
   const openStartSheet = useCallback(() => {
@@ -32814,18 +34097,22 @@ export default function PlaceDetailScreen() {
     (chosen) => {
       if (chosen == null) {
         setStartSheetMode('place-list');
+        if (nearbyPlaces.length === 0) {
+          loadOutdoorPlaces({ excludePlaceId: place?.id ?? null });
+        }
         return;
       }
       choosePlace(chosen);
       setStartSheetOpen(false);
       setStartSheetMode('choose');
     },
-    [choosePlace]
+    [choosePlace, nearbyPlaces.length, loadOutdoorPlaces, place]
   );
 
   const handleUseGps = useCallback(() => {
     setStartSheetOpen(false);
-  }, []);
+    forgetStart();
+  }, [forgetStart]);
 
   const handleImInside = useCallback(() => {
     setStartSheetOpen(false);
@@ -33013,9 +34300,6 @@ function prettifyCategory(category) {
   return value.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-// Note: the import for AreYouInsideSheet is at the top; it's
-// already imported.
-
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
   state: {
@@ -33101,6 +34385,15 @@ const styles = StyleSheet.create({
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\route-preview.jsx ---
 
 // Route preview screen.
+//
+// Loads a route from the pending request, shows the summary and
+// steps, and starts Walking Mode.
+//
+// Recovery path: if the backend rejects the GPS fix with
+// `LocationTooFarError`, we show a single button — "Pick where you
+// are" — that opens the door picker. Picking a door replaces the
+// request's `from` with the door's place id and re-runs the route.
+// The student never leaves this screen.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -33116,6 +34409,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { RouteMap } from '@/components/MapView';
 import { RouteSummary } from '@/components/RouteSummary';
+import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { computeRoute, narrateRoute } from '@/services/api';
 import { takeRouteRequest, setRouteRequest } from '@/services/routeRequest';
 import { useSettings } from '@/context/SettingsContext';
@@ -33127,31 +34421,38 @@ export default function RoutePreviewScreen() {
   const insets = useSafeAreaInsets();
   const { settings } = useSettings();
 
-  const [request] = useState(() => takeRouteRequest());
+  // The current route request. It starts as whatever was stashed by
+  // the previous screen, and can be replaced here when the student
+  // picks a door after a LocationTooFarError.
+  const [request, setRequest] = useState(() => takeRouteRequest());
 
   const [route, setRoute] = useState(null);
   const [narration, setNarration] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [doorPickerOpen, setDoorPickerOpen] = useState(false);
 
-  const hasFrom =
-    request != null &&
-    (request.fromId != null ||
-      (request.fromLat != null && request.fromLon != null));
+  const needsIndoorPick =
+    error != null && error.code === 'LocationTooFarError';
 
+  // Load the route whenever the request changes.
   useEffect(() => {
-    if (!hasFrom) {
-      setError(
-        'This route has no starting point. Go back and try again.'
-      );
+    if (!request) {
+      setError({
+        message: 'This route has no starting point. Go back and try again.',
+        code: null,
+      });
       setLoading(false);
       return;
     }
 
     let cancelled = false;
+
     async function load() {
       setLoading(true);
       setError(null);
+      setRoute(null);
+
       try {
         const data = await computeRoute({
           fromPlaceId: request.fromId,
@@ -33163,28 +34464,28 @@ export default function RoutePreviewScreen() {
         if (!cancelled) setRoute(data);
       } catch (err) {
         if (!cancelled) {
-          if (err.code === 'LocationTooFarError') {
-            setError(
-              "We couldn't confidently place your location. Move to an " +
-                'open area and try again, or pick a starting place.'
-            );
-          } else {
-            setError(err.message || t('common.error'));
-          }
+          setError({
+            message:
+              err.code === 'LocationTooFarError'
+                ? "We couldn't confidently place your location."
+                : err.message || t('common.error'),
+            code: err.code || null,
+          });
         }
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
+
     load();
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasFrom]);
+  }, [request]);
 
+  // Load narration whenever the route changes.
   useEffect(() => {
-    if (!hasFrom) return;
+    if (!route || !request) return;
     let cancelled = false;
     async function load() {
       try {
@@ -33205,8 +34506,7 @@ export default function RoutePreviewScreen() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasFrom, settings.language]);
+  }, [route, request, settings.language]);
 
   const startWalking = useCallback(() => {
     if (!route || !request) return;
@@ -33225,22 +34525,83 @@ export default function RoutePreviewScreen() {
     });
   }, [route, request]);
 
+  const handleDoorPicked = useCallback(
+    (door) => {
+      setDoorPickerOpen(false);
+      // Replace the request's from side with the picked door. The
+      // failed GPS fix is dropped.
+      setRequest({
+        fromId: door.id,
+        fromLat: null,
+        fromLon: null,
+        fromAccuracyM: null,
+        toId: request?.toId ?? null,
+      });
+    },
+    [request]
+  );
+
+  // ---- Loading ----
   if (loading) {
     return (
-      <View style={styles.state}>
-        <ActivityIndicator color={COLORS.textMuted} />
-      </View>
+      <>
+        <Stack.Screen options={{ title: t('route.title') }} />
+        <View style={styles.state}>
+          <ActivityIndicator color={COLORS.textMuted} />
+        </View>
+      </>
     );
   }
 
+  // ---- Recovery: the backend couldn't place the GPS fix ----
+  if (needsIndoorPick) {
+    return (
+      <>
+        <Stack.Screen options={{ title: t('route.title') }} />
+        <View style={styles.state}>
+          <Text style={styles.stateTitle}>
+            {t('route.locationTooFarTitle')}
+          </Text>
+          <Text style={styles.stateBody}>
+            {t('route.locationTooFarBody')}
+          </Text>
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={() => setDoorPickerOpen(true)}
+            accessibilityRole="button"
+            accessibilityLabel={t('route.locationTooFarButton')}
+          >
+            <Text style={styles.primaryButtonText}>
+              {t('route.locationTooFarButton')}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <DoorPickerSheet
+          visible={doorPickerOpen}
+          buildingName={null}
+          onPick={handleDoorPicked}
+          onCancel={() => setDoorPickerOpen(false)}
+        />
+      </>
+    );
+  }
+
+  // ---- Any other error ----
   if (error || !route) {
     return (
-      <View style={styles.state}>
-        <Text style={styles.errorText}>{error || t('route.noRoute')}</Text>
-      </View>
+      <>
+        <Stack.Screen options={{ title: t('route.title') }} />
+        <View style={styles.state}>
+          <Text style={styles.errorText}>
+            {error?.message || t('route.noRoute')}
+          </Text>
+        </View>
+      </>
     );
   }
 
+  // ---- Normal preview ----
   const seconds = estimateWalkingSeconds(route.distance_m);
 
   const markers = [
@@ -33304,7 +34665,9 @@ export default function RoutePreviewScreen() {
             accessibilityRole="button"
             accessibilityLabel={t('route.startButton')}
           >
-            <Text style={styles.primaryButtonText}>{t('route.startButton')}</Text>
+            <Text style={styles.primaryButtonText}>
+              {t('route.startButton')}
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -33319,12 +34682,27 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.backgroundSubtle,
+    padding: SPACING.xl,
+  },
+  stateTitle: {
+    fontSize: FONT_SIZE.large,
+    fontWeight: '700',
+    color: COLORS.text,
+    textAlign: 'center',
+    marginBottom: SPACING.md,
+  },
+  stateBody: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.textMuted,
+    textAlign: 'center',
+    lineHeight: 22,
+    marginBottom: SPACING.lg,
   },
   errorText: {
     color: COLORS.danger,
     fontSize: FONT_SIZE.body,
     textAlign: 'center',
-    padding: 20,
+    padding: SPACING.lg,
   },
   map: { height: 280 },
   body: { flex: 1 },
@@ -33363,6 +34741,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primaryDark,
     borderRadius: RADIUS.md,
     paddingVertical: 16,
+    paddingHorizontal: SPACING.xl,
     minHeight: TOUCH.minHeight,
     alignItems: 'center',
     justifyContent: 'center',
@@ -35119,9 +36498,12 @@ const styles = StyleSheet.create({
 // and taps a result. The picked door's place_id is returned to the
 // caller as the route start.
 //
-// We show the door's name (door18, door19, ...). Building and level
-// are shown as a subtitle so results across buildings are
-// distinguishable.
+// We show the door's name. Building and level are shown as a
+// subtitle so results across buildings are distinguishable.
+//
+// `buildingName` is optional. If passed, the list is scoped to that
+// building. If null, the list spans all buildings — used by the
+// route-preview recovery flow, where we don't know the building.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -35164,7 +36546,7 @@ export function DoorPickerSheet({
 
     listIndoorDoors({ buildingName: buildingName || undefined })
       .then((data) => {
-        if (!cancelled) setDoors(data);
+        if (!cancelled) setDoors(Array.isArray(data) ? data : []);
       })
       .catch((err) => {
         if (!cancelled) setError(err.message || t('common.error'));
@@ -35182,11 +36564,7 @@ export function DoorPickerSheet({
     const q = search.trim().toLowerCase();
     if (!q) return doors;
     return doors.filter((d) => {
-      const haystack = [
-        d.name || '',
-        d.room_name || '',
-        d.building_name || '',
-      ]
+      const haystack = [d.name || '', d.room_name || '', d.building_name || '']
         .join(' ')
         .toLowerCase();
       return haystack.includes(q);
@@ -35207,10 +36585,7 @@ export function DoorPickerSheet({
       onRequestClose={onCancel}
     >
       <View
-        style={[
-          styles.container,
-          { paddingTop: insets.top + SPACING.md },
-        ]}
+        style={[styles.container, { paddingTop: insets.top + SPACING.md }]}
       >
         <View style={styles.header}>
           <Text style={styles.title}>{t('start.doorPickerTitle')}</Text>
@@ -35220,11 +36595,7 @@ export function DoorPickerSheet({
             accessibilityRole="button"
             accessibilityLabel={t('common.cancel')}
           >
-            <MaterialIcons
-              name="close"
-              size={22}
-              color={COLORS.textMuted}
-            />
+            <MaterialIcons name="close" size={22} color={COLORS.textMuted} />
           </TouchableOpacity>
         </View>
 
@@ -35239,9 +36610,11 @@ export function DoorPickerSheet({
           returnKeyType="search"
         />
 
-        {error ? <Text style={styles.error}>{error}</Text> : null}
-
-        {loading ? (
+        {error ? (
+          <View style={styles.state}>
+            <Text style={styles.error}>{error}</Text>
+          </View>
+        ) : loading ? (
           <View style={styles.state}>
             <ActivityIndicator color={COLORS.textMuted} />
           </View>
@@ -35319,9 +36692,8 @@ const styles = StyleSheet.create({
   },
   error: {
     color: COLORS.danger,
-    paddingHorizontal: SPACING.md,
-    paddingBottom: SPACING.sm,
-    fontSize: FONT_SIZE.small,
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
   },
   state: {
     flex: 1,
@@ -38894,7 +40266,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'https://inspector-discuss-invalid-gratuit.trycloudflare.com';
+const DEFAULT_API_BASE_URL = 'https://lately-glad-isp-holdem.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -39780,8 +41152,18 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
 //      case the caller is told to ask "are you inside?".
 //   2. If GPS fails or is refused: the outdoor place picker.
 //
-// The caller (Home screen, Place detail) decides what to do with
-// `shouldAskIndoor`. Typically it shows AreYouInsideSheet.
+// Two invariants this hook maintains:
+//
+//   - `start` holds ONLY a deliberate choice — a place or a door the
+//     student picked. It is never set from a raw GPS fix. GPS fixes
+//     are returned to the caller, not stored. This prevents a stale
+//     fix from being reused on a later route after the student has
+//     walked elsewhere.
+//
+//   - `resolveStart` returns a discriminated status object. Callers
+//     branch on the return value, not on the hook's state, because
+//     React state updates are asynchronous and reading `state` right
+//     after `await resolveStart(...)` would read the previous value.
 
 import { useCallback, useRef, useState } from 'react';
 
@@ -39792,6 +41174,7 @@ const GPS_TIMEOUT_MS = 15000;
 const NEAR_ENTRANCE_M = 20;
 const ACCURACY_THRESHOLD_M = 25;
 
+// Distance in metres between two lat/lon points.
 function haversineM(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const phi1 = (lat1 * Math.PI) / 180;
@@ -39817,16 +41200,42 @@ export function useStartingPoint() {
 
   const pendingResolverRef = useRef(null);
 
+  // Reset clears transient state only — the failure flags, the
+  // suspicious fix, and the internal state machine. It deliberately
+  // does NOT clear `start` or `nearbyPlaces`, because those are the
+  // student's deliberate choices and shouldn't be wiped just because
+  // they opened the chip or backed out of a sheet.
   const reset = useCallback(() => {
     setState('idle');
-    setStart(null);
-    setNearbyPlaces([]);
     setLastError(null);
     setSuspiciousBuilding(null);
     setSuspiciousFix(null);
     if (pendingResolverRef.current) {
       pendingResolverRef.current(null);
       pendingResolverRef.current = null;
+    }
+  }, []);
+
+  // Explicitly forget the chosen start. Called when the student picks
+  // "Use my current location" — the next route should do a fresh GPS
+  // read, not reuse a place they picked five minutes ago.
+  const forgetStart = useCallback(() => {
+    setStart(null);
+  }, []);
+
+  // Load the outdoor place list into `nearbyPlaces`. The caller passes
+  // `excludePlaceId` to hide the destination from the starting-point
+  // list — you can't start from where you're going.
+  const loadOutdoorPlaces = useCallback(async ({ excludePlaceId } = {}) => {
+    try {
+      const places = await listPlaces({ kind: 'outdoor', limit: 100 });
+      const filtered =
+        excludePlaceId != null
+          ? places.filter((p) => p.id !== excludePlaceId)
+          : places;
+      setNearbyPlaces(filtered);
+    } catch {
+      setNearbyPlaces([]);
     }
   }, []);
 
@@ -39857,86 +41266,114 @@ export function useStartingPoint() {
     }
   }, []);
 
+  // The student answered "yes, I'm inside". Opens the door picker.
   const startDoorPick = useCallback(async ({ buildingName } = {}) => {
     setState('pickingDoor');
     setSuspiciousBuilding(buildingName || null);
   }, []);
 
+  // The student answered "no, I'm outside". Return the fix so the
+  // caller can route from it. Does NOT store the fix in `start`.
   const confirmOutside = useCallback(() => {
     const fix = suspiciousFix;
     setSuspiciousBuilding(null);
     setSuspiciousFix(null);
+    setState('idle');
     if (fix) {
-      const result = { lat: fix.lat, lon: fix.lon, accuracyM: fix.accuracyM };
-      setStart(result);
-      return result;
+      return { lat: fix.lat, lon: fix.lon, accuracyM: fix.accuracyM };
     }
     return null;
   }, [suspiciousFix]);
 
-  const resolveStart = useCallback(async ({ destinationPlaceId } = {}) => {
-    setLastError(null);
-    setSuspiciousBuilding(null);
-    setSuspiciousFix(null);
+  /**
+   * Resolve where to start a route.
+   *
+   * Returns one of:
+   *   { status: 'ok',       start: { lat, lon, accuracyM } }
+   *   { status: 'ok_place', start: { placeId, placeName, ... } }
+   *   { status: 'ask',      buildingName }
+   *   { status: 'pick' }
+   *   { status: 'denied',   reason }
+   *
+   * The caller branches on `status`. The hook's internal `state`
+   * also updates so the sheets (which read it) show the right thing.
+   */
+  const resolveStart = useCallback(
+    async ({ destinationPlaceId } = {}) => {
+      setLastError(null);
+      setSuspiciousBuilding(null);
+      setSuspiciousFix(null);
 
-    setState('locating');
-    let granted = false;
-    try {
-      granted = await requestPermission();
-    } catch {
-      setLastError('permission_error');
-      setState('idle');
-      return null;
-    }
-
-    if (!granted) {
-      setLastError('permission_denied');
-      setState('idle');
-      return null;
-    }
-
-    let fresh = null;
-    try {
-      fresh = await getPositionOnce({ timeoutMs: GPS_TIMEOUT_MS });
-    } catch {
-      fresh = null;
-    }
-
-    if (fresh) {
-      const suspicious = await checkSuspicious(fresh);
-
-      if (suspicious) {
-        setSuspiciousFix(fresh);
-        setSuspiciousBuilding(suspicious.buildingName || null);
-        setState('askIndoor');
-        return null;
+      // If a place was already deliberately chosen, reuse it.
+      if (start && start.placeId != null) {
+        setState('idle');
+        return { status: 'ok_place', start };
       }
 
-      const result = {
-        lat: fresh.lat,
-        lon: fresh.lon,
-        accuracyM: fresh.accuracyM,
-      };
-      setStart(result);
-      setState('idle');
-      return result;
-    }
+      setState('locating');
 
-    // GPS failed. Fall back to the outdoor place picker.
-    setLastError('no_fix');
-    setState('needPick');
-    try {
-      const places = await listPlaces({ limit: 20 });
-      const filtered = places.filter((p) => p.id !== destinationPlaceId);
-      setNearbyPlaces(filtered);
-    } catch {
-      setNearbyPlaces([]);
-    }
+      let granted = false;
+      try {
+        granted = await requestPermission();
+      } catch {
+        setLastError('permission_error');
+        setState('idle');
+        return { status: 'denied', reason: 'permission_error' };
+      }
 
-    return new Promise((resolve) => {
-      pendingResolverRef.current = resolve;
-    });
-  }, []);
+      if (!granted) {
+        setLastError('permission_denied');
+        setState('idle');
+        return { status: 'denied', reason: 'permission_denied' };
+      }
+
+      let fresh = null;
+      try {
+        fresh = await getPositionOnce({ timeoutMs: GPS_TIMEOUT_MS });
+      } catch {
+        fresh = null;
+      }
+
+      if (fresh) {
+        const suspicious = await checkSuspicious(fresh);
+
+        if (suspicious) {
+          setSuspiciousFix(fresh);
+          const buildingName = suspicious.buildingName || null;
+          setSuspiciousBuilding(buildingName);
+          setState('askIndoor');
+          return { status: 'ask', buildingName };
+        }
+
+        setState('idle');
+        return {
+          status: 'ok',
+          start: {
+            lat: fresh.lat,
+            lon: fresh.lon,
+            accuracyM: fresh.accuracyM,
+          },
+        };
+      }
+
+      // GPS failed. Fall back to the outdoor place picker.
+      setLastError('no_fix');
+      setState('needPick');
+      try {
+        const places = await listPlaces({ kind: 'outdoor', limit: 100 });
+        const filtered =
+          destinationPlaceId != null
+            ? places.filter((p) => p.id !== destinationPlaceId)
+            : places;
+        setNearbyPlaces(filtered);
+      } catch {
+        setNearbyPlaces([]);
+      }
+
+      return { status: 'pick' };
+    },
+    [start]
+  );
 
   return {
     state,
@@ -39949,10 +41386,20 @@ export function useStartingPoint() {
     cancelPick,
     startDoorPick,
     confirmOutside,
+    loadOutdoorPlaces,
+    forgetStart,
     reset,
   };
 }
 
+/**
+ * Returns null if the fix looks fine (route from GPS), or an object
+ * `{ reason, buildingName }` if it looks suspicious.
+ *
+ * Two triggers:
+ *   - fix is within 20 m of any building entrance
+ *   - accuracy worse than 25 m
+ */
 async function checkSuspicious(fix) {
   if (!fix) return null;
 
@@ -39981,7 +41428,7 @@ async function checkSuspicious(fix) {
       };
     }
   } catch {
-    // No entrance lookup — skip the entrance trigger.
+    // Entrance lookup failed — skip the entrance trigger.
   }
 
   return null;
@@ -40250,28 +41697,28 @@ export function useWalkingProgress(route) {
     "chatDescription": "Ask about rules, history, and hours"
   },
   "start": {
-  "title": "Where are you starting from?",
-  "subtitle": "Pick a starting point, or use your current location.",
-  "findingLocation": "Finding your location…",
-  "noPlaces": "No places available. Try again.",
-  "couldNotResolve": "Couldn't work out where to start from.",
-  "permissionDenied": "Location permission is needed to guide you.",
-  "chipMyLocation": "From: My location",
-  "chipFromPlace": "From: {name}",
-  "optionUseGps": "Use my current location",
-  "optionPickPlace": "Pick a starting place",
-  "optionImInside": "I'm inside a building",
-  "pickPlaceTitle": "Pick a starting place",
-  "pickPlaceSubtitle": "Tap a place to start from it.",
-  "areYouInsideNamed": "Are you inside {name}?",
-  "areYouInsideUnnamed": "Are you inside a building?",
-  "areYouInsideBody": "Your GPS can't tell us for sure.",
-  "areYouInsideYes": "Yes, I'm inside",
-  "areYouInsideNo": "No, I'm outside",
-  "doorPickerTitle": "Pick your starting door",
-  "doorPickerSearchPlaceholder": "Search by door name…",
-  "doorPickerEmpty": "No doors in this building yet."
-},
+    "title": "Where are you starting from?",
+    "subtitle": "Pick a starting point, or use your current location.",
+    "findingLocation": "Finding your location…",
+    "noPlaces": "No places available. Try again.",
+    "couldNotResolve": "Couldn't work out where to start from.",
+    "permissionDenied": "Location permission is needed to guide you.",
+    "chipMyLocation": "From: My location",
+    "chipFromPlace": "From: {name}",
+    "optionUseGps": "Use my current location",
+    "optionPickPlace": "Pick a starting place",
+    "optionImInside": "I'm inside a building",
+    "pickPlaceTitle": "Pick a starting place",
+    "pickPlaceSubtitle": "Tap a place to start from it.",
+    "areYouInsideNamed": "Are you inside {name}?",
+    "areYouInsideUnnamed": "Are you inside a building?",
+    "areYouInsideBody": "Your GPS can't tell us for sure.",
+    "areYouInsideYes": "Yes, I'm inside",
+    "areYouInsideNo": "No, I'm outside",
+    "doorPickerTitle": "Pick your starting door",
+    "doorPickerSearchPlaceholder": "Search by door name…",
+    "doorPickerEmpty": "No doors in this building yet."
+  },
   "place": {
     "takeMeThere": "Take me there",
     "noDescription": "No description yet.",
@@ -40293,7 +41740,10 @@ export function useWalkingProgress(route) {
     "estimatedTime": "About {minutes} min",
     "turnByTurn": "Turn by turn",
     "narration": "Walk description",
-    "noRoute": "No route found between those places."
+    "noRoute": "No route found between those places.",
+    "locationTooFarTitle": "We can't place your location",
+    "locationTooFarBody": "Your GPS fix is too far from the walkable paths. If you're inside a building, pick the door you're nearest to.",
+    "locationTooFarButton": "Pick where you are"
   },
   "walking": {
     "title": "Walking",
@@ -40584,28 +42034,28 @@ export function ttsLanguageForCurrentLang() {
     "chatDescription": "Uliza kuhusu sheria, historia, na saa za kufungua"
   },
   "start": {
-  "title": "Unaanza kutoka wapi?",
-  "subtitle": "Chagua mahali pa kuanzia, au tumia mahali ulipo sasa.",
-  "findingLocation": "Inatafuta mahali ulipo…",
-  "noPlaces": "Hakuna mahali panapatikana. Jaribu tena.",
-  "couldNotResolve": "Hatukuweza kubaini pa kuanzia.",
-  "permissionDenied": "Ruhusa ya mahali inahitajika kukuelekeza.",
-  "chipMyLocation": "Kutoka: Mahali nilipo",
-  "chipFromPlace": "Kutoka: {name}",
-  "optionUseGps": "Tumia mahali nilipo sasa",
-  "optionPickPlace": "Chagua mahali pa kuanzia",
-  "optionImInside": "Niko ndani ya jengo",
-  "pickPlaceTitle": "Chagua mahali pa kuanzia",
-  "pickPlaceSubtitle": "Gusa mahali ili kuanzia hapo.",
-  "areYouInsideNamed": "Uko ndani ya {name}?",
-  "areYouInsideUnnamed": "Uko ndani ya jengo?",
-  "areYouInsideBody": "GPS yako haiwezi kutujulisha kwa uhakika.",
-  "areYouInsideYes": "Ndiyo, niko ndani",
-  "areYouInsideNo": "Hapana, niko nje",
-  "doorPickerTitle": "Chagua mlango wa kuanzia",
-  "doorPickerSearchPlaceholder": "Tafuta kwa jina la mlango…",
-  "doorPickerEmpty": "Hakuna milango kwenye jengo hili bado."
-},
+    "title": "Unaanza kutoka wapi?",
+    "subtitle": "Chagua mahali pa kuanzia, au tumia mahali ulipo sasa.",
+    "findingLocation": "Inatafuta mahali ulipo…",
+    "noPlaces": "Hakuna mahali panapatikana. Jaribu tena.",
+    "couldNotResolve": "Hatukuweza kubaini pa kuanzia.",
+    "permissionDenied": "Ruhusa ya mahali inahitajika kukuelekeza.",
+    "chipMyLocation": "Kutoka: Mahali nilipo",
+    "chipFromPlace": "Kutoka: {name}",
+    "optionUseGps": "Tumia mahali nilipo sasa",
+    "optionPickPlace": "Chagua mahali pa kuanzia",
+    "optionImInside": "Niko ndani ya jengo",
+    "pickPlaceTitle": "Chagua mahali pa kuanzia",
+    "pickPlaceSubtitle": "Gusa mahali ili kuanzia hapo.",
+    "areYouInsideNamed": "Uko ndani ya {name}?",
+    "areYouInsideUnnamed": "Uko ndani ya jengo?",
+    "areYouInsideBody": "GPS yako haiwezi kutujulisha kwa uhakika.",
+    "areYouInsideYes": "Ndiyo, niko ndani",
+    "areYouInsideNo": "Hapana, niko nje",
+    "doorPickerTitle": "Chagua mlango wa kuanzia",
+    "doorPickerSearchPlaceholder": "Tafuta kwa jina la mlango…",
+    "doorPickerEmpty": "Hakuna milango kwenye jengo hili bado."
+  },
   "place": {
     "takeMeThere": "Nipeleke hapo",
     "noDescription": "Bado hakuna maelezo.",
@@ -40627,7 +42077,10 @@ export function ttsLanguageForCurrentLang() {
     "estimatedTime": "Dakika {minutes}",
     "turnByTurn": "Maelekezo ya hatua kwa hatua",
     "narration": "Maelezo ya safari",
-    "noRoute": "Hakuna njia kati ya mahali hapo."
+    "noRoute": "Hakuna njia kati ya mahali hapo.",
+    "locationTooFarTitle": "Hatuwezi kubaini mahali ulipo",
+    "locationTooFarBody": "GPS yako iko mbali sana na njia za kutembea. Kama uko ndani ya jengo, chagua mlango ulio karibu nawe.",
+    "locationTooFarButton": "Chagua ulipo"
   },
   "walking": {
     "title": "Kutembea",
@@ -58003,12 +59456,16 @@ export async function listEntrances() {
  * declare which door they're starting from.
  *
  * Pass `buildingName` to narrow to one building.
+ *
+ * The backend caps /api/places at limit=200, so we stay under that.
+ * A single building has far fewer than 200 doors; if a caller ever
+ * needs more, they'd need a dedicated endpoint.
  */
 export async function listIndoorDoors({ buildingName } = {}) {
   return listPlaces({
     kind: 'indoor',
     building_name: buildingName || undefined,
-    limit: 500,
+    limit: 200,
   });
 }
 
