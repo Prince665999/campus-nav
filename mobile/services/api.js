@@ -101,6 +101,22 @@ export async function getPlace(id) {
   return request(`/api/places/${id}`);
 }
 
+/**
+ * Category and intent counts, for hiding empty chips.
+ * Returns { categories: {...}, intents: {...} }.
+ */
+export async function getPlaceTags() {
+  return request('/api/places/tags');
+}
+
+/**
+ * Every building with a room count.
+ * Returns [{ id, name, room_count }, ...].
+ */
+export async function listBuildings() {
+  return request('/api/places/buildings');
+}
+
 // ---------------------------------------------------------------
 // Media
 // ---------------------------------------------------------------
@@ -331,11 +347,6 @@ export async function getIndoorAreas({ buildingName, level }) {
 // Entrances (for the "are you inside?" trigger)
 // ---------------------------------------------------------------
 
-/**
- * All building entrances. Used by the starting-point logic to work
- * out whether a GPS fix is close enough to an entrance that the
- * student might actually be inside.
- */
 export async function listEntrances() {
   return listPlaces({ kind: 'entrance', limit: 200 });
 }
@@ -344,16 +355,6 @@ export async function listEntrances() {
 // Indoor doors (for the door picker)
 // ---------------------------------------------------------------
 
-/**
- * Indoor door nodes. Used by the door picker to let the student
- * declare which door they're starting from.
- *
- * Pass `buildingName` to narrow to one building.
- *
- * The backend caps /api/places at limit=200, so we stay under that.
- * A single building has far fewer than 200 doors; if a caller ever
- * needs more, they'd need a dedicated endpoint.
- */
 export async function listIndoorDoors({ buildingName } = {}) {
   return listPlaces({
     kind: 'indoor',

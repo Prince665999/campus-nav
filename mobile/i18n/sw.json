@@ -63,7 +63,11 @@
     "photos": "Picha",
     "photo": "Picha",
     "addFavorite": "Ongeza kwenye vipendwa",
-    "removeFavorite": "Ondoa kwenye vipendwa"
+    "removeFavorite": "Ondoa kwenye vipendwa",
+    "insideThisBuilding": "Ndani ya jengo hili",
+    "roomCount": "Vyumba {count}",
+    "searchRoomsPlaceholder": "Tafuta vyumba…",
+    "partOfBuilding": "Sehemu ya {name}"
   },
   "route": {
     "title": "Njia",

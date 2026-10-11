@@ -3,6 +3,10 @@
 // Shown when the student reaches the destination. Shows the
 // destination's photo, a "was this helpful?" feedback row, and a
 // save-to-favorites button.
+//
+// On mount, clears the shared starting point. The walk is over, so
+// the next route should begin fresh — GPS by default, or a new
+// choice the student makes.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -24,6 +28,7 @@ import {
   isFavorite,
   listMediaForPlace,
 } from '@/services/api';
+import { clearStart } from '@/services/startStore';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 
@@ -38,6 +43,13 @@ export default function ArrivalScreen() {
   const [favorited, setFavorited] = useState(false);
   const [loading, setLoading] = useState(true);
   const [feedbackSent, setFeedbackSent] = useState(null);
+
+  // The walk is over. Clear the shared start as a backstop, in case
+  // the commit-time clear was missed (route failed on preview, then
+  // the student came back to arrival some other way).
+  useEffect(() => {
+    clearStart();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

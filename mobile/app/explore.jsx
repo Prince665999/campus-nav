@@ -1,7 +1,13 @@
 // Explore screen.
 //
 // A visual browse of the whole campus. Featured places up top,
-// category and intent chips below, then a photo grid.
+// intent chips below, then a photo grid of buildings and outdoor
+// places.
+//
+// The grid deliberately excludes indoor rooms and doors: they have
+// no photos, and they're reachable through the building they're in.
+// Tapping a building opens its place-detail, which has an "Inside
+// this building" section listing its rooms.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -13,30 +19,31 @@ import {
 } from 'react-native';
 import { router, Stack } from 'expo-router';
 
-import { CategoryChips } from '@/components/CategoryChips';
 import { IntentChips } from '@/components/IntentChips';
 import { FeaturedStrip } from '@/components/FeaturedStrip';
 import { ExploreGridCard } from '@/components/ExploreGridCard';
-import { listPlaces } from '@/services/api';
+import { listBuildings, listPlaces, getPlaceTags } from '@/services/api';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 
-// How many featured places to show. The most prominent ones.
 const FEATURED_LIMIT = 5;
 
 export default function ExploreScreen() {
-  const [category, setCategory] = useState(null);
   const [intent, setIntent] = useState(null);
+  const [intentCounts, setIntentCounts] = useState(null);
 
   const [featured, setFeatured] = useState([]);
   const [places, setPlaces] = useState([]);
+  const [roomCounts, setRoomCounts] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Load featured places once. These don't change with the filters.
+  // Load featured places and room counts once. These don't change
+  // with the filters.
   useEffect(() => {
     let cancelled = false;
-    listPlaces({ limit: 200 })
+
+    listPlaces({ kind: 'outdoor', limit: 200 })
       .then((data) => {
         if (cancelled) return;
         const landmarks = data.filter((p) => p.is_landmark);
@@ -45,6 +52,28 @@ export default function ExploreScreen() {
       .catch(() => {
         if (!cancelled) setFeatured([]);
       });
+
+    listBuildings()
+      .then((buildings) => {
+        if (cancelled) return;
+        const counts = {};
+        for (const b of buildings) {
+          counts[b.id] = b.room_count;
+        }
+        setRoomCounts(counts);
+      })
+      .catch(() => {
+        if (!cancelled) setRoomCounts({});
+      });
+
+    getPlaceTags()
+      .then((tags) => {
+        if (!cancelled) setIntentCounts(tags.intents || {});
+      })
+      .catch(() => {
+        if (!cancelled) setIntentCounts(null);
+      });
+
     return () => {
       cancelled = true;
     };
@@ -57,7 +86,7 @@ export default function ExploreScreen() {
     setError(null);
 
     listPlaces({
-      category: category || undefined,
+      kind: 'outdoor',
       intent: intent || undefined,
       limit: 200,
     })
@@ -74,22 +103,14 @@ export default function ExploreScreen() {
     return () => {
       cancelled = true;
     };
-  }, [category, intent]);
+  }, [intent]);
 
   const openPlace = useCallback((place) => {
     router.push(`/place/${place.id}`);
   }, []);
 
-  // When the admin picks a category, clear the intent. Only one
-  // filter can be active at a time — the alternative is confusing.
-  const chooseCategory = useCallback((next) => {
-    setCategory(next);
-    if (next) setIntent(null);
-  }, []);
-
   const chooseIntent = useCallback((next) => {
     setIntent(next);
-    if (next) setCategory(null);
   }, []);
 
   // Convert the flat list of places into rows of 2 for the grid.
@@ -101,21 +122,22 @@ export default function ExploreScreen() {
     return rows;
   }, [places]);
 
-  const hasActiveFilter = category !== null || intent !== null;
+  const hasActiveFilter = intent !== null;
 
   return (
     <>
       <Stack.Screen options={{ title: t('explore.title') }} />
       <View style={styles.container}>
-        {/* Featured strip. Hidden when a filter is active, so the
-            whole screen focuses on the results. */}
         {!hasActiveFilter ? (
           <FeaturedStrip places={featured} onPress={openPlace} />
         ) : null}
 
         <View style={styles.chipsWrapper}>
-          <CategoryChips selected={category} onSelect={chooseCategory} />
-          <IntentChips selected={intent} onSelect={chooseIntent} />
+          <IntentChips
+            selected={intent}
+            onSelect={chooseIntent}
+            counts={intentCounts}
+          />
         </View>
 
         {error ? (
@@ -140,11 +162,10 @@ export default function ExploreScreen() {
                   <ExploreGridCard
                     key={place.id}
                     place={place}
+                    roomCount={roomCounts[place.id]}
                     onPress={() => openPlace(place)}
                   />
                 ))}
-                {/* If the row has only one place, fill the other slot
-                    so the layout stays even. */}
                 {row.length === 1 ? <View style={styles.gridFiller} /> : null}
               </View>
             )}

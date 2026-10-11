@@ -27,8 +27,10 @@ import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { setRouteRequest } from '@/services/routeRequest';
+import { clearStart } from '@/services/startStore';
 import {
   extractDestination,
+  getPlaceTags,
   listPlaces,
   listRecents,
   listFavorites,
@@ -47,6 +49,7 @@ export default function HomeScreen() {
 
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState(null);
+  const [categoryCounts, setCategoryCounts] = useState(null);
   const [results, setResults] = useState([]);
   const [recents, setRecents] = useState([]);
   const [favorites, setFavorites] = useState([]);
@@ -71,7 +74,6 @@ export default function HomeScreen() {
     suspiciousBuilding,
     resolveStart,
     choosePlace,
-    startDoorPick,
     confirmOutside,
     loadOutdoorPlaces,
     forgetStart,
@@ -100,6 +102,24 @@ export default function HomeScreen() {
         setFavorites(f);
       }
     });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fetch the category counts so we can hide chips with nothing in
+  // them. Runs once per screen mount; a session rarely changes the
+  // tag distribution mid-use.
+  useEffect(() => {
+    let cancelled = false;
+    getPlaceTags()
+      .then((tags) => {
+        if (!cancelled) setCategoryCounts(tags.categories || {});
+      })
+      .catch(() => {
+        // If the endpoint fails, fall back to showing every chip.
+        if (!cancelled) setCategoryCounts(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -193,7 +213,12 @@ export default function HomeScreen() {
   }, [debouncedQuery, category]);
 
   const openPlace = useCallback((place) => {
-    router.push(`/place/${place.id}`);
+    // Search results use `id`. Recents and favorites use `place_id`
+    // (see DestinationItem in the backend). Accept both so the same
+    // callback works for every list on this screen.
+    const id = place?.id ?? place?.place_id;
+    if (id == null) return;
+    router.push(`/place/${id}`);
   }, []);
 
   const openChat = useCallback(() => {
@@ -209,6 +234,11 @@ export default function HomeScreen() {
   }, []);
 
   // Perform a route from a resolved start to a destination.
+  //
+  // This is the single commit point for "the student is taking this
+  // route". After the request is stashed, we clear the shared start
+  // so the next route the student takes begins fresh — with a GPS
+  // read unless they pick a start again.
   const beginRoute = useCallback((resolvedStart, destId) => {
     if (!resolvedStart && !destId) {
       return false;
@@ -228,13 +258,16 @@ export default function HomeScreen() {
     } else {
       return false;
     }
+
+    // The student has committed. Clear the shared start now, before
+    // navigating, so the next screen doesn't inherit a stale choice.
+    clearStart();
+
     router.push('/route-preview');
     return true;
   }, []);
 
   // Take me there — from a place detail or from anywhere.
-  // On Home, this is only called via the sentence search or the
-  // next-class banner. Destination is a place id.
   const startRouteToDestination = useCallback(
     async (destId) => {
       if (navigatingRef.current) return;
@@ -322,7 +355,6 @@ export default function HomeScreen() {
   const handleChoosePlace = useCallback(
     (place) => {
       if (place == null) {
-        // Student picked "pick a starting place" — switch to the list.
         setStartSheetMode('place-list');
         if (nearbyPlaces.length === 0) {
           loadOutdoorPlaces({ excludePlaceId: pendingDestination });
@@ -352,8 +384,6 @@ export default function HomeScreen() {
     (door) => {
       setDoorPickerOpen(false);
       choosePlace(door);
-      // If there's a pending destination (auto-trigger flow), route
-      // to it now.
       if (pendingDestination != null) {
         beginRoute(
           {
@@ -371,7 +401,6 @@ export default function HomeScreen() {
     [choosePlace, pendingDestination, beginRoute]
   );
 
-  // Auto-trigger — "Are you inside?" — yes/no.
   const handleInsideYes = useCallback(() => {
     setDoorPickerOpen(true);
   }, []);
@@ -457,7 +486,11 @@ export default function HomeScreen() {
 
         {showSearchResults ? (
           <>
-            <CategoryChips selected={category} onSelect={setCategory} />
+            <CategoryChips
+              selected={category}
+              onSelect={setCategory}
+              counts={categoryCounts}
+            />
             {error ? (
               <View style={styles.state}>
                 <Text style={styles.errorText}>{error}</Text>
@@ -515,13 +548,16 @@ export default function HomeScreen() {
               <Text style={styles.sectionTitle}>
                 {t('home.categoriesTitle')}
               </Text>
-              <CategoryChips selected={null} onSelect={setCategory} />
+              <CategoryChips
+                selected={null}
+                onSelect={setCategory}
+                counts={categoryCounts}
+              />
             </View>
           </ScrollView>
         )}
       </View>
 
-      {/* Starting-point sheet */}
       <StartingPointSheet
         visible={startSheetOpen}
         places={nearbyPlaces}
@@ -535,7 +571,6 @@ export default function HomeScreen() {
         }}
       />
 
-      {/* Door picker */}
       <DoorPickerSheet
         visible={doorPickerOpen}
         buildingName={suspiciousBuilding}
@@ -543,7 +578,6 @@ export default function HomeScreen() {
         onCancel={() => setDoorPickerOpen(false)}
       />
 
-      {/* Are you inside? */}
       <AreYouInsideSheet
         visible={startState === 'askIndoor'}
         buildingName={suspiciousBuilding}

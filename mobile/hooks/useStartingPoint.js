@@ -1,20 +1,22 @@
 // Determines where a route should start from.
 //
 // Priority order:
-//   1. A fresh GPS fix — unless it looks "suspicious" (near a
+//   1. The shared start, if the student has chosen one (a place or
+//      a door). Shared across screens via startStore.
+//   2. A fresh GPS fix — unless it looks "suspicious" (near a
 //      building entrance, or accuracy worse than 25 m). In that
 //      case the caller is told to ask "are you inside?".
-//   2. If GPS fails or is refused: the outdoor place picker.
+//   3. If GPS fails or is refused: the outdoor place picker.
 //
 // Two invariants this hook maintains:
 //
-//   - `start` holds ONLY a deliberate choice — a place or a door the
-//     student picked. It is never set from a raw GPS fix. GPS fixes
-//     are returned to the caller, not stored. This prevents a stale
-//     fix from being reused on a later route after the student has
-//     walked elsewhere.
+//   - The shared start holds ONLY a deliberate choice — a place or
+//     a door the student picked. It is never set from a raw GPS fix.
+//     GPS fixes are returned to the caller, not stored. This prevents
+//     a stale fix from being reused on a later route after the
+//     student has walked elsewhere.
 //
-//   - `resolveStart` returns a discriminated status object. Callers
+//   - resolveStart returns a discriminated status object. Callers
 //     branch on the return value, not on the hook's state, because
 //     React state updates are asynchronous and reading `state` right
 //     after `await resolveStart(...)` would read the previous value.
@@ -23,6 +25,7 @@ import { useCallback, useRef, useState } from 'react';
 
 import { getPositionOnce, requestPermission } from '@/services/location';
 import { listPlaces, listEntrances } from '@/services/api';
+import { useStart, setStart, clearStart } from '@/services/startStore';
 
 const GPS_TIMEOUT_MS = 15000;
 const NEAR_ENTRANCE_M = 20;
@@ -43,7 +46,6 @@ function haversineM(lat1, lon1, lat2, lon2) {
 
 export function useStartingPoint() {
   const [state, setState] = useState('idle');
-  const [start, setStart] = useState(null);
   const [nearbyPlaces, setNearbyPlaces] = useState([]);
   const [lastError, setLastError] = useState(null);
 
@@ -52,13 +54,17 @@ export function useStartingPoint() {
   const [suspiciousBuilding, setSuspiciousBuilding] = useState(null);
   const [suspiciousFix, setSuspiciousFix] = useState(null);
 
+  // The shared start. Lives in a module-level store so all screens
+  // see the same value.
+  const start = useStart();
+
   const pendingResolverRef = useRef(null);
 
   // Reset clears transient state only — the failure flags, the
   // suspicious fix, and the internal state machine. It deliberately
-  // does NOT clear `start` or `nearbyPlaces`, because those are the
-  // student's deliberate choices and shouldn't be wiped just because
-  // they opened the chip or backed out of a sheet.
+  // does NOT clear the shared start or nearbyPlaces, because those
+  // are the student's deliberate choices and shouldn't be wiped just
+  // because they opened the chip or backed out of a sheet.
   const reset = useCallback(() => {
     setState('idle');
     setLastError(null);
@@ -74,7 +80,7 @@ export function useStartingPoint() {
   // "Use my current location" — the next route should do a fresh GPS
   // read, not reuse a place they picked five minutes ago.
   const forgetStart = useCallback(() => {
-    setStart(null);
+    clearStart();
   }, []);
 
   // Load the outdoor place list into `nearbyPlaces`. The caller passes
@@ -127,7 +133,8 @@ export function useStartingPoint() {
   }, []);
 
   // The student answered "no, I'm outside". Return the fix so the
-  // caller can route from it. Does NOT store the fix in `start`.
+  // caller can route from it. Does NOT store the fix in the shared
+  // start.
   const confirmOutside = useCallback(() => {
     const fix = suspiciousFix;
     setSuspiciousBuilding(null);

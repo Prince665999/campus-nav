@@ -63,7 +63,11 @@
     "photos": "Photos",
     "photo": "Photo",
     "addFavorite": "Add to favorites",
-    "removeFavorite": "Remove from favorites"
+    "removeFavorite": "Remove from favorites",
+    "insideThisBuilding": "Inside this building",
+    "roomCount": "{count} rooms",
+    "searchRoomsPlaceholder": "Search rooms…",
+    "partOfBuilding": "Part of {name}"
   },
   "route": {
     "title": "Route",

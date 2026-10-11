@@ -1,4 +1,13 @@
 // Horizontal scroll of category filter chips.
+//
+// The `counts` prop is optional. When provided, it's a
+// { category: count } map from the /api/places/tags endpoint, and any
+// chip whose category has zero places is hidden. The "All" chip is
+// always shown.
+//
+// When counts is null (endpoint failed, or not yet loaded), every
+// chip is shown. That's the honest fallback: better to show a chip
+// that might be empty than to hide chips we can't count.
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
@@ -8,7 +17,17 @@ import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
 
-export function CategoryChips({ selected, onSelect }) {
+export function CategoryChips({ selected, onSelect, counts = null }) {
+  const visible = CATEGORIES.filter((cat) => {
+    // "All" (key === null) is always shown.
+    if (cat.key == null) return true;
+    if (counts == null) return true;
+    const n = counts[cat.key];
+    return typeof n === 'number' && n > 0;
+  });
+
+  // If every category is empty and only "All" remains, still show it
+  // — the student can tap All and get the full unfiltered list.
   return (
     <ScrollView
       horizontal
@@ -16,7 +35,7 @@ export function CategoryChips({ selected, onSelect }) {
       contentContainerStyle={styles.scrollContent}
       style={styles.scroll}
     >
-      {CATEGORIES.map((cat) => {
+      {visible.map((cat) => {
         const isSelected = selected === cat.key;
         return (
           <TouchableOpacity

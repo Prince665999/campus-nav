@@ -20,11 +20,13 @@ import {
   removeFavorite,
 } from '@/services/api';
 import { setRouteRequest } from '@/services/routeRequest';
+import { clearStart } from '@/services/startStore';
 import { PhotoCarousel } from '@/components/PhotoCarousel';
 import { ReportSheet } from '@/components/ReportSheet';
 import { StartingPointSheet } from '@/components/StartingPointSheet';
 import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { AreYouInsideSheet } from '@/components/AreYouInsideSheet';
+import { BuildingRooms } from '@/components/BuildingRooms';
 import { FromChip } from '@/components/FromChip';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { t } from '@/i18n';
@@ -123,6 +125,11 @@ export default function PlaceDetailScreen() {
         setError(t('start.couldNotResolve'));
         return;
       }
+
+      // The student has committed. Clear the shared start now, before
+      // navigating, so the next screen doesn't inherit a stale choice.
+      clearStart();
+
       router.push('/route-preview');
     },
     [place]
@@ -133,8 +140,6 @@ export default function PlaceDetailScreen() {
     if (navigatingRef.current) return;
     navigatingRef.current = true;
 
-    // If the student has explicitly chosen a start via the chip,
-    // use it directly.
     if (start && start.placeId != null) {
       navigateToRoute(start);
       navigatingRef.current = false;
@@ -156,8 +161,6 @@ export default function PlaceDetailScreen() {
           return;
 
         case 'ask':
-          // AreYouInsideSheet will show; the student's answer
-          // drives the rest.
           setResolvingStart(false);
           return;
 
@@ -210,11 +213,11 @@ export default function PlaceDetailScreen() {
     (door) => {
       setDoorPickerOpen(false);
       if (!place) return;
-      // The picked door IS the start. Route straight to this place.
       setRouteRequest({
         fromId: door.id,
         toId: place.id,
       });
+      clearStart();
       router.push('/route-preview');
     },
     [place]
@@ -252,6 +255,12 @@ export default function PlaceDetailScreen() {
     setDoorPickerOpen(true);
   }, []);
 
+  // Open a room inside this building. Called by BuildingRooms when a
+  // room row is tapped.
+  const openRoom = useCallback((room) => {
+    router.push(`/place/${room.id}`);
+  }, []);
+
   if (loading) {
     return (
       <View style={styles.state}>
@@ -267,6 +276,12 @@ export default function PlaceDetailScreen() {
       </View>
     );
   }
+
+  // A building is an outdoor place that can have rooms inside it.
+  // Indoor places and entrances never show the section, because
+  // their own building_name points up to a building, not down to
+  // rooms.
+  const isBuilding = place.kind === 'outdoor';
 
   return (
     <>
@@ -335,6 +350,17 @@ export default function PlaceDetailScreen() {
               {place.wifi_ssid ? `: ${place.wifi_ssid}` : ''}
             </Text>
           </Section>
+        ) : null}
+
+        {/* Rooms inside this building. Only for outdoor places —
+            indoor places and entrances don't have rooms of their
+            own. The component renders nothing if the building has
+            no matching rooms. */}
+        {isBuilding ? (
+          <BuildingRooms
+            buildingName={place.name}
+            onOpenRoom={openRoom}
+          />
         ) : null}
 
         <FromChip start={start} onPress={openStartSheet} />

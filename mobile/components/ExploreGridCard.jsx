@@ -1,4 +1,8 @@
 // One card in the two-column grid on Explore.
+//
+// If `roomCount` is provided and > 0, shows a small "· N rooms"
+// badge in the caption. That tells the student the building has an
+// "Inside this building" section waiting on its detail page.
 
 import {
   Image,
@@ -31,9 +35,11 @@ function colorForName(name) {
   return PLACEHOLDER_COLORS[Math.abs(hash) % PLACEHOLDER_COLORS.length];
 }
 
-export function ExploreGridCard({ place, onPress }) {
+export function ExploreGridCard({ place, onPress, roomCount }) {
   const photo = place.primary_photo_url;
   const placeholderColor = colorForName(place.name);
+  const showRoomCount =
+    typeof roomCount === 'number' && roomCount > 0;
 
   return (
     <TouchableOpacity
@@ -41,12 +47,26 @@ export function ExploreGridCard({ place, onPress }) {
       onPress={onPress}
       activeOpacity={0.85}
       accessibilityRole="button"
-      accessibilityLabel={place.name}
+      accessibilityLabel={
+        showRoomCount
+          ? `${place.name}, ${roomCount} rooms`
+          : place.name
+      }
     >
       {photo ? (
-        <Image source={{ uri: photo }} style={styles.photo} resizeMode="cover" />
+        <Image
+          source={{ uri: photo }}
+          style={styles.photo}
+          resizeMode="cover"
+        />
       ) : (
-        <View style={[styles.photo, styles.placeholder, { backgroundColor: placeholderColor }]}>
+        <View
+          style={[
+            styles.photo,
+            styles.placeholder,
+            { backgroundColor: placeholderColor },
+          ]}
+        >
           <MaterialIcons
             name={ICONS[place.categoryIconKey] || ICONS.place}
             size={32}
@@ -61,6 +81,11 @@ export function ExploreGridCard({ place, onPress }) {
         {place.name_sw ? (
           <Text style={styles.nameSw} numberOfLines={1}>
             {place.name_sw}
+          </Text>
+        ) : null}
+        {showRoomCount ? (
+          <Text style={styles.roomCount} numberOfLines={1}>
+            {roomCount} rooms
           </Text>
         ) : null}
       </View>
@@ -99,5 +124,11 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.small - 1,
     color: COLORS.textMuted,
     marginTop: 2,
+  },
+  roomCount: {
+    fontSize: FONT_SIZE.small - 1,
+    color: COLORS.primary,
+    fontWeight: '600',
+    marginTop: 4,
   },
 });

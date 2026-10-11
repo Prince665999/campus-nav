@@ -1,5 +1,10 @@
 // A horizontal row of intent chips for Explore. Tapping one filters
 // the grid by that intent. Tapping the active one clears it.
+//
+// `counts` is optional. When provided (from /api/places/tags), any
+// intent whose count is zero is hidden. When null, every chip is
+// shown — better to show a chip that might be empty than to hide
+// chips we can't count.
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
 
@@ -7,7 +12,17 @@ import { INTENTS } from '@/constants/intents';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
-export function IntentChips({ selected, onSelect }) {
+export function IntentChips({ selected, onSelect, counts = null }) {
+  const visible = INTENTS.filter((intent) => {
+    if (counts == null) return true;
+    const n = counts[intent.key];
+    return typeof n === 'number' && n > 0;
+  });
+
+  if (visible.length === 0) {
+    return null;
+  }
+
   return (
     <ScrollView
       horizontal
@@ -15,7 +30,7 @@ export function IntentChips({ selected, onSelect }) {
       contentContainerStyle={styles.scrollContent}
       style={styles.scroll}
     >
-      {INTENTS.map((intent) => {
+      {visible.map((intent) => {
         const isSelected = selected === intent.key;
         return (
           <TouchableOpacity
