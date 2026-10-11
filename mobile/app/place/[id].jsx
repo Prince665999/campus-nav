@@ -16,6 +16,7 @@ import {
   addFavorite,
   getPlace,
   isFavorite,
+  listBuildings,
   listMediaForPlace,
   removeFavorite,
 } from '@/services/api';
@@ -26,7 +27,6 @@ import { ReportSheet } from '@/components/ReportSheet';
 import { StartingPointSheet } from '@/components/StartingPointSheet';
 import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { AreYouInsideSheet } from '@/components/AreYouInsideSheet';
-import { BuildingRooms } from '@/components/BuildingRooms';
 import { FromChip } from '@/components/FromChip';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { t } from '@/i18n';
@@ -44,6 +44,7 @@ export default function PlaceDetailScreen() {
   const [error, setError] = useState(null);
   const [reportOpen, setReportOpen] = useState(false);
   const [resolvingStart, setResolvingStart] = useState(false);
+  const [roomCount, setRoomCount] = useState(0);
 
   const [startSheetOpen, setStartSheetOpen] = useState(false);
   const [startSheetMode, setStartSheetMode] = useState('choose');
@@ -92,6 +93,28 @@ export default function PlaceDetailScreen() {
     };
   }, [placeId]);
 
+  // Look up the room count for this building. Only outdoor places can
+  // be buildings.
+  useEffect(() => {
+    if (!place || place.kind !== 'outdoor') {
+      setRoomCount(0);
+      return;
+    }
+    let cancelled = false;
+    listBuildings()
+      .then((buildings) => {
+        if (cancelled) return;
+        const match = buildings.find((b) => b.id === place.id);
+        setRoomCount(match ? match.room_count : 0);
+      })
+      .catch(() => {
+        if (!cancelled) setRoomCount(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [place]);
+
   const toggleFavorite = useCallback(async () => {
     const next = !favorited;
     setFavorited(next);
@@ -106,19 +129,26 @@ export default function PlaceDetailScreen() {
     }
   }, [favorited, placeId]);
 
+  // Perform a route from a resolved start to this place.
+  //
+  // placeId is checked FIRST. A deliberately chosen start (a room,
+  // door, or place) carries both a placeId and coordinates. If we
+  // checked coordinates first, the start would go out as raw lat/lon
+  // and the backend would snap it to the nearest outdoor path node —
+  // silently replacing the room with a nearby outdoor point.
   const navigateToRoute = useCallback(
     (resolvedStart) => {
       if (!place) return;
-      if (resolvedStart.lat != null && resolvedStart.lon != null) {
+      if (resolvedStart.placeId != null) {
+        setRouteRequest({
+          fromId: resolvedStart.placeId,
+          toId: place.id,
+        });
+      } else if (resolvedStart.lat != null && resolvedStart.lon != null) {
         setRouteRequest({
           fromLat: resolvedStart.lat,
           fromLon: resolvedStart.lon,
           fromAccuracyM: resolvedStart.accuracyM,
-          toId: place.id,
-        });
-      } else if (resolvedStart.placeId != null) {
-        setRouteRequest({
-          fromId: resolvedStart.placeId,
           toId: place.id,
         });
       } else {
@@ -126,10 +156,7 @@ export default function PlaceDetailScreen() {
         return;
       }
 
-      // The student has committed. Clear the shared start now, before
-      // navigating, so the next screen doesn't inherit a stale choice.
       clearStart();
-
       router.push('/route-preview');
     },
     [place]
@@ -255,11 +282,13 @@ export default function PlaceDetailScreen() {
     setDoorPickerOpen(true);
   }, []);
 
-  // Open a room inside this building. Called by BuildingRooms when a
-  // room row is tapped.
-  const openRoom = useCallback((room) => {
-    router.push(`/place/${room.id}`);
-  }, []);
+  const openRooms = useCallback(() => {
+    if (!place) return;
+    router.push({
+      pathname: '/building-rooms',
+      params: { name: place.name },
+    });
+  }, [place]);
 
   if (loading) {
     return (
@@ -277,11 +306,7 @@ export default function PlaceDetailScreen() {
     );
   }
 
-  // A building is an outdoor place that can have rooms inside it.
-  // Indoor places and entrances never show the section, because
-  // their own building_name points up to a building, not down to
-  // rooms.
-  const isBuilding = place.kind === 'outdoor';
+  const isBuilding = place.kind === 'outdoor' && roomCount > 0;
 
   return (
     <>
@@ -352,15 +377,32 @@ export default function PlaceDetailScreen() {
           </Section>
         ) : null}
 
-        {/* Rooms inside this building. Only for outdoor places —
-            indoor places and entrances don't have rooms of their
-            own. The component renders nothing if the building has
-            no matching rooms. */}
+        {/* Buildings with rooms get a single button. The full list
+            lives on its own screen, so the "Take me there" button
+            stays within reach. */}
         {isBuilding ? (
-          <BuildingRooms
-            buildingName={place.name}
-            onOpenRoom={openRoom}
-          />
+          <TouchableOpacity
+            style={styles.roomsButton}
+            onPress={openRooms}
+            accessibilityRole="button"
+            accessibilityLabel={t('place.seeAllRooms', {
+              count: roomCount,
+            })}
+          >
+            <MaterialIcons
+              name="meeting-room"
+              size={22}
+              color={COLORS.primary}
+            />
+            <Text style={styles.roomsButtonText}>
+              {t('place.seeAllRooms', { count: roomCount })}
+            </Text>
+            <MaterialIcons
+              name="chevron-right"
+              size={22}
+              color={COLORS.textMuted}
+            />
+          </TouchableOpacity>
         ) : null}
 
         <FromChip start={start} onPress={openStartSheet} />
@@ -510,6 +552,22 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   body: { fontSize: FONT_SIZE.body, color: '#374151', lineHeight: 22 },
+  roomsButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.md,
+    paddingHorizontal: SPACING.lg,
+    paddingVertical: SPACING.md,
+    minHeight: TOUCH.minHeight,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderSubtle,
+  },
+  roomsButtonText: {
+    flex: 1,
+    fontSize: FONT_SIZE.body + 1,
+    color: COLORS.text,
+    fontWeight: '600',
+  },
   actions: { padding: SPACING.lg },
   primaryButton: {
     backgroundColor: COLORS.primaryDark,

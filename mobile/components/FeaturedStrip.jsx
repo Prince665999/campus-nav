@@ -4,6 +4,11 @@
 // If a place has a primary photo, it's shown. Otherwise a coloured
 // placeholder is shown with the category icon. Same for the grid
 // cards — consistent look across both.
+//
+// `roomCounts` is optional. When provided (a map of place id →
+// room count), a card whose building has rooms shows "· N rooms"
+// under its category line. The counts arrive a moment after the
+// strip renders, so the badge pops in once they're loaded.
 
 import {
   Dimensions,
@@ -47,7 +52,7 @@ function colorForName(name) {
   return PLACEHOLDER_COLORS[Math.abs(hash) % PLACEHOLDER_COLORS.length];
 }
 
-export function FeaturedStrip({ places, onPress }) {
+export function FeaturedStrip({ places, onPress, roomCounts }) {
   if (!places || places.length === 0) return null;
 
   return (
@@ -63,6 +68,7 @@ export function FeaturedStrip({ places, onPress }) {
           <FeaturedCard
             key={place.id}
             place={place}
+            roomCount={roomCounts?.[place.id]}
             onPress={() => onPress(place)}
           />
         ))}
@@ -71,9 +77,26 @@ export function FeaturedStrip({ places, onPress }) {
   );
 }
 
-function FeaturedCard({ place, onPress }) {
+function FeaturedCard({ place, onPress, roomCount }) {
   const photo = place.primary_photo_url;
   const placeholderColor = colorForName(place.name);
+  const showRooms = typeof roomCount === 'number' && roomCount > 0;
+
+  const categoryText = place.category
+    ? prettifyCategory(place.category)
+    : '';
+  const roomText = showRooms ? `${roomCount} rooms` : '';
+
+  // Build the caption line: category, then "· N rooms" if both
+  // exist; either one alone if only one exists.
+  let caption = '';
+  if (categoryText && roomText) {
+    caption = `${categoryText} · ${roomText}`;
+  } else if (roomText) {
+    caption = roomText;
+  } else if (categoryText) {
+    caption = categoryText;
+  }
 
   return (
     <TouchableOpacity
@@ -81,12 +104,26 @@ function FeaturedCard({ place, onPress }) {
       onPress={onPress}
       activeOpacity={0.85}
       accessibilityRole="button"
-      accessibilityLabel={place.name}
+      accessibilityLabel={
+        showRooms
+          ? `${place.name}, ${roomCount} rooms`
+          : place.name
+      }
     >
       {photo ? (
-        <Image source={{ uri: photo }} style={styles.photo} resizeMode="cover" />
+        <Image
+          source={{ uri: photo }}
+          style={styles.photo}
+          resizeMode="cover"
+        />
       ) : (
-        <View style={[styles.photo, styles.placeholder, { backgroundColor: placeholderColor }]}>
+        <View
+          style={[
+            styles.photo,
+            styles.placeholder,
+            { backgroundColor: placeholderColor },
+          ]}
+        >
           <MaterialIcons
             name={ICONS[place.categoryIconKey] || ICONS.place}
             size={48}
@@ -98,9 +135,12 @@ function FeaturedCard({ place, onPress }) {
         <Text style={styles.name} numberOfLines={1}>
           {place.name}
         </Text>
-        {place.category ? (
-          <Text style={styles.category} numberOfLines={1}>
-            {prettifyCategory(place.category)}
+        {caption ? (
+          <Text
+            style={[styles.category, showRooms && styles.roomCount]}
+            numberOfLines={1}
+          >
+            {caption}
           </Text>
         ) : null}
       </View>
@@ -162,5 +202,9 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
     marginTop: 2,
+  },
+  roomCount: {
+    color: COLORS.primary,
+    fontWeight: '600',
   },
 });

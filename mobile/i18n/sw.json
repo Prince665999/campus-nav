@@ -67,7 +67,8 @@
     "insideThisBuilding": "Ndani ya jengo hili",
     "roomCount": "Vyumba {count}",
     "searchRoomsPlaceholder": "Tafuta vyumba…",
-    "partOfBuilding": "Sehemu ya {name}"
+    "partOfBuilding": "Sehemu ya {name}",
+    "seeAllRooms": "Ona vyumba vyote {count}"
   },
   "route": {
     "title": "Njia",

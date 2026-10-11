@@ -1,13 +1,13 @@
 // Explore screen.
 //
-// A visual browse of the whole campus. Featured places up top,
-// intent chips below, then a photo grid of buildings and outdoor
-// places.
+// A visual browse of the whole campus. Featured places (landmarks)
+// up top, intent chips below, then a photo grid of buildings and
+// outdoor places.
 //
 // The grid deliberately excludes indoor rooms and doors: they have
 // no photos, and they're reachable through the building they're in.
-// Tapping a building opens its place-detail, which has an "Inside
-// this building" section listing its rooms.
+// Tapping a building opens its place-detail, which has a "See all
+// rooms" button leading to a dedicated rooms screen.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -38,8 +38,8 @@ export default function ExploreScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Load featured places and room counts once. These don't change
-  // with the filters.
+  // Load featured places, room counts, and intent counts once.
+  // These don't change with the intent filter.
   useEffect(() => {
     let cancelled = false;
 
@@ -79,7 +79,7 @@ export default function ExploreScreen() {
     };
   }, []);
 
-  // Load the grid whenever a filter changes.
+  // Load the grid whenever the intent filter changes.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -129,7 +129,11 @@ export default function ExploreScreen() {
       <Stack.Screen options={{ title: t('explore.title') }} />
       <View style={styles.container}>
         {!hasActiveFilter ? (
-          <FeaturedStrip places={featured} onPress={openPlace} />
+          <FeaturedStrip
+            places={featured}
+            onPress={openPlace}
+            roomCounts={roomCounts}
+          />
         ) : null}
 
         <View style={styles.chipsWrapper}>

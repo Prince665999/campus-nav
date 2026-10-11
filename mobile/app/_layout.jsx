@@ -34,7 +34,6 @@ function SettingsButton() {
 function AppStack() {
   const { settings } = useSettings();
 
-  // Keep the haptics service in sync with the setting.
   useEffect(() => {
     haptics.setEnabled(settings.hapticsEnabled);
   }, [settings.hapticsEnabled]);
@@ -57,6 +56,7 @@ function AppStack() {
         }}
       />
       <Stack.Screen name="place/[id]" options={{ title: 'Place' }} />
+      <Stack.Screen name="building-rooms" options={{ title: 'Rooms' }} />
       <Stack.Screen name="route-preview" options={{ title: 'Route' }} />
       <Stack.Screen name="walking" options={{ title: 'Walking' }} />
       <Stack.Screen name="arrival" options={{ title: 'Arrival' }} />

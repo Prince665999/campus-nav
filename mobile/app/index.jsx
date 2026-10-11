@@ -83,14 +83,12 @@ export default function HomeScreen() {
   const debouncedQuery = useDebounce(query, SEARCH_DEBOUNCE_MS);
   const isSearching = debouncedQuery.length > 0 || category !== null;
 
-  // First launch: redirect to onboarding.
   useEffect(() => {
     if (loaded && !settings.hasSeenOnboarding) {
       router.replace('/onboarding');
     }
   }, [loaded, settings.hasSeenOnboarding]);
 
-  // Load recents and favorites.
   useEffect(() => {
     let cancelled = false;
     Promise.all([
@@ -107,9 +105,6 @@ export default function HomeScreen() {
     };
   }, []);
 
-  // Fetch the category counts so we can hide chips with nothing in
-  // them. Runs once per screen mount; a session rarely changes the
-  // tag distribution mid-use.
   useEffect(() => {
     let cancelled = false;
     getPlaceTags()
@@ -117,7 +112,6 @@ export default function HomeScreen() {
         if (!cancelled) setCategoryCounts(tags.categories || {});
       })
       .catch(() => {
-        // If the endpoint fails, fall back to showing every chip.
         if (!cancelled) setCategoryCounts(null);
       });
     return () => {
@@ -125,7 +119,6 @@ export default function HomeScreen() {
     };
   }, []);
 
-  // Load timetable week when the selection changes.
   useEffect(() => {
     const programYearId = settings.programYearId;
     if (!programYearId) {
@@ -146,7 +139,6 @@ export default function HomeScreen() {
     };
   }, [settings.programYearId]);
 
-  // Compute the next class.
   useEffect(() => {
     function computeNext() {
       if (!weekEntries.length) {
@@ -187,7 +179,6 @@ export default function HomeScreen() {
     return () => clearInterval(id);
   }, [weekEntries]);
 
-  // Search.
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -213,9 +204,6 @@ export default function HomeScreen() {
   }, [debouncedQuery, category]);
 
   const openPlace = useCallback((place) => {
-    // Search results use `id`. Recents and favorites use `place_id`
-    // (see DestinationItem in the backend). Accept both so the same
-    // callback works for every list on this screen.
     const id = place?.id ?? place?.place_id;
     if (id == null) return;
     router.push(`/place/${id}`);
@@ -235,39 +223,38 @@ export default function HomeScreen() {
 
   // Perform a route from a resolved start to a destination.
   //
-  // This is the single commit point for "the student is taking this
-  // route". After the request is stashed, we clear the shared start
-  // so the next route the student takes begins fresh — with a GPS
-  // read unless they pick a start again.
+  // placeId is checked FIRST. A deliberately chosen start (a room,
+  // door, or place) has both a placeId and coordinates. If we check
+  // coordinates first, we send the start as raw lat/lon, and the
+  // backend snaps it to the nearest outdoor path node — losing the
+  // room the student actually picked. Coordinates are only used
+  // when there is no placeId, which means the start is a live GPS
+  // fix.
   const beginRoute = useCallback((resolvedStart, destId) => {
-    if (!resolvedStart && !destId) {
+    if (!resolvedStart || !destId) {
       return false;
     }
-    if (resolvedStart.lat != null && resolvedStart.lon != null) {
+    if (resolvedStart.placeId != null) {
+      setRouteRequest({
+        fromId: resolvedStart.placeId,
+        toId: destId,
+      });
+    } else if (resolvedStart.lat != null && resolvedStart.lon != null) {
       setRouteRequest({
         fromLat: resolvedStart.lat,
         fromLon: resolvedStart.lon,
         fromAccuracyM: resolvedStart.accuracyM,
         toId: destId,
       });
-    } else if (resolvedStart.placeId != null) {
-      setRouteRequest({
-        fromId: resolvedStart.placeId,
-        toId: destId,
-      });
     } else {
       return false;
     }
 
-    // The student has committed. Clear the shared start now, before
-    // navigating, so the next screen doesn't inherit a stale choice.
     clearStart();
-
     router.push('/route-preview');
     return true;
   }, []);
 
-  // Take me there — from a place detail or from anywhere.
   const startRouteToDestination = useCallback(
     async (destId) => {
       if (navigatingRef.current) return;
@@ -286,9 +273,6 @@ export default function HomeScreen() {
             return;
 
           case 'ask':
-            // AreYouInsideSheet is driven by startState === 'askIndoor'.
-            // Keep navigatingRef true and pendingDestination set —
-            // the sheet's handlers will finish the flow.
             return;
 
           case 'pick':
@@ -320,7 +304,6 @@ export default function HomeScreen() {
     [resolveStart, beginRoute]
   );
 
-  // Banner's Take me there.
   const navigateToNextClass = useCallback(
     async (entry) => {
       if (entry.venue_place_id == null) return;
@@ -329,7 +312,6 @@ export default function HomeScreen() {
     [startRouteToDestination]
   );
 
-  // Sentence search: "take me to the library".
   const tryResolveSentence = useCallback(async () => {
     const text = query.trim();
     if (!text || text.length < 5) return;
@@ -345,7 +327,6 @@ export default function HomeScreen() {
     }
   }, [query, startRouteToDestination]);
 
-  // Chip handlers.
   const openStartSheet = useCallback(() => {
     setStartSheetMode('choose');
     setStartSheetOpen(true);
@@ -370,8 +351,6 @@ export default function HomeScreen() {
 
   const handleUseGps = useCallback(() => {
     setStartSheetOpen(false);
-    // Forget any previously chosen start so the next route does a
-    // fresh GPS read.
     forgetStart();
   }, [forgetStart]);
 
@@ -437,11 +416,7 @@ export default function HomeScreen() {
           accessibilityRole="button"
           accessibilityLabel={t('timetable.title')}
         >
-          <MaterialIcons
-            name="calendar-today"
-            size={22}
-            color={COLORS.text}
-          />
+          <MaterialIcons name="calendar-today" size={22} color={COLORS.text} />
         </TouchableOpacity>
         <Link href="/settings" asChild>
           <TouchableOpacity
@@ -449,11 +424,7 @@ export default function HomeScreen() {
             accessibilityRole="button"
             accessibilityLabel="Settings"
           >
-            <MaterialIcons
-              name={ICONS.settings}
-              size={22}
-              color={COLORS.text}
-            />
+            <MaterialIcons name={ICONS.settings} size={22} color={COLORS.text} />
           </TouchableOpacity>
         </Link>
       </View>

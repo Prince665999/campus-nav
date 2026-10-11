@@ -1,23 +1,13 @@
 // "Inside this building" — the list of rooms and offices inside a
 // building, grouped by floor.
 //
-// Shown on the place-detail screen for a building. The rooms come
+// Shown on its own screen (app/building-rooms.jsx). The rooms come
 // from /api/places?kind=indoor&building_name=<name>, which returns
 // every indoor place whose building_name tag matches the building's
-// name. The ingest keeps those identical, so this is an exact
-// match.
+// name.
 //
-// What this component does NOT do:
-//   - It does not show photos. Rooms rarely have them.
-//   - It does not offer "Take me there" from a room row. Tapping a
-//     row opens the room's own place-detail, which has the button.
-//
-// What it does:
-//   - Groups rooms by floor (level), sorted basement → ground → upper.
-//   - Sorts rooms by name within a floor.
-//   - Shows a search box above the list when there are more than
-//     10 rooms, so a large building like the Admin Block stays
-//     navigable.
+// Only the door's name is shown. The room_name field is not
+// rendered — it's redundant with the door name in most buildings.
 
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -80,23 +70,19 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
     const q = search.trim().toLowerCase();
     if (!q) return rooms;
     return rooms.filter((r) => {
-      const haystack = [r.name || '', r.room_name || '', r.ref || '']
-        .join(' ')
-        .toLowerCase();
+      const haystack = [r.name || '', r.ref || ''].join(' ').toLowerCase();
       return haystack.includes(q);
     });
   }, [rooms, search]);
 
   const grouped = useMemo(() => groupByLevel(filtered), [filtered]);
 
-  // If the building has no rooms, render nothing. The caller doesn't
-  // need to know — no rooms means no section.
   if (!loading && (!rooms || rooms.length === 0)) {
     return null;
   }
 
   return (
-    <View style={styles.section}>
+    <View>
       <View style={styles.header}>
         <Text style={styles.sectionTitle}>
           {t('place.insideThisBuilding')}
@@ -145,16 +131,9 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
                     accessibilityRole="button"
                     accessibilityLabel={room.name}
                   >
-                    <View style={styles.roomText}>
-                      <Text style={styles.roomName} numberOfLines={1}>
-                        {room.name}
-                      </Text>
-                      {room.room_name && room.room_name !== room.name ? (
-                        <Text style={styles.roomSubtitle} numberOfLines={1}>
-                          {room.room_name}
-                        </Text>
-                      ) : null}
-                    </View>
+                    <Text style={styles.roomName} numberOfLines={1}>
+                      {room.name}
+                    </Text>
                     <MaterialIcons
                       name="chevron-right"
                       size={20}
@@ -170,10 +149,6 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
     </View>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function groupByLevel(rooms) {
   const byLevel = new Map();
@@ -216,12 +191,6 @@ function levelLabel(level) {
 }
 
 const styles = StyleSheet.create({
-  section: {
-    paddingHorizontal: SPACING.lg,
-    paddingVertical: SPACING.md,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.borderSubtle,
-  },
   header: {
     flexDirection: 'row',
     alignItems: 'baseline',
@@ -284,15 +253,10 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: COLORS.borderSubtle,
   },
-  roomText: { flex: 1 },
   roomName: {
+    flex: 1,
     fontSize: FONT_SIZE.body,
     color: COLORS.text,
     fontWeight: '500',
-  },
-  roomSubtitle: {
-    fontSize: FONT_SIZE.small,
-    color: COLORS.textMuted,
-    marginTop: 2,
   },
 });

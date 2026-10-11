@@ -67,7 +67,8 @@
     "insideThisBuilding": "Inside this building",
     "roomCount": "{count} rooms",
     "searchRoomsPlaceholder": "Search rooms…",
-    "partOfBuilding": "Part of {name}"
+    "partOfBuilding": "Part of {name}",
+    "seeAllRooms": "See all {count} rooms"
   },
   "route": {
     "title": "Route",

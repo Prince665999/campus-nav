@@ -14879,6 +14879,12 @@ def narrate(
 places.py
 
 Endpoints for listing, searching, and looking up places.
+
+Route ordering note
+-------------------
+FastAPI matches routes in declaration order. `/search`, `/tags`, and
+`/buildings` are declared before `/{place_id}` so a request for
+`/api/places/search` doesn't get interpreted as `place_id="search"`.
 """
 
 from fastapi import APIRouter, Depends, Query
@@ -14890,6 +14896,22 @@ from ..schemas.place import PlaceDetail, PlaceSummary
 from ..services import place_service
 
 router = APIRouter(prefix="/api/places", tags=["places"])
+
+
+# Fixed vocabulary of intents the app's chips use. Keep in sync with
+# mobile/constants/intents.js. Only these are counted for the tags
+# endpoint — arbitrary words a contributor might have typed are not
+# surfaced as chips.
+KNOWN_INTENTS = [
+    "eat",
+    "study",
+    "print",
+    "wifi",
+    "sports",
+    "meet",
+    "toilet",
+    "prayer",
+]
 
 
 @router.get("", response_model=list[PlaceSummary])
@@ -14950,6 +14972,74 @@ def search_places(
         building_name=building_name,
         limit=limit,
     )
+
+
+@router.get("/tags")
+def list_tags(session: Session = Depends(db_session)):
+    """
+    Return the counts of each category and each known intent.
+
+    The mobile app uses this to hide chips whose count is zero, so a
+    student never taps a chip that returns "No places found".
+    """
+    return {
+        "categories": place_service.list_category_counts(session),
+        "intents": place_service.list_intent_counts(session, KNOWN_INTENTS),
+    }
+
+
+@router.get("/buildings")
+def list_buildings(session: Session = Depends(db_session)):
+    """
+    Return every building with its room count.
+
+    A building here means an outdoor place whose name matches the
+    `building_name` tag on one or more indoor places. The count is
+    the number of indoor rooms/doors with that tag.
+
+    The mobile app uses this on Explore to show "Library · 14 rooms"
+    on the building card.
+
+    Response shape:
+        [
+            {"id": 12, "name": "Dr. Magufuli Library", "room_count": 14},
+            ...
+        ]
+    """
+    from ..models.place import Place
+
+    counts = place_service.list_building_counts(session)
+    if not counts:
+        return []
+
+    # Match each count to a place by name. Exact match, case
+    # insensitive, trimmed — the ingest guarantees they're identical,
+    # but this makes the endpoint robust against a slight case or
+    # whitespace difference.
+    from sqlalchemy import func as sa_func
+
+    normalised = {k.strip().lower(): (k, v) for k, v in counts.items()}
+    outdoor_rows = (
+        session.query(Place)
+        .filter(Place.kind == "outdoor")
+        .filter(Place.name.isnot(None))
+        .all()
+    )
+
+    out = []
+    for place in outdoor_rows:
+        key = place.name.strip().lower()
+        if key in normalised:
+            _original, room_count = normalised[key]
+            out.append({
+                "id": place.id,
+                "name": place.name,
+                "room_count": room_count,
+            })
+
+    # Sort by name for a stable order the app can rely on.
+    out.sort(key=lambda b: b["name"].lower())
+    return out
 
 
 @router.get("/{place_id}", response_model=PlaceDetail)
@@ -19950,7 +20040,21 @@ place_service.py
 
 Search and lookup against the places table. Used by /api/places and
 /api/places/search.
+
+Filters
+-------
+- q:      case-insensitive substring match on name, name_sw, alt_names.
+- category: exact match against the category column. Case-insensitive
+            and trimmed, so 'amenity=Library' and 'amenity=library '
+            both match the chip's 'amenity=library'.
+- intent: case-insensitive substring match on the intents column.
+          A place with intents="eat; study; wifi" matches intent=eat,
+          intent=study, and intent=wifi.
+- kind, building_name, level: exact / case-insensitive as noted inline.
+- lat/lon/radius_m: proximity filter.
 """
+
+import math
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -19978,7 +20082,8 @@ _CATEGORY_ICON_KEYS = {
 def _icon_key_for_category(category):
     if not category:
         return None
-    return _CATEGORY_ICON_KEYS.get(category)
+    # Lookup is case-insensitive: normalise once.
+    return _CATEGORY_ICON_KEYS.get(category.strip().lower())
 
 
 def _primary_photo_for(session, place_id):
@@ -20053,10 +20158,10 @@ def search_places(
     Return matching places.
 
     - q: case-insensitive substring against name, name_sw, alt_names
-    - category: exact match against the category column
+    - category: case-insensitive exact match against the category column
     - intent: case-insensitive substring against the intents column
     - kind: "outdoor", "indoor", or "entrance"
-    - building_name: exact match (case-insensitive)
+    - building_name: case-insensitive exact match
     - level: exact match against the level column
     - lat/lon/radius_m: proximity filter
     """
@@ -20073,7 +20178,13 @@ def search_places(
         )
 
     if category:
-        query = query.filter(Place.category == category)
+        # Case-insensitive, trimmed compare. The category stored in
+        # the DB may have mixed case or stray whitespace; the chip
+        # sends a normalised lowercase value. Compare on equal terms.
+        wanted = category.strip().lower()
+        query = query.filter(
+            func.lower(func.trim(func.coalesce(Place.category, ""))) == wanted
+        )
 
     if intent:
         needle = f"%{intent.lower()}%"
@@ -20094,7 +20205,6 @@ def search_places(
         query = query.filter(Place.level == str(level))
 
     if lat is not None and lon is not None:
-        import math
         dlat = radius_m / 111_000
         dlon = radius_m / (111_000 * max(math.cos(math.radians(lat)), 0.01))
         query = query.filter(
@@ -20120,6 +20230,82 @@ def get_place(session: Session, place_id: int) -> PlaceDetail | None:
     if row is None:
         return None
     return _to_detail(session, row)
+
+
+# ---------------------------------------------------------------------------
+# Tag counts (for hiding empty chips)
+# ---------------------------------------------------------------------------
+
+def list_category_counts(session: Session) -> dict[str, int]:
+    """
+    Return {category: count} for every non-empty category, with the
+    category value normalised to lowercase and trimmed so the counts
+    match the chip keys the app sends.
+    """
+    rows = (
+        session.query(
+            func.lower(func.trim(Place.category)),
+            func.count(Place.id),
+        )
+        .filter(Place.category.isnot(None))
+        .filter(func.trim(Place.category) != "")
+        .group_by(func.lower(func.trim(Place.category)))
+        .all()
+    )
+    return {cat: n for cat, n in rows}
+
+
+def list_intent_counts(session: Session, known_intents: list[str]) -> dict[str, int]:
+    """
+    Return {intent: count} for the given known intents.
+
+    The intents column is free text, semicolon-separated:
+        "eat; study; wifi"
+    So we can't GROUP BY it directly the way we do with categories.
+    Instead, we count with a LIKE for each known intent.
+
+    known_intents is the fixed vocabulary the app's intent chips use.
+    Only intents in that list are counted — arbitrary words a
+    contributor might have typed are not surfaced as chips.
+    """
+    counts: dict[str, int] = {}
+    for key in known_intents:
+        needle = f"%{key.lower()}%"
+        n = (
+            session.query(func.count(Place.id))
+            .filter(func.lower(func.coalesce(Place.intents, "")).like(needle))
+            .scalar()
+        ) or 0
+        counts[key] = n
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Building room counts (for the Explore card badge)
+# ---------------------------------------------------------------------------
+
+def list_building_counts(session: Session) -> dict[str, int]:
+    """
+    Return {building_name: room_count}.
+
+    Counts indoor places grouped by their building_name. The
+    comparison to a building place is done by exact string on
+    building_name == building's name — see the note in
+    `list_rooms_for_building` below for why the ingest keeps these
+    identical.
+    """
+    rows = (
+        session.query(
+            Place.building_name,
+            func.count(Place.id),
+        )
+        .filter(Place.kind == "indoor")
+        .filter(Place.building_name.isnot(None))
+        .filter(func.trim(Place.building_name) != "")
+        .group_by(Place.building_name)
+        .all()
+    )
+    return {name: n for name, n in rows}
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\reimport_service.py ---
 
@@ -32081,6 +32267,10 @@ const styles = StyleSheet.create({
 // Shown when the student reaches the destination. Shows the
 // destination's photo, a "was this helpful?" feedback row, and a
 // save-to-favorites button.
+//
+// On mount, clears the shared starting point. The walk is over, so
+// the next route should begin fresh — GPS by default, or a new
+// choice the student makes.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -32102,6 +32292,7 @@ import {
   isFavorite,
   listMediaForPlace,
 } from '@/services/api';
+import { clearStart } from '@/services/startStore';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 
@@ -32116,6 +32307,13 @@ export default function ArrivalScreen() {
   const [favorited, setFavorited] = useState(false);
   const [loading, setLoading] = useState(true);
   const [feedbackSent, setFeedbackSent] = useState(null);
+
+  // The walk is over. Clear the shared start as a backstop, in case
+  // the commit-time clear was missed (route failed on preview, then
+  // the student came back to arrival some other way).
+  useEffect(() => {
+    clearStart();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -32784,7 +32982,13 @@ const styles = StyleSheet.create({
 // Explore screen.
 //
 // A visual browse of the whole campus. Featured places up top,
-// category and intent chips below, then a photo grid.
+// intent chips below, then a photo grid of buildings and outdoor
+// places.
+//
+// The grid deliberately excludes indoor rooms and doors: they have
+// no photos, and they're reachable through the building they're in.
+// Tapping a building opens its place-detail, which has an "Inside
+// this building" section listing its rooms.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -32796,30 +33000,31 @@ import {
 } from 'react-native';
 import { router, Stack } from 'expo-router';
 
-import { CategoryChips } from '@/components/CategoryChips';
 import { IntentChips } from '@/components/IntentChips';
 import { FeaturedStrip } from '@/components/FeaturedStrip';
 import { ExploreGridCard } from '@/components/ExploreGridCard';
-import { listPlaces } from '@/services/api';
+import { listBuildings, listPlaces, getPlaceTags } from '@/services/api';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 
-// How many featured places to show. The most prominent ones.
 const FEATURED_LIMIT = 5;
 
 export default function ExploreScreen() {
-  const [category, setCategory] = useState(null);
   const [intent, setIntent] = useState(null);
+  const [intentCounts, setIntentCounts] = useState(null);
 
   const [featured, setFeatured] = useState([]);
   const [places, setPlaces] = useState([]);
+  const [roomCounts, setRoomCounts] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Load featured places once. These don't change with the filters.
+  // Load featured places and room counts once. These don't change
+  // with the filters.
   useEffect(() => {
     let cancelled = false;
-    listPlaces({ limit: 200 })
+
+    listPlaces({ kind: 'outdoor', limit: 200 })
       .then((data) => {
         if (cancelled) return;
         const landmarks = data.filter((p) => p.is_landmark);
@@ -32828,6 +33033,28 @@ export default function ExploreScreen() {
       .catch(() => {
         if (!cancelled) setFeatured([]);
       });
+
+    listBuildings()
+      .then((buildings) => {
+        if (cancelled) return;
+        const counts = {};
+        for (const b of buildings) {
+          counts[b.id] = b.room_count;
+        }
+        setRoomCounts(counts);
+      })
+      .catch(() => {
+        if (!cancelled) setRoomCounts({});
+      });
+
+    getPlaceTags()
+      .then((tags) => {
+        if (!cancelled) setIntentCounts(tags.intents || {});
+      })
+      .catch(() => {
+        if (!cancelled) setIntentCounts(null);
+      });
+
     return () => {
       cancelled = true;
     };
@@ -32840,7 +33067,7 @@ export default function ExploreScreen() {
     setError(null);
 
     listPlaces({
-      category: category || undefined,
+      kind: 'outdoor',
       intent: intent || undefined,
       limit: 200,
     })
@@ -32857,22 +33084,14 @@ export default function ExploreScreen() {
     return () => {
       cancelled = true;
     };
-  }, [category, intent]);
+  }, [intent]);
 
   const openPlace = useCallback((place) => {
     router.push(`/place/${place.id}`);
   }, []);
 
-  // When the admin picks a category, clear the intent. Only one
-  // filter can be active at a time — the alternative is confusing.
-  const chooseCategory = useCallback((next) => {
-    setCategory(next);
-    if (next) setIntent(null);
-  }, []);
-
   const chooseIntent = useCallback((next) => {
     setIntent(next);
-    if (next) setCategory(null);
   }, []);
 
   // Convert the flat list of places into rows of 2 for the grid.
@@ -32884,21 +33103,22 @@ export default function ExploreScreen() {
     return rows;
   }, [places]);
 
-  const hasActiveFilter = category !== null || intent !== null;
+  const hasActiveFilter = intent !== null;
 
   return (
     <>
       <Stack.Screen options={{ title: t('explore.title') }} />
       <View style={styles.container}>
-        {/* Featured strip. Hidden when a filter is active, so the
-            whole screen focuses on the results. */}
         {!hasActiveFilter ? (
           <FeaturedStrip places={featured} onPress={openPlace} />
         ) : null}
 
         <View style={styles.chipsWrapper}>
-          <CategoryChips selected={category} onSelect={chooseCategory} />
-          <IntentChips selected={intent} onSelect={chooseIntent} />
+          <IntentChips
+            selected={intent}
+            onSelect={chooseIntent}
+            counts={intentCounts}
+          />
         </View>
 
         {error ? (
@@ -32923,11 +33143,10 @@ export default function ExploreScreen() {
                   <ExploreGridCard
                     key={place.id}
                     place={place}
+                    roomCount={roomCounts[place.id]}
                     onPress={() => openPlace(place)}
                   />
                 ))}
-                {/* If the row has only one place, fill the other slot
-                    so the layout stays even. */}
                 {row.length === 1 ? <View style={styles.gridFiller} /> : null}
               </View>
             )}
@@ -33004,8 +33223,10 @@ import { useDebounce } from '@/hooks/useDebounce';
 import { useSettings } from '@/context/SettingsContext';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { setRouteRequest } from '@/services/routeRequest';
+import { clearStart } from '@/services/startStore';
 import {
   extractDestination,
+  getPlaceTags,
   listPlaces,
   listRecents,
   listFavorites,
@@ -33024,6 +33245,7 @@ export default function HomeScreen() {
 
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState(null);
+  const [categoryCounts, setCategoryCounts] = useState(null);
   const [results, setResults] = useState([]);
   const [recents, setRecents] = useState([]);
   const [favorites, setFavorites] = useState([]);
@@ -33048,7 +33270,6 @@ export default function HomeScreen() {
     suspiciousBuilding,
     resolveStart,
     choosePlace,
-    startDoorPick,
     confirmOutside,
     loadOutdoorPlaces,
     forgetStart,
@@ -33077,6 +33298,24 @@ export default function HomeScreen() {
         setFavorites(f);
       }
     });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fetch the category counts so we can hide chips with nothing in
+  // them. Runs once per screen mount; a session rarely changes the
+  // tag distribution mid-use.
+  useEffect(() => {
+    let cancelled = false;
+    getPlaceTags()
+      .then((tags) => {
+        if (!cancelled) setCategoryCounts(tags.categories || {});
+      })
+      .catch(() => {
+        // If the endpoint fails, fall back to showing every chip.
+        if (!cancelled) setCategoryCounts(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -33170,7 +33409,12 @@ export default function HomeScreen() {
   }, [debouncedQuery, category]);
 
   const openPlace = useCallback((place) => {
-    router.push(`/place/${place.id}`);
+    // Search results use `id`. Recents and favorites use `place_id`
+    // (see DestinationItem in the backend). Accept both so the same
+    // callback works for every list on this screen.
+    const id = place?.id ?? place?.place_id;
+    if (id == null) return;
+    router.push(`/place/${id}`);
   }, []);
 
   const openChat = useCallback(() => {
@@ -33186,6 +33430,11 @@ export default function HomeScreen() {
   }, []);
 
   // Perform a route from a resolved start to a destination.
+  //
+  // This is the single commit point for "the student is taking this
+  // route". After the request is stashed, we clear the shared start
+  // so the next route the student takes begins fresh — with a GPS
+  // read unless they pick a start again.
   const beginRoute = useCallback((resolvedStart, destId) => {
     if (!resolvedStart && !destId) {
       return false;
@@ -33205,13 +33454,16 @@ export default function HomeScreen() {
     } else {
       return false;
     }
+
+    // The student has committed. Clear the shared start now, before
+    // navigating, so the next screen doesn't inherit a stale choice.
+    clearStart();
+
     router.push('/route-preview');
     return true;
   }, []);
 
   // Take me there — from a place detail or from anywhere.
-  // On Home, this is only called via the sentence search or the
-  // next-class banner. Destination is a place id.
   const startRouteToDestination = useCallback(
     async (destId) => {
       if (navigatingRef.current) return;
@@ -33299,7 +33551,6 @@ export default function HomeScreen() {
   const handleChoosePlace = useCallback(
     (place) => {
       if (place == null) {
-        // Student picked "pick a starting place" — switch to the list.
         setStartSheetMode('place-list');
         if (nearbyPlaces.length === 0) {
           loadOutdoorPlaces({ excludePlaceId: pendingDestination });
@@ -33329,8 +33580,6 @@ export default function HomeScreen() {
     (door) => {
       setDoorPickerOpen(false);
       choosePlace(door);
-      // If there's a pending destination (auto-trigger flow), route
-      // to it now.
       if (pendingDestination != null) {
         beginRoute(
           {
@@ -33348,7 +33597,6 @@ export default function HomeScreen() {
     [choosePlace, pendingDestination, beginRoute]
   );
 
-  // Auto-trigger — "Are you inside?" — yes/no.
   const handleInsideYes = useCallback(() => {
     setDoorPickerOpen(true);
   }, []);
@@ -33434,7 +33682,11 @@ export default function HomeScreen() {
 
         {showSearchResults ? (
           <>
-            <CategoryChips selected={category} onSelect={setCategory} />
+            <CategoryChips
+              selected={category}
+              onSelect={setCategory}
+              counts={categoryCounts}
+            />
             {error ? (
               <View style={styles.state}>
                 <Text style={styles.errorText}>{error}</Text>
@@ -33492,13 +33744,16 @@ export default function HomeScreen() {
               <Text style={styles.sectionTitle}>
                 {t('home.categoriesTitle')}
               </Text>
-              <CategoryChips selected={null} onSelect={setCategory} />
+              <CategoryChips
+                selected={null}
+                onSelect={setCategory}
+                counts={categoryCounts}
+              />
             </View>
           </ScrollView>
         )}
       </View>
 
-      {/* Starting-point sheet */}
       <StartingPointSheet
         visible={startSheetOpen}
         places={nearbyPlaces}
@@ -33512,7 +33767,6 @@ export default function HomeScreen() {
         }}
       />
 
-      {/* Door picker */}
       <DoorPickerSheet
         visible={doorPickerOpen}
         buildingName={suspiciousBuilding}
@@ -33520,7 +33774,6 @@ export default function HomeScreen() {
         onCancel={() => setDoorPickerOpen(false)}
       />
 
-      {/* Are you inside? */}
       <AreYouInsideSheet
         visible={startState === 'askIndoor'}
         buildingName={suspiciousBuilding}
@@ -33887,11 +34140,13 @@ import {
   removeFavorite,
 } from '@/services/api';
 import { setRouteRequest } from '@/services/routeRequest';
+import { clearStart } from '@/services/startStore';
 import { PhotoCarousel } from '@/components/PhotoCarousel';
 import { ReportSheet } from '@/components/ReportSheet';
 import { StartingPointSheet } from '@/components/StartingPointSheet';
 import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { AreYouInsideSheet } from '@/components/AreYouInsideSheet';
+import { BuildingRooms } from '@/components/BuildingRooms';
 import { FromChip } from '@/components/FromChip';
 import { useStartingPoint } from '@/hooks/useStartingPoint';
 import { t } from '@/i18n';
@@ -33990,6 +34245,11 @@ export default function PlaceDetailScreen() {
         setError(t('start.couldNotResolve'));
         return;
       }
+
+      // The student has committed. Clear the shared start now, before
+      // navigating, so the next screen doesn't inherit a stale choice.
+      clearStart();
+
       router.push('/route-preview');
     },
     [place]
@@ -34000,8 +34260,6 @@ export default function PlaceDetailScreen() {
     if (navigatingRef.current) return;
     navigatingRef.current = true;
 
-    // If the student has explicitly chosen a start via the chip,
-    // use it directly.
     if (start && start.placeId != null) {
       navigateToRoute(start);
       navigatingRef.current = false;
@@ -34023,8 +34281,6 @@ export default function PlaceDetailScreen() {
           return;
 
         case 'ask':
-          // AreYouInsideSheet will show; the student's answer
-          // drives the rest.
           setResolvingStart(false);
           return;
 
@@ -34077,11 +34333,11 @@ export default function PlaceDetailScreen() {
     (door) => {
       setDoorPickerOpen(false);
       if (!place) return;
-      // The picked door IS the start. Route straight to this place.
       setRouteRequest({
         fromId: door.id,
         toId: place.id,
       });
+      clearStart();
       router.push('/route-preview');
     },
     [place]
@@ -34119,6 +34375,12 @@ export default function PlaceDetailScreen() {
     setDoorPickerOpen(true);
   }, []);
 
+  // Open a room inside this building. Called by BuildingRooms when a
+  // room row is tapped.
+  const openRoom = useCallback((room) => {
+    router.push(`/place/${room.id}`);
+  }, []);
+
   if (loading) {
     return (
       <View style={styles.state}>
@@ -34134,6 +34396,12 @@ export default function PlaceDetailScreen() {
       </View>
     );
   }
+
+  // A building is an outdoor place that can have rooms inside it.
+  // Indoor places and entrances never show the section, because
+  // their own building_name points up to a building, not down to
+  // rooms.
+  const isBuilding = place.kind === 'outdoor';
 
   return (
     <>
@@ -34202,6 +34470,17 @@ export default function PlaceDetailScreen() {
               {place.wifi_ssid ? `: ${place.wifi_ssid}` : ''}
             </Text>
           </Section>
+        ) : null}
+
+        {/* Rooms inside this building. Only for outdoor places —
+            indoor places and entrances don't have rooms of their
+            own. The component renders nothing if the building has
+            no matching rooms. */}
+        {isBuilding ? (
+          <BuildingRooms
+            buildingName={place.name}
+            onOpenRoom={openRoom}
+          />
         ) : null}
 
         <FromChip start={start} onPress={openStartSheet} />
@@ -36156,9 +36435,319 @@ const styles = StyleSheet.create({
   noText: { color: COLORS.text, fontSize: 16, fontWeight: '600' },
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\BuildingRooms.jsx ---
+
+// "Inside this building" — the list of rooms and offices inside a
+// building, grouped by floor.
+//
+// Shown on the place-detail screen for a building. The rooms come
+// from /api/places?kind=indoor&building_name=<name>, which returns
+// every indoor place whose building_name tag matches the building's
+// name. The ingest keeps those identical, so this is an exact
+// match.
+//
+// What this component does NOT do:
+//   - It does not show photos. Rooms rarely have them.
+//   - It does not offer "Take me there" from a room row. Tapping a
+//     row opens the room's own place-detail, which has the button.
+//
+// What it does:
+//   - Groups rooms by floor (level), sorted basement → ground → upper.
+//   - Sorts rooms by name within a floor.
+//   - Shows a search box above the list when there are more than
+//     10 rooms, so a large building like the Admin Block stays
+//     navigable.
+
+import { useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { listPlaces } from '@/services/api';
+import { t } from '@/i18n';
+import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
+
+const SEARCH_THRESHOLD = 10;
+
+export function BuildingRooms({ buildingName, onOpenRoom }) {
+  const [rooms, setRooms] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [search, setSearch] = useState('');
+
+  useEffect(() => {
+    if (!buildingName) {
+      setRooms([]);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    listPlaces({
+      kind: 'indoor',
+      building_name: buildingName,
+      limit: 200,
+    })
+      .then((data) => {
+        if (!cancelled) setRooms(Array.isArray(data) ? data : []);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err.message || t('common.error'));
+          setRooms([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [buildingName]);
+
+  const filtered = useMemo(() => {
+    if (!rooms) return [];
+    const q = search.trim().toLowerCase();
+    if (!q) return rooms;
+    return rooms.filter((r) => {
+      const haystack = [r.name || '', r.room_name || '', r.ref || '']
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [rooms, search]);
+
+  const grouped = useMemo(() => groupByLevel(filtered), [filtered]);
+
+  // If the building has no rooms, render nothing. The caller doesn't
+  // need to know — no rooms means no section.
+  if (!loading && (!rooms || rooms.length === 0)) {
+    return null;
+  }
+
+  return (
+    <View style={styles.section}>
+      <View style={styles.header}>
+        <Text style={styles.sectionTitle}>
+          {t('place.insideThisBuilding')}
+        </Text>
+        {rooms && rooms.length > 0 ? (
+          <Text style={styles.count}>
+            {t('place.roomCount', { count: rooms.length })}
+          </Text>
+        ) : null}
+      </View>
+
+      {loading ? (
+        <View style={styles.state}>
+          <ActivityIndicator color={COLORS.textMuted} />
+        </View>
+      ) : error ? (
+        <Text style={styles.error}>{error}</Text>
+      ) : (
+        <>
+          {rooms.length > SEARCH_THRESHOLD ? (
+            <TextInput
+              style={styles.searchInput}
+              value={search}
+              onChangeText={setSearch}
+              placeholder={t('place.searchRoomsPlaceholder')}
+              placeholderTextColor={COLORS.textFaint}
+              autoCapitalize="none"
+              autoCorrect={false}
+              returnKeyType="search"
+            />
+          ) : null}
+
+          {grouped.length === 0 ? (
+            <Text style={styles.emptyText}>{t('common.noResults')}</Text>
+          ) : (
+            grouped.map((group) => (
+              <View key={group.level} style={styles.levelGroup}>
+                <Text style={styles.levelLabel}>
+                  {levelLabel(group.level)}
+                </Text>
+                {group.rooms.map((room) => (
+                  <TouchableOpacity
+                    key={room.id}
+                    style={styles.roomRow}
+                    onPress={() => onOpenRoom(room)}
+                    accessibilityRole="button"
+                    accessibilityLabel={room.name}
+                  >
+                    <View style={styles.roomText}>
+                      <Text style={styles.roomName} numberOfLines={1}>
+                        {room.name}
+                      </Text>
+                      {room.room_name && room.room_name !== room.name ? (
+                        <Text style={styles.roomSubtitle} numberOfLines={1}>
+                          {room.room_name}
+                        </Text>
+                      ) : null}
+                    </View>
+                    <MaterialIcons
+                      name="chevron-right"
+                      size={20}
+                      color={COLORS.textMuted}
+                    />
+                  </TouchableOpacity>
+                ))}
+              </View>
+            ))
+          )}
+        </>
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function groupByLevel(rooms) {
+  const byLevel = new Map();
+  for (const room of rooms) {
+    const level = normaliseLevel(room.level);
+    if (!byLevel.has(level)) byLevel.set(level, []);
+    byLevel.get(level).push(room);
+  }
+  const groups = Array.from(byLevel.entries()).map(([level, list]) => {
+    list.sort((a, b) =>
+      (a.name || '').localeCompare(b.name || '', undefined, {
+        sensitivity: 'base',
+      })
+    );
+    return { level, rooms: list };
+  });
+  groups.sort((a, b) => levelSortKey(a.level) - levelSortKey(b.level));
+  return groups;
+}
+
+function normaliseLevel(level) {
+  if (level == null) return '0';
+  const s = String(level).split(';')[0].trim();
+  return s || '0';
+}
+
+function levelSortKey(level) {
+  const n = Number(level);
+  if (Number.isFinite(n)) return n;
+  return 999;
+}
+
+function levelLabel(level) {
+  if (level === '-1') return 'Basement';
+  if (level === '0') return 'Ground floor';
+  if (level === '1') return 'First floor';
+  if (level === '2') return 'Second floor';
+  if (level === '3') return 'Third floor';
+  return `Level ${level}`;
+}
+
+const styles = StyleSheet.create({
+  section: {
+    paddingHorizontal: SPACING.lg,
+    paddingVertical: SPACING.md,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderSubtle,
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    marginBottom: SPACING.md,
+  },
+  sectionTitle: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  count: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textFaint,
+  },
+  state: {
+    paddingVertical: SPACING.lg,
+    alignItems: 'center',
+  },
+  error: {
+    color: COLORS.danger,
+    fontSize: FONT_SIZE.small,
+    textAlign: 'center',
+  },
+  searchInput: {
+    backgroundColor: COLORS.backgroundSubtle,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.sm,
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 10,
+    fontSize: FONT_SIZE.body,
+    color: COLORS.text,
+    marginBottom: SPACING.md,
+  },
+  emptyText: {
+    color: COLORS.textMuted,
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
+    paddingVertical: SPACING.md,
+  },
+  levelGroup: {
+    marginBottom: SPACING.md,
+  },
+  levelLabel: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textFaint,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: SPACING.sm,
+  },
+  roomRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    minHeight: TOUCH.minHeight,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderSubtle,
+  },
+  roomText: { flex: 1 },
+  roomName: {
+    fontSize: FONT_SIZE.body,
+    color: COLORS.text,
+    fontWeight: '500',
+  },
+  roomSubtitle: {
+    fontSize: FONT_SIZE.small,
+    color: COLORS.textMuted,
+    marginTop: 2,
+  },
+});
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\CategoryChips.jsx ---
 
 // Horizontal scroll of category filter chips.
+//
+// The `counts` prop is optional. When provided, it's a
+// { category: count } map from the /api/places/tags endpoint, and any
+// chip whose category has zero places is hidden. The "All" chip is
+// always shown.
+//
+// When counts is null (endpoint failed, or not yet loaded), every
+// chip is shown. That's the honest fallback: better to show a chip
+// that might be empty than to hide chips we can't count.
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
@@ -36168,7 +36757,17 @@ import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
 
-export function CategoryChips({ selected, onSelect }) {
+export function CategoryChips({ selected, onSelect, counts = null }) {
+  const visible = CATEGORIES.filter((cat) => {
+    // "All" (key === null) is always shown.
+    if (cat.key == null) return true;
+    if (counts == null) return true;
+    const n = counts[cat.key];
+    return typeof n === 'number' && n > 0;
+  });
+
+  // If every category is empty and only "All" remains, still show it
+  // — the student can tap All and get the full unfiltered list.
   return (
     <ScrollView
       horizontal
@@ -36176,7 +36775,7 @@ export function CategoryChips({ selected, onSelect }) {
       contentContainerStyle={styles.scrollContent}
       style={styles.scroll}
     >
-      {CATEGORIES.map((cat) => {
+      {visible.map((cat) => {
         const isSelected = selected === cat.key;
         return (
           <TouchableOpacity
@@ -36735,6 +37334,10 @@ const styles = StyleSheet.create({
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\ExploreGridCard.jsx ---
 
 // One card in the two-column grid on Explore.
+//
+// If `roomCount` is provided and > 0, shows a small "· N rooms"
+// badge in the caption. That tells the student the building has an
+// "Inside this building" section waiting on its detail page.
 
 import {
   Image,
@@ -36767,9 +37370,11 @@ function colorForName(name) {
   return PLACEHOLDER_COLORS[Math.abs(hash) % PLACEHOLDER_COLORS.length];
 }
 
-export function ExploreGridCard({ place, onPress }) {
+export function ExploreGridCard({ place, onPress, roomCount }) {
   const photo = place.primary_photo_url;
   const placeholderColor = colorForName(place.name);
+  const showRoomCount =
+    typeof roomCount === 'number' && roomCount > 0;
 
   return (
     <TouchableOpacity
@@ -36777,12 +37382,26 @@ export function ExploreGridCard({ place, onPress }) {
       onPress={onPress}
       activeOpacity={0.85}
       accessibilityRole="button"
-      accessibilityLabel={place.name}
+      accessibilityLabel={
+        showRoomCount
+          ? `${place.name}, ${roomCount} rooms`
+          : place.name
+      }
     >
       {photo ? (
-        <Image source={{ uri: photo }} style={styles.photo} resizeMode="cover" />
+        <Image
+          source={{ uri: photo }}
+          style={styles.photo}
+          resizeMode="cover"
+        />
       ) : (
-        <View style={[styles.photo, styles.placeholder, { backgroundColor: placeholderColor }]}>
+        <View
+          style={[
+            styles.photo,
+            styles.placeholder,
+            { backgroundColor: placeholderColor },
+          ]}
+        >
           <MaterialIcons
             name={ICONS[place.categoryIconKey] || ICONS.place}
             size={32}
@@ -36797,6 +37416,11 @@ export function ExploreGridCard({ place, onPress }) {
         {place.name_sw ? (
           <Text style={styles.nameSw} numberOfLines={1}>
             {place.name_sw}
+          </Text>
+        ) : null}
+        {showRoomCount ? (
+          <Text style={styles.roomCount} numberOfLines={1}>
+            {roomCount} rooms
           </Text>
         ) : null}
       </View>
@@ -36835,6 +37459,12 @@ const styles = StyleSheet.create({
     fontSize: FONT_SIZE.small - 1,
     color: COLORS.textMuted,
     marginTop: 2,
+  },
+  roomCount: {
+    fontSize: FONT_SIZE.small - 1,
+    color: COLORS.primary,
+    fontWeight: '600',
+    marginTop: 4,
   },
 });
 
@@ -38036,6 +38666,11 @@ const styles = StyleSheet.create({
 
 // A horizontal row of intent chips for Explore. Tapping one filters
 // the grid by that intent. Tapping the active one clears it.
+//
+// `counts` is optional. When provided (from /api/places/tags), any
+// intent whose count is zero is hidden. When null, every chip is
+// shown — better to show a chip that might be empty than to hide
+// chips we can't count.
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
 
@@ -38043,7 +38678,17 @@ import { INTENTS } from '@/constants/intents';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
-export function IntentChips({ selected, onSelect }) {
+export function IntentChips({ selected, onSelect, counts = null }) {
+  const visible = INTENTS.filter((intent) => {
+    if (counts == null) return true;
+    const n = counts[intent.key];
+    return typeof n === 'number' && n > 0;
+  });
+
+  if (visible.length === 0) {
+    return null;
+  }
+
   return (
     <ScrollView
       horizontal
@@ -38051,7 +38696,7 @@ export function IntentChips({ selected, onSelect }) {
       contentContainerStyle={styles.scrollContent}
       style={styles.scroll}
     >
-      {INTENTS.map((intent) => {
+      {visible.map((intent) => {
         const isSelected = selected === intent.key;
         return (
           <TouchableOpacity
@@ -40266,7 +40911,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'https://eliminate-diana-header-excitement.trycloudflare.com';
+const DEFAULT_API_BASE_URL = 'https://counting-exclude-believes-attend.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -41147,20 +41792,22 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
 // Determines where a route should start from.
 //
 // Priority order:
-//   1. A fresh GPS fix — unless it looks "suspicious" (near a
+//   1. The shared start, if the student has chosen one (a place or
+//      a door). Shared across screens via startStore.
+//   2. A fresh GPS fix — unless it looks "suspicious" (near a
 //      building entrance, or accuracy worse than 25 m). In that
 //      case the caller is told to ask "are you inside?".
-//   2. If GPS fails or is refused: the outdoor place picker.
+//   3. If GPS fails or is refused: the outdoor place picker.
 //
 // Two invariants this hook maintains:
 //
-//   - `start` holds ONLY a deliberate choice — a place or a door the
-//     student picked. It is never set from a raw GPS fix. GPS fixes
-//     are returned to the caller, not stored. This prevents a stale
-//     fix from being reused on a later route after the student has
-//     walked elsewhere.
+//   - The shared start holds ONLY a deliberate choice — a place or
+//     a door the student picked. It is never set from a raw GPS fix.
+//     GPS fixes are returned to the caller, not stored. This prevents
+//     a stale fix from being reused on a later route after the
+//     student has walked elsewhere.
 //
-//   - `resolveStart` returns a discriminated status object. Callers
+//   - resolveStart returns a discriminated status object. Callers
 //     branch on the return value, not on the hook's state, because
 //     React state updates are asynchronous and reading `state` right
 //     after `await resolveStart(...)` would read the previous value.
@@ -41169,6 +41816,7 @@ import { useCallback, useRef, useState } from 'react';
 
 import { getPositionOnce, requestPermission } from '@/services/location';
 import { listPlaces, listEntrances } from '@/services/api';
+import { useStart, setStart, clearStart } from '@/services/startStore';
 
 const GPS_TIMEOUT_MS = 15000;
 const NEAR_ENTRANCE_M = 20;
@@ -41189,7 +41837,6 @@ function haversineM(lat1, lon1, lat2, lon2) {
 
 export function useStartingPoint() {
   const [state, setState] = useState('idle');
-  const [start, setStart] = useState(null);
   const [nearbyPlaces, setNearbyPlaces] = useState([]);
   const [lastError, setLastError] = useState(null);
 
@@ -41198,13 +41845,17 @@ export function useStartingPoint() {
   const [suspiciousBuilding, setSuspiciousBuilding] = useState(null);
   const [suspiciousFix, setSuspiciousFix] = useState(null);
 
+  // The shared start. Lives in a module-level store so all screens
+  // see the same value.
+  const start = useStart();
+
   const pendingResolverRef = useRef(null);
 
   // Reset clears transient state only — the failure flags, the
   // suspicious fix, and the internal state machine. It deliberately
-  // does NOT clear `start` or `nearbyPlaces`, because those are the
-  // student's deliberate choices and shouldn't be wiped just because
-  // they opened the chip or backed out of a sheet.
+  // does NOT clear the shared start or nearbyPlaces, because those
+  // are the student's deliberate choices and shouldn't be wiped just
+  // because they opened the chip or backed out of a sheet.
   const reset = useCallback(() => {
     setState('idle');
     setLastError(null);
@@ -41220,7 +41871,7 @@ export function useStartingPoint() {
   // "Use my current location" — the next route should do a fresh GPS
   // read, not reuse a place they picked five minutes ago.
   const forgetStart = useCallback(() => {
-    setStart(null);
+    clearStart();
   }, []);
 
   // Load the outdoor place list into `nearbyPlaces`. The caller passes
@@ -41273,7 +41924,8 @@ export function useStartingPoint() {
   }, []);
 
   // The student answered "no, I'm outside". Return the fix so the
-  // caller can route from it. Does NOT store the fix in `start`.
+  // caller can route from it. Does NOT store the fix in the shared
+  // start.
   const confirmOutside = useCallback(() => {
     const fix = suspiciousFix;
     setSuspiciousBuilding(null);
@@ -41731,7 +42383,11 @@ export function useWalkingProgress(route) {
     "photos": "Photos",
     "photo": "Photo",
     "addFavorite": "Add to favorites",
-    "removeFavorite": "Remove from favorites"
+    "removeFavorite": "Remove from favorites",
+    "insideThisBuilding": "Inside this building",
+    "roomCount": "{count} rooms",
+    "searchRoomsPlaceholder": "Search rooms…",
+    "partOfBuilding": "Part of {name}"
   },
   "route": {
     "title": "Route",
@@ -42068,7 +42724,11 @@ export function ttsLanguageForCurrentLang() {
     "photos": "Picha",
     "photo": "Picha",
     "addFavorite": "Ongeza kwenye vipendwa",
-    "removeFavorite": "Ondoa kwenye vipendwa"
+    "removeFavorite": "Ondoa kwenye vipendwa",
+    "insideThisBuilding": "Ndani ya jengo hili",
+    "roomCount": "Vyumba {count}",
+    "searchRoomsPlaceholder": "Tafuta vyumba…",
+    "partOfBuilding": "Sehemu ya {name}"
   },
   "route": {
     "title": "Njia",
@@ -59208,6 +59868,22 @@ export async function getPlace(id) {
   return request(`/api/places/${id}`);
 }
 
+/**
+ * Category and intent counts, for hiding empty chips.
+ * Returns { categories: {...}, intents: {...} }.
+ */
+export async function getPlaceTags() {
+  return request('/api/places/tags');
+}
+
+/**
+ * Every building with a room count.
+ * Returns [{ id, name, room_count }, ...].
+ */
+export async function listBuildings() {
+  return request('/api/places/buildings');
+}
+
 // ---------------------------------------------------------------
 // Media
 // ---------------------------------------------------------------
@@ -59438,11 +60114,6 @@ export async function getIndoorAreas({ buildingName, level }) {
 // Entrances (for the "are you inside?" trigger)
 // ---------------------------------------------------------------
 
-/**
- * All building entrances. Used by the starting-point logic to work
- * out whether a GPS fix is close enough to an entrance that the
- * student might actually be inside.
- */
 export async function listEntrances() {
   return listPlaces({ kind: 'entrance', limit: 200 });
 }
@@ -59451,16 +60122,6 @@ export async function listEntrances() {
 // Indoor doors (for the door picker)
 // ---------------------------------------------------------------
 
-/**
- * Indoor door nodes. Used by the door picker to let the student
- * declare which door they're starting from.
- *
- * Pass `buildingName` to narrow to one building.
- *
- * The backend caps /api/places at limit=200, so we stay under that.
- * A single building has far fewer than 200 doors; if a caller ever
- * needs more, they'd need a dedicated endpoint.
- */
 export async function listIndoorDoors({ buildingName } = {}) {
   return listPlaces({
     kind: 'indoor',
@@ -60003,6 +60664,75 @@ export async function getDeviceId() {
   await setItem(STORAGE_KEY, fresh);
   _cached = fresh;
   return fresh;
+}
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\startStore.js ---
+
+// The shared starting point.
+//
+// "Where will the next route start from?" has exactly one answer at
+// a time, and it belongs to the session, not to any one screen.
+// Home sets it. The place-detail screen reads it. Arrival clears it.
+//
+// Before this store existed, each screen called useStartingPoint()
+// and got its own copy of `start` in local state. The Home screen's
+// choice was invisible to place-detail, so the chip appeared to
+// reset. This module is the shared answer.
+//
+// Rules:
+//   - The store is not persisted. Every cold app start begins with
+//     start === null, which is exactly the behaviour we want: the
+//     student's last choice doesn't survive closing the app.
+//   - start is cleared the moment a route is committed, and again
+//     when the arrival screen mounts. See clearStart's callers.
+//   - No TTL. If a clear is missed, the start is stale — but the
+//     two clear points above (commit + arrival) mean a miss is
+//     unlikely. Adding a TTL would hide bugs, not fix them.
+
+import { useSyncExternalStore } from 'react';
+
+let current = null;
+const listeners = new Set();
+
+function emit() {
+  listeners.forEach((listener) => {
+    try {
+      listener();
+    } catch {
+      // A listener throwing must not prevent the others from running.
+    }
+  });
+}
+
+export function getStart() {
+  return current;
+}
+
+export function setStart(value) {
+  // Normalise: null and undefined both mean "no start".
+  current = value || null;
+  emit();
+}
+
+export function clearStart() {
+  if (current === null) return;
+  current = null;
+  emit();
+}
+
+export function subscribeStart(listener) {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * React hook. Returns the current start value and re-renders the
+ * component whenever the store changes.
+ */
+export function useStart() {
+  return useSyncExternalStore(subscribeStart, getStart, getStart);
 }
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\storage.js ---
