@@ -21279,6 +21279,7 @@ from ..models.route_cache import RouteCache
 from ..schemas.common import LatLon
 from ..schemas.route import RouteResponse, TurnStep
 from . import cache_service
+from .step_merge import merge_opening_step
 
 logger = logging.getLogger(__name__)
 
@@ -21412,6 +21413,12 @@ def _compute_route_uncached(
         return None
 
     steps = generate_turn_by_turn(path, nodes)
+    # Fold the engine's pure opening step into the first real leg so
+    # the first instruction shown covers both the heading and the
+    # length of the first leg, instead of the length arriving a step
+    # late. See step_merge.py for the reasoning.
+    steps = merge_opening_step(steps)
+
     geometry = [
         LatLon(lat=nodes[nid]["lat"], lon=nodes[nid]["lon"]) for nid in path
     ]
@@ -21546,6 +21553,98 @@ def _upsert_durable_cache(
     else:
         existing.path_json = json.dumps(route_dict)
         existing.hit_count += 1
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\step_merge.py ---
+
+"""
+step_merge.py
+
+Narrow post-processing for the outdoor engine's step list.
+
+Problem
+-------
+generate_turn_by_turn() emits a pure opening step ("Head north from X")
+at at_m = 0, and puts the length of the first leg on the *next* step.
+So while the walker covers the first leg, the walking screen shows only
+the opening line. The leg length only appears once the walker has
+already reached the turn, which reads as "one step behind."
+
+Fix
+---
+Fold the opening line into the first real step and drop the opening:
+
+    "Head north from Library"
+    "Continue for about 150 meters, then turn left"
+  becomes
+    "Head north from Library, continue for about 150 meters, then turn left"
+
+Nothing else in the step list is touched: at_m, kind, distance_m, and
+every instruction from index 1 onward are exactly as the engine made
+them.
+
+Scope
+-----
+Only the outdoor engine's step list is affected. Narration calls
+generate_turn_by_turn() directly and is not routed through here, so it
+is unchanged. The frozen engine is not modified.
+"""
+
+
+_OPENER_PREFIX = "Continue for "
+
+
+def merge_opening_step(steps):
+    """
+    Merge steps[0] (the pure opening) into steps[1] (the first real leg),
+    and return the list with steps[0] removed.
+
+    steps[0] is the engine's opening heading, e.g. "Head north from Library".
+    steps[1] is the first real instruction, e.g. "Continue for about 150
+    meters, then turn left".
+
+    The returned first step is a copy of steps[1] with:
+      - instruction = "<opening>, continue for <tail of steps[1]>"
+      - at_m = 0.0  (the merged step now begins at the walk's start)
+
+    All other fields on the merged step, and every field on every later
+    step, are left as the engine produced them.
+
+    Safe to call on a list with fewer than two steps — returns it unchanged.
+    """
+    if not steps or len(steps) < 2:
+        return steps
+
+    opening = steps[0]
+    first = steps[1]
+    rest = steps[2:]
+
+    opening_text = (opening.get("instruction") or "").strip()
+    first_text = (first.get("instruction") or "").strip()
+
+    if not opening_text:
+        # Nothing to fold in. Drop the empty opener and return the rest.
+        return [first, *rest]
+
+    if first_text.startswith(_OPENER_PREFIX):
+        # Normal case: "Continue for about 150 meters, then turn left"
+        # becomes "continue for about 150 meters, then turn left"
+        # (lowercase the C; keep the rest verbatim).
+        tail = first_text[len(_OPENER_PREFIX):]
+        merged_text = f"{opening_text}, continue for {tail}"
+    else:
+        # Defensive: the engine's shape changed, or this step already
+        # starts with something other than "Continue for ". Merge with
+        # a comma, lowercasing the first letter so it reads as a
+        # continuation of the opening.
+        lowered = first_text[:1].lower() + first_text[1:] if first_text else ""
+        merged_text = f"{opening_text}, {lowered}".rstrip(", ")
+
+    merged = {
+        **first,
+        "at_m": 0.0,
+        "instruction": merged_text,
+    }
+    return [merged, *rest]
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\timetable_service.py ---
 
@@ -34988,6 +35087,7 @@ export default function RoutePreviewScreen() {
             currentStepPoint={startPoint}
             currentStepLevel={indoorStartLevel}
             forceSwitcher={true}
+            lockHeading={true}
             onNoRooms={() => setIndoorFailed(true)}
             style={styles.map}
           />
@@ -38024,12 +38124,28 @@ const styles = StyleSheet.create({
 // The camera auto-fits to the room bounds on first render.
 //
 // Changes in this version:
+//   - The map is no longer unmounted while a new floor loads. The
+//     loading spinner is shown as an overlay on top of the existing
+//     map, so the Camera keeps its state.
+//   - The fit runs once per (building, level) via a ref, so re-renders
+//     and step advances don't override the student's zoom or pan.
+//   - The fit formula uses the container's real pixel size and a
+//     metres-per-pixel diagonal, replacing the old fixed-constant
+//     formula that produced a zoom that was too low for buildings.
+//   - Route-up heading: the map is rotated so the direction the
+//     student is about to walk points at the top of the screen. This
+//     is a one-shot turn when the step changes, not a continuous
+//     follow. A north-up button lets the student flip back.
+//   - `lockHeading` prop: used by the route preview. When true, the
+//     heading is computed from the WHOLE route so it doesn't change
+//     when the student taps a floor chip. The preview is stationary
+//     by design.
 //   - forceSwitcher prop: when true, the floor switcher is shown
 //     regardless of the settings toggle. The route-preview screen
 //     uses this, because a preview always wants the switcher if the
 //     building has more than one floor.
-//   - onNoRooms is now called in the catch branch too, not only when
-//     the areas list is empty. Without this, a network error on the
+//   - onNoRooms is called in the catch branch too, not only when the
+//     areas list is empty. Without this, a network error on the
 //     floor-plan fetch left a blank screen and never fell back to
 //     the outdoor map.
 
@@ -38053,6 +38169,7 @@ import {
 
 import { getIndoorAreas } from '@/services/api';
 import { useSettings } from '@/context/SettingsContext';
+import { bearingDeg, haversineM } from '@/utils/geo';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 
@@ -38078,10 +38195,34 @@ const FILL_COLOR_EXPR = [
   '#ffffff',
 ];
 
+// A bearing needs at least this much movement to be meaningful.
+// Below it, GPS noise would dominate, so we fall back to 0.
+const MIN_HEADING_DISTANCE_M = 3;
+
 function levelLabel(level) {
   if (level === '-1') return 'B';
   if (level === '0') return 'G';
   return level;
+}
+
+function firstLegBearing(points) {
+  /**
+   * Given a list of { lat, lon }, return the bearing from the first
+   * point to the first point at least MIN_HEADING_DISTANCE_M away.
+   * Returns 0 if no such point exists.
+   */
+  if (!points || points.length < 2) return 0;
+  const from = points[0];
+  for (let i = 1; i < points.length; i++) {
+    const to = points[i];
+    if (
+      haversineM(from.lat, from.lon, to.lat, to.lon) >=
+      MIN_HEADING_DISTANCE_M
+    ) {
+      return bearingDeg(from.lat, from.lon, to.lat, to.lon);
+    }
+  }
+  return 0;
 }
 
 export function IndoorMapView({
@@ -38094,6 +38235,7 @@ export function IndoorMapView({
   style,
   onNoRooms,
   forceSwitcher = false,
+  lockHeading = false,
 }) {
   const { settings } = useSettings();
   const cameraRef = useRef(null);
@@ -38105,10 +38247,26 @@ export function IndoorMapView({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // Container size, measured from onLayout, used for the fit maths.
+  const [containerSize, setContainerSize] = useState({ width: 360, height: 480 });
+
+  // Tracks which (building, level) the camera has already been fitted
+  // to. Once a floor has been fitted, we never re-fit it, so the
+  // student's zoom and pan are preserved across re-renders and step
+  // advances.
+  const fittedKeyRef = useRef(null);
+
+  // North-up toggle. Off by default, meaning "route-up" — the map is
+  // rotated so the walking direction is at the top of the screen.
+  const [northUp, setNorthUp] = useState(false);
+
   // When the building changes, reset the selected level to whatever
-  // the current step says.
+  // the current step says, clear the fitted key so the new building's
+  // floors get fitted, and reset the north-up toggle.
   useEffect(() => {
     setSelectedLevel(level);
+    fittedKeyRef.current = null;
+    setNorthUp(false);
   }, [buildingName]);
 
   // Follow the current step's level unless the student manually
@@ -38234,17 +38392,88 @@ export function IndoorMapView({
     };
   }, [routeByLevel, selectedLevel]);
 
-  // Camera fit whenever the displayed floor's areas change.
+  // -------------------------------------------------------------------------
+  // Route-up heading
+  // -------------------------------------------------------------------------
+  //
+  // The heading is the compass bearing of the leg the student is
+  // about to walk. Setting it as the camera heading rotates the map
+  // so that direction points at the top of the screen.
+  //
+  // Two modes:
+  //   - lockHeading = false (walking screen): the heading is computed
+  //     from the route points on the CURRENTLY DISPLAYED floor. It
+  //     updates when the step changes, so the map turns as the
+  //     student turns. It does NOT update continuously.
+  //   - lockHeading = true (preview): the heading is computed from
+  //     the whole route, so tapping a floor chip doesn't rotate the
+  //     map. The preview is stationary.
+  //
+  // The bearing is taken from `currentStepPoint` when available, so
+  // the map is oriented from where the student actually is right
+  // now, not from the first point of the route.
+  const routeHeading = useMemo(() => {
+    const all = routeByLevel || [];
+    if (all.length < 2) return 0;
+
+    let points;
+    if (lockHeading) {
+      points = all;
+    } else {
+      points = all.filter((p) => p.level === selectedLevel);
+      if (points.length < 2) {
+        // The current floor has no route points. Fall back to the
+        // whole route so the map still has a sensible heading.
+        points = all;
+      }
+    }
+
+    // Find where the student is on this floor, if we know.
+    let startIdx = 0;
+    if (currentStepPoint) {
+      const idx = points.findIndex(
+        (p) =>
+          p.lat === currentStepPoint.lat && p.lon === currentStepPoint.lon
+      );
+      if (idx >= 0) startIdx = idx;
+    }
+
+    const slice = points.slice(startIdx);
+    return firstLegBearing(slice);
+  }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
+
+  // -------------------------------------------------------------------------
+  // Camera fit — once per (building, level)
+  // -------------------------------------------------------------------------
+  //
+  // The old formula (zoom = 15 + log2(0.0015 / span)) produced a zoom
+  // that was too low for a building: for a 60 m span it gave ~16.6,
+  // which is more zoomed out than the map default of 18. That's why
+  // rooms looked small right after a fit.
+  //
+  // The new formula:
+  //   1. Computes the diagonal of the building's bounding box in
+  //      metres.
+  //   2. Divides by the smaller of the container's two dimensions
+  //      (times 0.9, leaving a margin), giving metres per pixel.
+  //   3. Converts to a Web Mercator zoom at the building's latitude.
+  //
+  // The diagonal (not width or height alone) is the right measure
+  // because the map may be rotated, and either dimension could be
+  // the limiting one.
   useEffect(() => {
     if (!cameraRef.current) return;
     if (loading) return;
+    if (!areas || areas.length === 0) return;
+
+    const key = `${buildingName}|${selectedLevel}`;
+    if (fittedKeyRef.current === key) return;
+    fittedKeyRef.current = key;
 
     const points = [];
-    if (areas) {
-      for (const area of areas) {
-        for (const p of area.boundary || []) {
-          points.push([p.lon, p.lat]);
-        }
+    for (const area of areas) {
+      for (const p of area.boundary || []) {
+        points.push([p.lon, p.lat]);
       }
     }
     if (points.length === 0) return;
@@ -38258,17 +38487,33 @@ export function IndoorMapView({
 
     const centerLon = (west + east) / 2;
     const centerLat = (south + north) / 2;
-    const span = Math.max(east - west, north - south);
 
-    let zoom = 17;
-    if (span > 0) zoom = 15 + Math.log2(0.0015 / span);
-    zoom = Math.max(15, Math.min(20, zoom));
+    // Diagonal in metres at the building's latitude.
+    const refLat = centerLat;
+    const cosLat = Math.cos((refLat * Math.PI) / 180);
+    const widthM = Math.abs(east - west) * 111320 * cosLat;
+    const heightM = Math.abs(north - south) * 110540;
+    const diagM = Math.hypot(widthM, heightM);
+
+    // Metres per pixel, using the smaller container dimension and a
+    // 0.9 factor so the building doesn't touch the edges.
+    const minDim = Math.min(containerSize.width, containerSize.height);
+    const mPerPx = diagM / Math.max(minDim * 0.9, 1);
+
+    // Web Mercator: at zoom z, the world is 256 * 2^z pixels wide,
+    // and there are ~78271.5 / cosLat metres per pixel at zoom 0.
+    // So metres-per-pixel at zoom z = (78271.5 * cosLat) / 2^z.
+    // Solving for z:
+    const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
+
+    const clamped = Math.max(16, Math.min(21, zoom));
 
     const timeout = setTimeout(() => {
       try {
         cameraRef.current?.setCamera({
           centerCoordinate: [centerLon, centerLat],
-          zoomLevel: zoom,
+          zoomLevel: clamped,
+          heading: northUp ? 0 : routeHeading,
           animationDuration: 400,
         });
       } catch {
@@ -38277,21 +38522,50 @@ export function IndoorMapView({
     }, 100);
 
     return () => clearTimeout(timeout);
-  }, [areas, loading]);
+    // routeHeading is intentionally excluded: the fit is a one-shot
+    // per floor, and heading changes are handled by the separate
+    // effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [areas, loading, buildingName, selectedLevel, containerSize]);
+
+  // -------------------------------------------------------------------------
+  // Heading effect — turns the map when the route direction changes
+  // -------------------------------------------------------------------------
+  //
+  // This runs whenever `routeHeading` or `northUp` changes. It only
+  // sets the heading, leaving the centre and zoom untouched, so the
+  // student's pan and zoom are preserved. It is a one-shot turn, not
+  // a continuous follow.
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    try {
+      cameraRef.current.setCamera({
+        heading: northUp ? 0 : routeHeading,
+        animationDuration: 500,
+      });
+    } catch {
+      // Silent.
+    }
+  }, [routeHeading, northUp]);
 
   // -------------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------------
 
-  if (loading) {
+  // First load only: nothing to show yet, so the spinner is fine and
+  // there's no camera state to preserve.
+  if (loading && !areas) {
     return (
-      <View style={[styles.container, style]}>
+      <View
+        style={[styles.container, style]}
+        onLayout={(e) => setContainerSize(e.nativeEvent.layout)}
+      >
         <ActivityIndicator color={COLORS.primaryDark} />
       </View>
     );
   }
 
-  if (error) {
+  if (error && (!areas || areas.length === 0)) {
     return <View style={[styles.container, style]} />;
   }
 
@@ -38313,7 +38587,10 @@ export function IndoorMapView({
     availableLevels.length > 1;
 
   return (
-    <View style={[styles.container, style]}>
+    <View
+      style={[styles.container, style]}
+      onLayout={(e) => setContainerSize(e.nativeEvent.layout)}
+    >
       <MapView
         style={styles.map}
         mapStyle={BLANK_STYLE}
@@ -38421,6 +38698,27 @@ export function IndoorMapView({
         ) : null}
       </MapView>
 
+      {/* Spinner overlay for floor changes after the first load.
+          Shown on top of the existing map so the Camera keeps its
+          state. */}
+      {loading && areas && areas.length > 0 ? (
+        <View style={styles.loadingOverlay} pointerEvents="none">
+          <ActivityIndicator color={COLORS.primaryDark} />
+        </View>
+      ) : null}
+
+      {/* North-up toggle. Sits in the top-right corner of the map. */}
+      <TouchableOpacity
+        style={styles.northButton}
+        onPress={() => setNorthUp((v) => !v)}
+        accessibilityRole="button"
+        accessibilityLabel={
+          northUp ? 'Switch to route-up view' : 'Switch to north-up view'
+        }
+      >
+        <Text style={styles.northButtonText}>{northUp ? 'N' : '↑'}</Text>
+      </TouchableOpacity>
+
       {showSwitcher ? (
         <View style={styles.switcherContainer}>
           {availableLevels.map((lvl) => {
@@ -38499,6 +38797,32 @@ const styles = StyleSheet.create({
   map: {
     flex: 1,
     width: '100%',
+  },
+  loadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(241, 245, 249, 0.35)',
+  },
+  northButton: {
+    position: 'absolute',
+    top: SPACING.md,
+    right: SPACING.md,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  northButtonText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.primaryDark,
   },
   destMarkerOuter: {
     width: 20,
@@ -38920,6 +39244,15 @@ const styles = StyleSheet.create({
 // least CAMERA_MIN_MOVE_M or the heading has changed by at least
 // CAMERA_MIN_HEADING_DEG. This stops the camera animation from
 // being restarted several times a second around corners.
+//
+// Route-up preview
+// ----------------
+// When this component is used as a preview (followBearing = false),
+// the initial fit turns the map so the route runs from bottom to top
+// of the screen. This is a one-shot turn on the fit call. After that
+// the map is stationary; it does not follow the compass. The walking
+// screen passes followBearing = true, so it skips this and follows
+// the walker's heading instead.
 
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
@@ -38935,7 +39268,7 @@ import {
 
 import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
 import { IndoorMapView } from '@/components/IndoorMapView';
-import { haversineM } from '@/utils/geo';
+import { haversineM, bearingDeg } from '@/utils/geo';
 import {
   CAMERA_MIN_INTERVAL_MS,
   CAMERA_MIN_MOVE_M,
@@ -38956,6 +39289,11 @@ const CAMPUS_BOUNDS = {
 // useful — it covers a whole block. We still draw the dot, just
 // without the circle.
 const ACCURACY_CIRCLE_MAX_M = 60;
+
+// The route preview pulls back by this many zoom levels when it
+// turns the map, because a diagonal route can push its ends toward
+// the screen edges once the map is rotated.
+const PREVIEW_HEADING_ZOOM_OFFSET = 0.5;
 
 function isWithinCampus(lon, lat) {
   return (
@@ -39115,6 +39453,20 @@ export function RouteMap({
     [userLocation, bearing]
   );
 
+  // The one-shot heading for the preview fit. Null when the walking
+  // screen is using this map (it follows the walker's heading), or
+  // when the route is too short for a meaningful bearing.
+  //
+  // Computed from the first to the last route point: the route runs
+  // from the bottom of the screen toward the top.
+  const previewHeading = useMemo(() => {
+    if (followBearing) return null;
+    if (routeCoords.length < 2) return null;
+    const first = routeCoords[0];             // [lon, lat]
+    const last = routeCoords[routeCoords.length - 1];
+    return bearingDeg(first[1], first[0], last[1], last[0]);
+  }, [routeCoords, followBearing]);
+
   // Camera throttle state.
   const lastCamRef = useRef({
     t: 0,
@@ -39155,20 +39507,30 @@ export function RouteMap({
     }
     zoom = Math.max(14, Math.min(18, zoom));
 
+    // If we're going to turn the map, pull back a little so the ends
+    // of a diagonal route don't get pushed off the top and bottom.
+    const finalZoom =
+      previewHeading != null ? zoom - PREVIEW_HEADING_ZOOM_OFFSET : zoom;
+
+    const cam = {
+      centerCoordinate: [centerLon, centerLat],
+      zoomLevel: finalZoom,
+      animationDuration: 500,
+    };
+    if (previewHeading != null) {
+      cam.heading = previewHeading;
+    }
+
     const timeout = setTimeout(() => {
       try {
-        cameraRef.current?.setCamera({
-          centerCoordinate: [centerLon, centerLat],
-          zoomLevel: zoom,
-          animationDuration: 500,
-        });
+        cameraRef.current?.setCamera(cam);
       } catch {
         // Silent.
       }
     }, 200);
 
     return () => clearTimeout(timeout);
-  }, [routeCoords, mode]);
+  }, [routeCoords, mode, previewHeading]);
 
   // Follow camera. Throttled: at most one update every
   // CAMERA_MIN_INTERVAL_MS, and only when the student has moved at
@@ -41254,7 +41616,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'https://pcs-aim-campaigns-removal.trycloudflare.com';
+const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
