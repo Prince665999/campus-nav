@@ -1,5 +1,13 @@
 
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\.vscode\settings.json ---
+
+{
+  "files.exclude": {
+    "**/node_modules/expo-modules-core": true
+  }
+}
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\scripts\create_admin_user.py ---
 
 """

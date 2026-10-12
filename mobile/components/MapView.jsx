@@ -31,6 +31,15 @@
 // least CAMERA_MIN_MOVE_M or the heading has changed by at least
 // CAMERA_MIN_HEADING_DEG. This stops the camera animation from
 // being restarted several times a second around corners.
+//
+// Route-up preview
+// ----------------
+// When this component is used as a preview (followBearing = false),
+// the initial fit turns the map so the route runs from bottom to top
+// of the screen. This is a one-shot turn on the fit call. After that
+// the map is stationary; it does not follow the compass. The walking
+// screen passes followBearing = true, so it skips this and follows
+// the walker's heading instead.
 
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
@@ -46,7 +55,7 @@ import {
 
 import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
 import { IndoorMapView } from '@/components/IndoorMapView';
-import { haversineM } from '@/utils/geo';
+import { haversineM, bearingDeg } from '@/utils/geo';
 import {
   CAMERA_MIN_INTERVAL_MS,
   CAMERA_MIN_MOVE_M,
@@ -67,6 +76,11 @@ const CAMPUS_BOUNDS = {
 // useful — it covers a whole block. We still draw the dot, just
 // without the circle.
 const ACCURACY_CIRCLE_MAX_M = 60;
+
+// The route preview pulls back by this many zoom levels when it
+// turns the map, because a diagonal route can push its ends toward
+// the screen edges once the map is rotated.
+const PREVIEW_HEADING_ZOOM_OFFSET = 0.5;
 
 function isWithinCampus(lon, lat) {
   return (
@@ -226,6 +240,20 @@ export function RouteMap({
     [userLocation, bearing]
   );
 
+  // The one-shot heading for the preview fit. Null when the walking
+  // screen is using this map (it follows the walker's heading), or
+  // when the route is too short for a meaningful bearing.
+  //
+  // Computed from the first to the last route point: the route runs
+  // from the bottom of the screen toward the top.
+  const previewHeading = useMemo(() => {
+    if (followBearing) return null;
+    if (routeCoords.length < 2) return null;
+    const first = routeCoords[0];             // [lon, lat]
+    const last = routeCoords[routeCoords.length - 1];
+    return bearingDeg(first[1], first[0], last[1], last[0]);
+  }, [routeCoords, followBearing]);
+
   // Camera throttle state.
   const lastCamRef = useRef({
     t: 0,
@@ -266,20 +294,30 @@ export function RouteMap({
     }
     zoom = Math.max(14, Math.min(18, zoom));
 
+    // If we're going to turn the map, pull back a little so the ends
+    // of a diagonal route don't get pushed off the top and bottom.
+    const finalZoom =
+      previewHeading != null ? zoom - PREVIEW_HEADING_ZOOM_OFFSET : zoom;
+
+    const cam = {
+      centerCoordinate: [centerLon, centerLat],
+      zoomLevel: finalZoom,
+      animationDuration: 500,
+    };
+    if (previewHeading != null) {
+      cam.heading = previewHeading;
+    }
+
     const timeout = setTimeout(() => {
       try {
-        cameraRef.current?.setCamera({
-          centerCoordinate: [centerLon, centerLat],
-          zoomLevel: zoom,
-          animationDuration: 500,
-        });
+        cameraRef.current?.setCamera(cam);
       } catch {
         // Silent.
       }
     }, 200);
 
     return () => clearTimeout(timeout);
-  }, [routeCoords, mode]);
+  }, [routeCoords, mode, previewHeading]);
 
   // Follow camera. Throttled: at most one update every
   // CAMERA_MIN_INTERVAL_MS, and only when the student has moved at

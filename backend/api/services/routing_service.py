@@ -22,6 +22,7 @@ from ..models.route_cache import RouteCache
 from ..schemas.common import LatLon
 from ..schemas.route import RouteResponse, TurnStep
 from . import cache_service
+from .step_merge import merge_opening_step
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,12 @@ def _compute_route_uncached(
         return None
 
     steps = generate_turn_by_turn(path, nodes)
+    # Fold the engine's pure opening step into the first real leg so
+    # the first instruction shown covers both the heading and the
+    # length of the first leg, instead of the length arriving a step
+    # late. See step_merge.py for the reasoning.
+    steps = merge_opening_step(steps)
+
     geometry = [
         LatLon(lat=nodes[nid]["lat"], lon=nodes[nid]["lon"]) for nid in path
     ]

@@ -290,6 +290,7 @@ export default function RoutePreviewScreen() {
             currentStepPoint={startPoint}
             currentStepLevel={indoorStartLevel}
             forceSwitcher={true}
+            lockHeading={true}
             onNoRooms={() => setIndoorFailed(true)}
             style={styles.map}
           />
