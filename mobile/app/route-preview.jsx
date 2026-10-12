@@ -3,13 +3,24 @@
 // Loads a route from the pending request, shows the summary and
 // steps, and starts Walking Mode.
 //
+// Two map modes:
+//
+//   - Mixed or outdoor: the tile map with the route line, as before.
+//     Correct for anything that goes outside — the student needs the
+//     campus context.
+//
+//   - Single building, all indoor: the floor plan, fitted to the
+//     building, on the origin's floor. The student is walking from
+//     room to room inside one building; showing the whole campus with
+//     a tiny line inside a single building is not useful.
+//
 // Recovery path: if the backend rejects the GPS fix with
 // `LocationTooFarError`, we show a single button — "Pick where you
 // are" — that opens the door picker. Picking a door replaces the
 // request's `from` with the door's place id and re-runs the route.
 // The student never leaves this screen.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -22,11 +33,18 @@ import { router, Stack } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { RouteMap } from '@/components/MapView';
+import { IndoorMapView } from '@/components/IndoorMapView';
 import { RouteSummary } from '@/components/RouteSummary';
 import { DoorPickerSheet } from '@/components/DoorPickerSheet';
 import { computeRoute, narrateRoute } from '@/services/api';
 import { takeRouteRequest, setRouteRequest } from '@/services/routeRequest';
 import { useSettings } from '@/context/SettingsContext';
+import {
+  indoorRoutePoints,
+  isSingleBuildingIndoorRoute,
+  singleBuildingName,
+  singleBuildingStartLevel,
+} from '@/utils/indoorRoute';
 import { t } from '@/i18n';
 import { estimateWalkingSeconds, formatDistance } from '@/utils/format';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
@@ -35,9 +53,6 @@ export default function RoutePreviewScreen() {
   const insets = useSafeAreaInsets();
   const { settings } = useSettings();
 
-  // The current route request. It starts as whatever was stashed by
-  // the previous screen, and can be replaced here when the student
-  // picks a door after a LocationTooFarError.
   const [request, setRequest] = useState(() => takeRouteRequest());
 
   const [route, setRoute] = useState(null);
@@ -45,6 +60,7 @@ export default function RoutePreviewScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [doorPickerOpen, setDoorPickerOpen] = useState(false);
+  const [indoorFailed, setIndoorFailed] = useState(false);
 
   const needsIndoorPick =
     error != null && error.code === 'LocationTooFarError';
@@ -66,6 +82,7 @@ export default function RoutePreviewScreen() {
       setLoading(true);
       setError(null);
       setRoute(null);
+      setIndoorFailed(false);
 
       try {
         const data = await computeRoute({
@@ -142,8 +159,6 @@ export default function RoutePreviewScreen() {
   const handleDoorPicked = useCallback(
     (door) => {
       setDoorPickerOpen(false);
-      // Replace the request's from side with the picked door. The
-      // failed GPS fix is dropped.
       setRequest({
         fromId: door.id,
         fromLat: null,
@@ -153,6 +168,28 @@ export default function RoutePreviewScreen() {
       });
     },
     [request]
+  );
+
+  // Decide which map to show. A single-building indoor route uses
+  // the floor plan; everything else uses the outdoor map.
+  const singleBuildingIndoor = useMemo(
+    () => (route ? isSingleBuildingIndoorRoute(route) : false),
+    [route]
+  );
+
+  const indoorPoints = useMemo(
+    () => (route ? indoorRoutePoints(route) : []),
+    [route]
+  );
+
+  const indoorBuilding = useMemo(
+    () => (route ? singleBuildingName(route) : null),
+    [route]
+  );
+
+  const indoorStartLevel = useMemo(
+    () => (route ? singleBuildingStartLevel(route) : '0'),
+    [route]
   );
 
   // ---- Loading ----
@@ -231,15 +268,38 @@ export default function RoutePreviewScreen() {
     },
   ];
 
+  const showIndoorMap =
+    singleBuildingIndoor && !indoorFailed && indoorPoints.length > 1;
+
+  const destinationPoint =
+    indoorPoints.length > 0
+      ? indoorPoints[indoorPoints.length - 1]
+      : null;
+  const startPoint = indoorPoints.length > 0 ? indoorPoints[0] : null;
+
   return (
     <>
       <Stack.Screen options={{ title: t('route.title') }} />
       <View style={styles.container}>
-        <RouteMap
-          geometry={route.geometry}
-          markers={markers}
-          style={styles.map}
-        />
+        {showIndoorMap ? (
+          <IndoorMapView
+            buildingName={indoorBuilding}
+            level={indoorStartLevel}
+            routeByLevel={indoorPoints}
+            destination={destinationPoint}
+            currentStepPoint={startPoint}
+            currentStepLevel={indoorStartLevel}
+            forceSwitcher={true}
+            onNoRooms={() => setIndoorFailed(true)}
+            style={styles.map}
+          />
+        ) : (
+          <RouteMap
+            geometry={route.geometry}
+            markers={markers}
+            style={styles.map}
+          />
+        )}
 
         <ScrollView
           style={styles.body}

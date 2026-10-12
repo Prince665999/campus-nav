@@ -12,9 +12,19 @@
 //   5. Shows a "you are here" dot on the current step's point, when
 //      the displayed floor matches the current step's floor.
 //   6. Shows a floor switcher on the right edge if the settings
-//      toggle is on.
+//      toggle is on, or always when `forceSwitcher` is true.
 //
 // The camera auto-fits to the room bounds on first render.
+//
+// Changes in this version:
+//   - forceSwitcher prop: when true, the floor switcher is shown
+//     regardless of the settings toggle. The route-preview screen
+//     uses this, because a preview always wants the switcher if the
+//     building has more than one floor.
+//   - onNoRooms is now called in the catch branch too, not only when
+//     the areas list is empty. Without this, a network error on the
+//     floor-plan fetch left a blank screen and never fell back to
+//     the outdoor map.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -39,10 +49,6 @@ import { useSettings } from '@/context/SettingsContext';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 
-// A minimal blank map style. Flat background, no tiles.
-// The glyphs URL is required for room-name labels. Without it,
-// MapLibre logs "Unable to parse resourceUrl" and labels never
-// appear.
 const BLANK_STYLE = JSON.stringify({
   version: 8,
   name: 'indoor-blank',
@@ -57,7 +63,6 @@ const BLANK_STYLE = JSON.stringify({
   ],
 });
 
-// MapLibre fill colour expression. Rooms white, corridors grey.
 const FILL_COLOR_EXPR = [
   'match',
   ['get', 'type'],
@@ -66,7 +71,6 @@ const FILL_COLOR_EXPR = [
   '#ffffff',
 ];
 
-// Convert a level string to a short chip label.
 function levelLabel(level) {
   if (level === '-1') return 'B';
   if (level === '0') return 'G';
@@ -82,12 +86,11 @@ export function IndoorMapView({
   currentStepLevel = null,
   style,
   onNoRooms,
+  forceSwitcher = false,
 }) {
   const { settings } = useSettings();
   const cameraRef = useRef(null);
 
-  // The floor currently being displayed. Starts as the current
-  // step's level, but can be overridden by the floor switcher.
   const [selectedLevel, setSelectedLevel] = useState(level);
 
   const [areas, setAreas] = useState(null);
@@ -101,9 +104,8 @@ export function IndoorMapView({
     setSelectedLevel(level);
   }, [buildingName]);
 
-  // When the current step's level changes and the student has NOT
-  // manually switched floors, follow it. If they HAVE manually
-  // switched, respect their choice.
+  // Follow the current step's level unless the student manually
+  // switched.
   const [manuallyChosen, setManuallyChosen] = useState(false);
   useEffect(() => {
     if (!manuallyChosen) {
@@ -141,6 +143,9 @@ export function IndoorMapView({
         if (cancelled) return;
         setError(err.message || 'Could not load floor plan.');
         setAreas([]);
+        // Notify the caller so it can fall back to the outdoor map
+        // rather than leaving a blank screen.
+        if (onNoRooms) onNoRooms();
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -180,17 +185,11 @@ export function IndoorMapView({
     return { type: 'FeatureCollection', features };
   }, [areas]);
 
-  // Route split — solid for current floor, dashed for other floors.
-  //
-  // The input is [{lat, lon, level}, ...]. We walk it and group
-  // consecutive points by whether they match the selected level.
-  // Each group becomes a LineString feature tagged with `dashed`.
   const { routeSolidGeoJSON, routeDashedGeoJSON } = useMemo(() => {
     if (!routeByLevel || routeByLevel.length === 0) {
       return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
     }
     if (routeByLevel.length === 1) {
-      // A single point isn't a line. Skip.
       return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
     }
 
@@ -299,14 +298,12 @@ export function IndoorMapView({
     ? [firstCentroid.lon, firstCentroid.lat]
     : [0, 0];
 
-  // The "you are here" dot is shown only when the displayed floor
-  // matches the current step's floor. Otherwise it would be in the
-  // wrong place.
   const showYouAreHere =
     currentStepPoint && currentStepLevel === selectedLevel;
 
   const showSwitcher =
-    settings.showFloorSwitcher !== false && availableLevels.length > 1;
+    (forceSwitcher || settings.showFloorSwitcher !== false) &&
+    availableLevels.length > 1;
 
   return (
     <View style={[styles.container, style]}>
@@ -366,7 +363,6 @@ export function IndoorMapView({
           </ShapeSource>
         ) : null}
 
-        {/* Dashed — route on other floors. Drawn first so solid sits on top. */}
         {routeDashedGeoJSON ? (
           <ShapeSource id="indoorRouteDashedSource" shape={routeDashedGeoJSON}>
             <LineLayer
@@ -383,7 +379,6 @@ export function IndoorMapView({
           </ShapeSource>
         ) : null}
 
-        {/* Solid — route on the displayed floor. */}
         {routeSolidGeoJSON ? (
           <ShapeSource id="indoorRouteSolidSource" shape={routeSolidGeoJSON}>
             <LineLayer
@@ -398,7 +393,6 @@ export function IndoorMapView({
           </ShapeSource>
         ) : null}
 
-        {/* Destination marker. */}
         {destination ? (
           <MarkerView
             coordinate={[destination.lon, destination.lat]}
@@ -410,8 +404,6 @@ export function IndoorMapView({
           </MarkerView>
         ) : null}
 
-        {/* You are here dot. Only shown when the displayed floor
-            matches the current step's floor. */}
         {showYouAreHere ? (
           <MarkerView
             coordinate={[currentStepPoint.lon, currentStepPoint.lat]}
@@ -422,7 +414,6 @@ export function IndoorMapView({
         ) : null}
       </MapView>
 
-      {/* Floor switcher. Vertical chips on the right edge. */}
       {showSwitcher ? (
         <View style={styles.switcherContainer}>
           {availableLevels.map((lvl) => {
@@ -462,10 +453,6 @@ export function IndoorMapView({
     </View>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function _closedRing(boundary) {
   if (!boundary || boundary.length === 0) return null;
