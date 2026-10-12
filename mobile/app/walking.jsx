@@ -26,13 +26,14 @@ import { computeRoute, listMediaForPlace, recordRecent } from '@/services/api';
 import { closestApproachPhoto } from '@/utils/media';
 import * as tts from '@/services/tts';
 import * as haptics from '@/services/haptics';
-import { bearingDeg } from '@/utils/geo';
+import { bearingDeg, snapToRoute } from '@/utils/geo';
 import { t, ttsLanguageForCurrentLang } from '@/i18n';
 import { COLORS, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
 import {
   RECOMPUTE_AFTER_MS,
   RECOMPUTE_MAX_ACCURACY_M,
+  LOCAL_RESNAP_MAX_M,
 } from '@/constants/config';
 
 const APPROACH_PHOTO_DISTANCE_M = 60;
@@ -68,13 +69,14 @@ export default function WalkingScreen() {
 
   const destinationId = routeRequestRef.current?.toId ?? null;
 
-  useState(() => {
+  useEffect(() => {
     if (route) return;
     if (!destinationId) {
       setError('No destination');
       setLoading(false);
       return;
     }
+    let cancelled = false;
     async function load() {
       try {
         const req = routeRequestRef.current;
@@ -85,15 +87,19 @@ export default function WalkingScreen() {
           fromAccuracyM: req?.fromAccuracyM ?? null,
           toPlaceId: destinationId,
         });
-        setRoute(data);
+        if (!cancelled) setRoute(data);
       } catch (err) {
-        setError(err.message || t('common.error'));
+        if (!cancelled) setError(err.message || t('common.error'));
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     }
     load();
-  });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!destinationId) return;
@@ -119,6 +125,7 @@ export default function WalkingScreen() {
     permissionGranted,
     position,
     rawPosition,
+    accuracyM,
     currentStep,
     currentStepIndex,
     distanceRemainingM,
@@ -209,18 +216,38 @@ export default function WalkingScreen() {
     };
   }, []);
 
+  // Arrival: the snap OR direct distance is enough.
   useEffect(() => {
     if (mode !== 'outdoor') return;
     if (arrivedRef.current) return;
     if (!route) return;
-    if (distanceRemainingM > ARRIVAL_DISTANCE_M) return;
+
+    const nearBySnap = distanceRemainingM <= ARRIVAL_DISTANCE_M;
+
+    let nearByDirect = false;
+    if (position && route.geometry && route.geometry.length > 0) {
+      const last = route.geometry[route.geometry.length - 1];
+      const R = 6371000;
+      const phi1 = (position.lat * Math.PI) / 180;
+      const phi2 = (last.lat * Math.PI) / 180;
+      const dphi = ((last.lat - position.lat) * Math.PI) / 180;
+      const dlambda = ((last.lon - position.lon) * Math.PI) / 180;
+      const a =
+        Math.sin(dphi / 2) ** 2 +
+        Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+      const d = 2 * R * Math.asin(Math.sqrt(a));
+      nearByDirect = d <= ARRIVAL_DISTANCE_M;
+    }
+
+    if (!nearBySnap && !nearByDirect) return;
+
     arrivedRef.current = true;
     haptics.arrivalPulse();
     router.replace({
       pathname: '/arrival',
       params: { toId: String(destinationId) },
     });
-  }, [mode, distanceRemainingM, route, destinationId]);
+  }, [mode, distanceRemainingM, position, route, destinationId]);
 
   const handleAdvanceStep = useCallback(() => {
     if (!isLastStep) {
@@ -286,11 +313,26 @@ export default function WalkingScreen() {
     return bearingDeg(position.lat, position.lon, last.lat, last.lon);
   })();
 
+  // Recalculate: local re-snap first, server only when genuinely off
+  // route.
   const handleRecalculate = useCallback(async () => {
     if (mode !== 'outdoor') return;
     const from = rawPosition || position;
     if (!from) return;
     if (!destinationId) return;
+
+    if (route?.geometry?.length > 1) {
+      const local = snapToRoute(from, route.geometry, { nearIndex: null });
+      if (local && local.offRouteM <= LOCAL_RESNAP_MAX_M) {
+        setBannerDismissed(false);
+        setPhotoDismissed(false);
+        resetOffRoute();
+        tts.reset();
+        recomputeAttemptsRef.current = 0;
+        return;
+      }
+    }
+
     setBannerDismissed(false);
     setPhotoDismissed(false);
     resetOffRoute();
@@ -305,7 +347,7 @@ export default function WalkingScreen() {
       });
       setRoute(data);
     } catch {}
-  }, [mode, position, rawPosition, destinationId, resetOffRoute]);
+  }, [mode, position, rawPosition, destinationId, resetOffRoute, route]);
 
   const openChat = useCallback(() => {
     router.push({
@@ -435,6 +477,7 @@ export default function WalkingScreen() {
             geometry={route.geometry}
             markers={markers}
             userLocation={position}
+            accuracyM={accuracyM}
             bearing={heading}
             followBearing={true}
             mode={mode}

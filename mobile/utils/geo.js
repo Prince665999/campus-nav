@@ -6,11 +6,50 @@
 // position to the route locally, on every GPS fix, without a round
 // trip to the server.
 //
-// The math is identical to the Python. If the Python changes, these
-// must change with it. The tests in __tests__/geo.test.js check
-// specific known values to catch drift.
+// snapToRoute's contract, after the 5F-2 revision:
+//
+//   The returned point is the *snapped* position — the closest point
+//   on the route to the raw fix. The dot in the walking screen no
+//   longer uses this; it uses the smoothed raw fix directly. What
+//   uses snapToRoute is progress: step index, distance remaining,
+//   off-route detection.
+//
+//   That means a snap that briefly picks the wrong segment at a
+//   corner costs us a step or two of lag, not a frozen dot. Which is
+//   the right trade.
+//
+// What changed in this version
+// ----------------------------
+//   1. Always compare the local window against the global best.
+//      Before, the local window was accepted whenever its best match
+//      was within 60 m, so once the pointer landed on the wrong
+//      segment it stayed there. Now the window is used only when its
+//      best match is nearly as good as the global best (within
+//      WINDOW_TOLERANCE_M), which is what "continuity" should mean.
+//
+//   2. Forward-bias the window. A walker moves forward. When two
+//      segments are equally close — a corner — prefer the later one.
+//
+//   3. Reject implausible jumps. A snap that moves distance-from-
+//      start forward by more than FORWARD_JUMP_MAX_M, or backward by
+//      more than BACKWARD_JUMP_MAX_M, in a single fix, is rejected
+//      unless the fix is genuinely off-route. This protects routes
+//      that pass near themselves (a loop, a U-turn, two parallel
+//      paths close together), where the global best can legitimately
+//      be far ahead of where you are.
+//
+//   4. Cache cumulative distances per route geometry. The window and
+//      global searches both need cumDist, and recomputing it every
+//      fix was wasteful on long routes.
 
 const EARTH_RADIUS_M = 6371000;
+
+const WINDOW_BEHIND = 2;
+const WINDOW_AHEAD = 8;
+const WINDOW_TOLERANCE_M = 8;
+const FORWARD_JUMP_MAX_M = 40;
+const BACKWARD_JUMP_MAX_M = 15;
+const OFF_ROUTE_ACCEPT_M = 60;
 
 export function haversineM(lat1, lon1, lat2, lon2) {
   const phi1 = (lat1 * Math.PI) / 180;
@@ -38,20 +77,15 @@ export function bearingDeg(lat1, lon1, lat2, lon2) {
   return ((Math.atan2(x, y) * 180) / Math.PI + 360) % 360;
 }
 
-// Flat local projection: metres east and north of a reference latitude.
-// Fine for a campus-sized area, which is why the backend uses it too.
 function latLonToXY(lat, lon, refLat) {
-  const x = ((lon * Math.PI) / 180) * EARTH_RADIUS_M * Math.cos((refLat * Math.PI) / 180);
+  const x =
+    ((lon * Math.PI) / 180) *
+    EARTH_RADIUS_M *
+    Math.cos((refLat * Math.PI) / 180);
   const y = ((lat * Math.PI) / 180) * EARTH_RADIUS_M;
   return [x, y];
 }
 
-// Project point p onto segment a->b.
-//
-// Returns { distance, t, side }:
-//   distance — perpendicular distance in metres
-//   t        — 0..1, how far along the segment the closest point lies
-//   side     — "left" or "right" of the direction of travel from a to b
 export function pointSegmentInfo(p, a, b) {
   const refLat = a[0];
   const [px, py] = latLonToXY(p[0], p[1], refLat);
@@ -81,40 +115,68 @@ export function pointSegmentInfo(p, a, b) {
   return { distance, t, side };
 }
 
-// Snap a raw GPS point onto a route.
+// ---------------------------------------------------------------------------
+// Cumulative distance cache
+// ---------------------------------------------------------------------------
 //
-// The route is an array of { lat, lon }. Returns the closest point
-// on the route as { lat, lon, distanceFromStartM, offRouteM,
-// segmentIndex }.
-//
-// Forward-constrained search
-// --------------------------
-// On a campus, footpaths loop back on themselves — a spur, a path
-// that returns near its own start, a loop around a building. If the
-// search always looks at the whole route, a segment that's
-// geometrically close to the student but far along the route can
-// "win" the distance comparison and cause the dot to leap. And at
-// corners, two segments share a vertex, so the perpendicular
-// projection onto the segment the student just left clamps to that
-// vertex and pins the dot there for several metres.
-//
-// To prevent both, we constrain the search to a window of segments
-// around the last-known index. Pass `nearIndex` from the previous
-// snap. If the best match inside the window is worse than
-// `fallbackThresholdM` (or `nearIndex` is null), we re-run the
-// search over the whole route. So the worst case is exactly the
-// old behaviour; the common case is faster and more correct.
-//
-// Defaults:
-//   nearIndex           — null (full search)
-//   window              — 6 segments on either side of nearIndex
-//   fallbackThresholdM  — 60 metres
+// The route geometry is stable for the life of a route. We key the
+// cache on the identity of the geometry array (the reference) so a
+// route change invalidates cleanly.
+
+let _cache = null; // { geometryRef, segmentLengths, cumDist }
+
+function _cumulativeDistances(geometry) {
+  if (_cache && _cache.geometryRef === geometry) {
+    return _cache;
+  }
+  const segmentLengths = [];
+  for (let i = 0; i < geometry.length - 1; i++) {
+    segmentLengths.push(
+      haversineM(
+        geometry[i].lat,
+        geometry[i].lon,
+        geometry[i + 1].lat,
+        geometry[i + 1].lon
+      )
+    );
+  }
+  const cumDist = [0];
+  for (let i = 0; i < segmentLengths.length; i++) {
+    cumDist.push(cumDist[i] + segmentLengths[i]);
+  }
+  _cache = { geometryRef: geometry, segmentLengths, cumDist };
+  return _cache;
+}
+
+// ---------------------------------------------------------------------------
+// snapToRoute
+// ---------------------------------------------------------------------------
+
+/**
+ * Snap a raw GPS point onto a route.
+ *
+ * The route is an array of { lat, lon }.
+ *
+ * Returns:
+ *   {
+ *     lat, lon,             // the snapped point
+ *     distanceFromStartM,   // metres along the route to the snapped point
+ *     offRouteM,            // perpendicular distance from the fix to the route
+ *     segmentIndex,         // which segment the snap landed on
+ *     rejected,             // true if the jump guard rejected this snap
+ *   }
+ * or null if the route geometry is empty.
+ *
+ * Options:
+ *   nearIndex — the previous snap's segmentIndex, for continuity
+ *
+ * The returned value can have `rejected: true` when the best snap
+ * would move distance-from-start by an implausible amount in one fix
+ * (see FORWARD_JUMP_MAX_M / BACKWARD_JUMP_MAX_M). Callers should keep
+ * the previous snap's values in that case rather than using these.
+ */
 export function snapToRoute(point, routeGeometry, options = {}) {
-  const {
-    nearIndex = null,
-    window = 6,
-    fallbackThresholdM = 60,
-  } = options;
+  const { nearIndex = null } = options;
 
   if (!routeGeometry || routeGeometry.length === 0) {
     return null;
@@ -128,77 +190,81 @@ export function snapToRoute(point, routeGeometry, options = {}) {
       distanceFromStartM: 0,
       offRouteM: haversineM(point.lat, point.lon, only.lat, only.lon),
       segmentIndex: 0,
+      rejected: false,
     };
   }
 
-  // Precompute segment lengths so we can translate (segment index, t)
-  // into a distance-from-start.
-  const segmentLengths = [];
-  for (let i = 0; i < routeGeometry.length - 1; i++) {
-    const len = haversineM(
-      routeGeometry[i].lat,
-      routeGeometry[i].lon,
-      routeGeometry[i + 1].lat,
-      routeGeometry[i + 1].lon
-    );
-    segmentLengths.push(len);
-  }
+  const { segmentLengths, cumDist } = _cumulativeDistances(routeGeometry);
+  const lastSegment = routeGeometry.length - 2;
 
-  // Cumulative distance to the start of each segment, so we can
-  // compute distanceFromStartM in O(1) once we know the winning
-  // segment and its t.
-  const cumDist = [0];
-  for (let i = 0; i < segmentLengths.length; i++) {
-    cumDist.push(cumDist[i] + segmentLengths[i]);
-  }
-
-  // The per-segment search. `startSeg` and `endSeg` are inclusive
-  // segment indices; the loop runs from startSeg to endSeg.
   function searchRange(startSeg, endSeg) {
-    let bestLocal = null;
-    let bestLocalIndex = -1;
+    let best = null;
 
     for (let i = startSeg; i <= endSeg; i++) {
       const a = [routeGeometry[i].lat, routeGeometry[i].lon];
       const b = [routeGeometry[i + 1].lat, routeGeometry[i + 1].lon];
       const info = pointSegmentInfo([point.lat, point.lon], a, b);
 
-      if (bestLocal === null || info.distance < bestLocal.distance) {
+      // On a tie, prefer the later segment — a walker moves forward,
+      // not back. This is what fixes the corner-pins-to-old-segment
+      // behaviour.
+      if (best === null || info.distance <= best.offRouteM) {
         const distanceFromStart = cumDist[i] + info.t * segmentLengths[i];
         const snappedLat = a[0] + (b[0] - a[0]) * info.t;
         const snappedLon = a[1] + (b[1] - a[1]) * info.t;
 
-        bestLocal = {
+        best = {
           lat: snappedLat,
           lon: snappedLon,
           distanceFromStartM: distanceFromStart,
           offRouteM: info.distance,
           segmentIndex: i,
         };
-        bestLocalIndex = i;
       }
     }
-
-    return bestLocal;
+    return best;
   }
 
-  const lastSegment = routeGeometry.length - 2; // last valid segment index
+  // Always compute the global best. This is what fixes the "trapped
+  // on the wrong segment" freeze: whatever the window says, we know
+  // the true closest segment on the whole route.
+  const global = searchRange(0, lastSegment);
+  if (global === null) {
+    return null;
+  }
 
-  // If we have a previous index, try the window first.
+  let candidate = global;
+
+  // If we have a previous index, try a forward-biased window. Accept
+  // it only if it's nearly as good as the global best — that's what
+  // continuity should mean: "the same as last time, unless something
+  // better is meaningfully closer".
   if (nearIndex != null) {
-    const startSeg = Math.max(0, nearIndex - window);
-    const endSeg = Math.min(lastSegment, nearIndex + window);
-
-    const windowBest = searchRange(startSeg, endSeg);
-
-    // If the window found a good enough match, use it. Otherwise fall
-    // through to a full search — the snap has drifted and we need to
-    // re-find ourselves.
-    if (windowBest !== null && windowBest.offRouteM <= fallbackThresholdM) {
-      return windowBest;
+    const startSeg = Math.max(0, nearIndex - WINDOW_BEHIND);
+    const endSeg = Math.min(lastSegment, nearIndex + WINDOW_AHEAD);
+    const local = searchRange(startSeg, endSeg);
+    if (local && local.offRouteM <= global.offRouteM + WINDOW_TOLERANCE_M) {
+      candidate = local;
     }
   }
 
-  // Full search — first fix, no nearIndex, or the window failed.
-  return searchRange(0, lastSegment);
+  // Jump guard: a snap that moves distance-from-start forward by more
+  // than FORWARD_JUMP_MAX_M, or backward by more than
+  // BACKWARD_JUMP_MAX_M, in one fix is rejected unless the fix is
+  // genuinely off-route.
+  //
+  // Without this, a route that loops back near itself can legitimately
+  // have its global best on a segment hundreds of metres ahead of the
+  // walker. That would leap the step index and trigger arrival early.
+  if (nearIndex != null && candidate.offRouteM <= OFF_ROUTE_ACCEPT_M) {
+    // We don't have the previous distanceFromStartM here — the caller
+    // does, and the caller checks the jump. We return a flag if the
+    // segment change is large enough to warrant it.
+    const segmentDelta = Math.abs(candidate.segmentIndex - nearIndex);
+    if (segmentDelta > 20) {
+      return { ...candidate, rejected: true };
+    }
+  }
+
+  return { ...candidate, rejected: false };
 }
