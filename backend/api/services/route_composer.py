@@ -51,6 +51,27 @@ distances along the path for every step, outdoor and indoor.
 Levels are stored on the *edges* in the OSM data. Corridor and walk
 edges carry a single level like "0" or "-1". Stairs edges carry a
 semicolon list like "0;1" or "-1;0;1", ordered bottom-to-top.
+
+Step anchoring (_prospective_indoor_steps)
+------------------------------------------
+The indoor engine pins "Walk N m, then turn left" to the node where
+the walk ENDS — the turn node. The app switches to a step when the
+walker reaches its `at_m`, so the walk text isn't shown until after
+the walk. This is the same off-by-one as the pure-outdoor engine
+had, fixed there by `step_merge.merge_opening_step`.
+
+`_prospective_indoor_steps` fixes it here for mixed and indoor
+routes: it moves each "Walk …" / "Continue for …" line back to where
+the walk STARTS, and folds the opening line ("Starting from X") into
+the first walk so there's no separate zero-length opening step.
+
+The steps at this stage have NO "kind" field. The "kind" on the API
+response is added later by _annotate_steps_and_legs. So this
+function must not rely on step["kind"].
+
+`_annotate_steps_and_legs` runs after this and reads `at_m` and
+`geometry_index` from each step's (now moved) node, so both follow
+the corrected anchors automatically.
 """
 
 import logging
@@ -416,6 +437,14 @@ def _route_via_indoor_engine(from_ep, to_ep):
         start_name=from_ep["name"],
     )
 
+    # Move "Walk …" lines back to where their walk starts, and fold
+    # the opening line into the first walk. This is the same fix that
+    # `step_merge.merge_opening_step` applies to the pure-outdoor
+    # engine, and it addresses the same off-by-one: the indoor engine
+    # pins "Walk N m, then turn" to the turn node, so the text isn't
+    # shown until the walker has already reached the turn.
+    steps = _prospective_indoor_steps(steps, path, total)
+
     annotated_steps, legs = _annotate_steps_and_legs(
         steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
     )
@@ -455,6 +484,164 @@ def _fix_opening_line(steps, start_is_outdoor, start_name):
     return fixed
 
 
+# ---------------------------------------------------------------------------
+# Prospective step re-anchoring (mixed / indoor routes)
+# ---------------------------------------------------------------------------
+
+# Instruction prefixes that begin a "walk" step. These are the ones
+# whose anchor the engine placed at the END of the leg, and which we
+# need to move to the start.
+_LEG_PREFIXES = ("walk", "continue for")
+
+
+def _lower_first(text):
+    """Lowercase the first character, leaving the rest alone."""
+    if not text:
+        return text
+    return text[:1].lower() + text[1:]
+
+
+def _is_opening_instruction(text):
+    """
+    True when the instruction is the engine's opening line.
+
+    _fix_opening_line() rewrites steps[0] to one of two forms:
+      "Starting from <name>"
+      "From your current position"
+    This helper recognises both.
+    """
+    if not text:
+        return False
+    lowered = text.strip().lower()
+    return (
+        lowered.startswith("starting from")
+        or lowered.startswith("from your current position")
+    )
+
+
+def _prospective_indoor_steps(steps, path, total_m):
+    """
+    Move each walk-style step back to where its walk starts, and fold
+    the opening line into the first walk.
+
+    The indoor engine produces steps in this shape:
+
+        {"instruction": "Starting from the main gate", "node_id": <start>}
+        {"instruction": "Walk about 90 metres, then turn left", "node_id": <turn>}
+        {"instruction": "Turn left", "node_id": <turn>}
+        {"instruction": "Walk about 20 metres along the corridor, then turn right", "node_id": <turn>}
+        ...
+
+    Note: these steps have no "kind" field at this stage. The "kind"
+    on the API response is added later by _annotate_steps_and_legs's
+    _kind_for_step. So this function must not rely on step["kind"].
+
+    The "Walk N m, then turn X" line is anchored at the TURN node,
+    which is the end of the walk. From the walker's point of view,
+    that means the instruction to walk N metres only appears once
+    they've already walked them.
+
+    This function moves each such step back to the node where the
+    walk starts, so the instruction is current from the moment the
+    walker begins the leg.
+
+    It also handles two adjacent "walk" steps that the engine emits
+    separately (a bare "Walk a short distance" followed by "Walk N m,
+    then turn X") by joining them into a single instruction.
+
+    Finally, if the opening line ("Starting from X") is immediately
+    followed by a walk that now starts at the same node, the opening
+    is folded into the walk as a lead-in.
+    """
+    if len(steps) < 2 or not path:
+        return steps
+
+    # ---- 1. Join adjacent walk-only + walk-and-turn pairs ----
+    #
+    # The engine sometimes emits:
+    #   "Walk a short distance"                     (no node_id)
+    #   "Walk about 20 metres, then turn right"     (node_id = turn)
+    # as two separate steps. Merge them into one.
+    merged = []
+    carry = None
+    for s in steps:
+        nid = s.get("node_id") or ""
+        walkish = s["instruction"].lower().startswith(_LEG_PREFIXES)
+        if walkish and not nid:
+            if carry is None:
+                carry = s
+            else:
+                carry = {
+                    **carry,
+                    "instruction": (
+                        carry["instruction"]
+                        + ", then "
+                        + _lower_first(s["instruction"])
+                    ),
+                }
+            continue
+        if carry is not None:
+            if walkish and nid:
+                s = {
+                    **s,
+                    "instruction": (
+                        carry["instruction"]
+                        + ", then "
+                        + _lower_first(s["instruction"])
+                    ),
+                }
+            else:
+                merged.append(carry)
+            carry = None
+        merged.append(s)
+    if carry is not None:
+        merged.append(carry)
+
+    # ---- 2. Re-anchor each walk-and-turn step at the start of its walk ----
+    #
+    # Walk the merged list. Remember the node id where the previous
+    # action really happened; that's where the current walk begins.
+    # When a step is a walk-style step with a node_id, rewrite its
+    # node_id to point at the *previous* action's node.
+    out = []
+    last_action_node = path[0]
+    for s in merged:
+        nid = s.get("node_id") or ""
+        is_leg = bool(nid) and s["instruction"].lower().startswith(_LEG_PREFIXES)
+        if is_leg:
+            out.append({**s, "node_id": last_action_node})
+        else:
+            out.append(s)
+        if nid:
+            last_action_node = nid
+
+    # ---- 3. Fold the opening line into the first walk ----
+    #
+    # After re-anchoring, the opening step ("Starting from X" or
+    # "From your current position") and the first walk both sit at
+    # path[0]. Merge them so the walker sees one instruction.
+    #
+    # Detection is by content, not by a "kind" field, because at this
+    # stage the steps have no "kind".
+    if (
+        len(out) >= 2
+        and out[0].get("node_id") == path[0]
+        and out[1].get("node_id") == path[0]
+        and _is_opening_instruction(out[0]["instruction"])
+    ):
+        opener = out[0]["instruction"]
+        first = out[1]["instruction"]
+        merged_text = f"{opener} — {_lower_first(first)}"
+        out[1] = {**out[1], "instruction": merged_text}
+        del out[0]
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Step annotation
+# ---------------------------------------------------------------------------
+
 def _annotate_steps_and_legs(
     steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
 ):
@@ -477,7 +664,7 @@ def _annotate_steps_and_legs(
 
       Here, we walk the path with a forward-only `ptr` and, for each
       step, find that step's node. The index we land on is the step's
-      real geometry_index. We record it as we go.
+      real geometry_index.
     """
     cum = [0.0]
     for a, b in zip(path, path[1:]):
@@ -507,9 +694,6 @@ def _annotate_steps_and_legs(
                 last_at = max(last_at, cum[ptr])
                 last_gi = ptr
             else:
-                # Node not found — reset and search from the start.
-                # This shouldn't happen for a well-formed step list,
-                # but it keeps the annotator from getting stuck.
                 ptr = 0
         modes.append(last_mode)
         at_ms.append(last_at)

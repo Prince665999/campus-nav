@@ -23,24 +23,23 @@
 //   - The fit runs once per (building, level) via a ref, so re-renders
 //     and step advances don't override the student's zoom or pan.
 //   - The fit formula uses the container's real pixel size and a
-//     metres-per-pixel diagonal, replacing the old fixed-constant
-//     formula that produced a zoom that was too low for buildings.
-//   - Route-up heading: the map is rotated so the direction the
-//     student is about to walk points at the top of the screen. This
-//     is a one-shot turn when the step changes, not a continuous
-//     follow. A north-up button lets the student flip back.
+//     metres-per-pixel diagonal.
+//   - Heading is computed differently for the two modes:
+//       • Walking screen (lockHeading = false): the heading is the
+//         compass direction of the leg the student is about to walk,
+//         SNAPPED to one of N / E / S / W. Only four values, so the
+//         building outline never sits at a skew angle. Updates on a
+//         Next press, not continuously.
+//       • Preview (lockHeading = true): the heading is the start-to-
+//         end bearing of the whole route, snapped to N or S only.
+//         Unchanged from the previous version.
 //   - `lockHeading` prop: used by the route preview. When true, the
-//     heading is computed from the WHOLE route so it doesn't change
-//     when the student taps a floor chip. The preview is stationary
-//     by design.
+//     heading is computed from the whole route, so tapping a floor
+//     chip doesn't rotate the map.
 //   - forceSwitcher prop: when true, the floor switcher is shown
-//     regardless of the settings toggle. The route-preview screen
-//     uses this, because a preview always wants the switcher if the
-//     building has more than one floor.
-//   - onNoRooms is called in the catch branch too, not only when the
-//     areas list is empty. Without this, a network error on the
-//     floor-plan fetch left a blank screen and never fell back to
-//     the outdoor map.
+//     regardless of the settings toggle.
+//   - onNoRooms is called in the catch branch too, so a network error
+//     on the floor-plan fetch falls back to the outdoor map.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -92,10 +91,47 @@ const FILL_COLOR_EXPR = [
 // Below it, GPS noise would dominate, so we fall back to 0.
 const MIN_HEADING_DISTANCE_M = 3;
 
+// Walking screen: the only four headings the map will use. No
+// intermediate angles — the building stays square to the screen.
+const CARDINALS = [0, 90, 180, 270];
+
 function levelLabel(level) {
   if (level === '-1') return 'B';
   if (level === '0') return 'G';
   return level;
+}
+
+// Snap a bearing to the nearest of N / E / S / W.
+function snapToCardinal(bearing) {
+  if (bearing == null || !Number.isFinite(bearing)) return 0;
+  const h = ((bearing % 360) + 360) % 360;
+  let best = 0;
+  let bestDiff = Infinity;
+  for (const c of CARDINALS) {
+    const diff = Math.abs(((h - c + 540) % 360) - 180);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = c;
+    }
+  }
+  return best;
+}
+
+// Snap a bearing to N or S only. Used by the preview.
+function snapToNorthSouth(bearing) {
+  if (bearing == null || !Number.isFinite(bearing)) return 0;
+  const h = ((bearing % 360) + 360) % 360;
+  return Math.cos((h * Math.PI) / 180) >= 0 ? 0 : 180;
+}
+
+// Which compass letter is at the top of the screen for a given
+// heading.
+function topLetter(heading) {
+  const h = ((heading % 360) + 360) % 360;
+  if (h >= 315 || h < 45) return 'N';
+  if (h < 135) return 'E';
+  if (h < 225) return 'S';
+  return 'W';
 }
 
 function firstLegBearing(points) {
@@ -149,17 +185,18 @@ export function IndoorMapView({
   // advances.
   const fittedKeyRef = useRef(null);
 
-  // North-up toggle. Off by default, meaning "route-up" — the map is
-  // rotated so the walking direction is at the top of the screen.
-  const [northUp, setNorthUp] = useState(false);
+  // 180-degree flip. Off by default: the map is route-up (the walking
+  // direction is at the top of the screen). The corner button toggles
+  // this, which turns the map exactly half a turn.
+  const [flipped, setFlipped] = useState(false);
 
   // When the building changes, reset the selected level to whatever
   // the current step says, clear the fitted key so the new building's
-  // floors get fitted, and reset the north-up toggle.
+  // floors get fitted, and reset the flip.
   useEffect(() => {
     setSelectedLevel(level);
     fittedKeyRef.current = null;
-    setNorthUp(false);
+    setFlipped(false);
   }, [buildingName]);
 
   // Follow the current step's level unless the student manually
@@ -201,8 +238,6 @@ export function IndoorMapView({
         if (cancelled) return;
         setError(err.message || 'Could not load floor plan.');
         setAreas([]);
-        // Notify the caller so it can fall back to the outdoor map
-        // rather than leaving a blank screen.
         if (onNoRooms) onNoRooms();
       })
       .finally(() => {
@@ -289,39 +324,49 @@ export function IndoorMapView({
   // Route-up heading
   // -------------------------------------------------------------------------
   //
-  // The heading is the compass bearing of the leg the student is
-  // about to walk. Setting it as the camera heading rotates the map
-  // so that direction points at the top of the screen.
+  // Two distinct behaviours, selected by `lockHeading`.
   //
-  // Two modes:
-  //   - lockHeading = false (walking screen): the heading is computed
-  //     from the route points on the CURRENTLY DISPLAYED floor. It
-  //     updates when the step changes, so the map turns as the
-  //     student turns. It does NOT update continuously.
-  //   - lockHeading = true (preview): the heading is computed from
-  //     the whole route, so tapping a floor chip doesn't rotate the
-  //     map. The preview is stationary.
+  // Walking screen (lockHeading = false):
+  //   The heading is the compass direction of the leg the student is
+  //   about to walk, taken from `currentStepPoint` forward, SNAPPED
+  //   to the nearest of N / E / S / W. Only four values are ever
+  //   applied, so the building outline never sits at a skew angle and
+  //   the map only rotates on the four 90° axes. The heading updates
+  //   when `currentStepPoint` changes — i.e. when the student presses
+  //   Next. Between presses, the map holds still.
   //
-  // The bearing is taken from `currentStepPoint` when available, so
-  // the map is oriented from where the student actually is right
-  // now, not from the first point of the route.
+  // Preview (lockHeading = true):
+  //   The heading is the start-to-end bearing of the whole route,
+  //   SNAPPED to N or S only. Tapping a floor chip does not rotate
+  //   the preview. This matches the previous version's behaviour.
   const routeHeading = useMemo(() => {
     const all = routeByLevel || [];
     if (all.length < 2) return 0;
 
-    let points;
     if (lockHeading) {
-      points = all;
-    } else {
-      points = all.filter((p) => p.level === selectedLevel);
-      if (points.length < 2) {
-        // The current floor has no route points. Fall back to the
-        // whole route so the map still has a sensible heading.
-        points = all;
+      // Preview: overall direction of the trip, snapped to N or S.
+      const first = all[0];
+      const last = all[all.length - 1];
+      let raw;
+      if (
+        haversineM(first.lat, first.lon, last.lat, last.lon) >=
+        MIN_HEADING_DISTANCE_M
+      ) {
+        raw = bearingDeg(first.lat, first.lon, last.lat, last.lon);
+      } else {
+        raw = firstLegBearing(all);
       }
+      return snapToNorthSouth(raw);
     }
 
-    // Find where the student is on this floor, if we know.
+    // Walking: look at the points on the current floor from
+    // `currentStepPoint` forward, take the first real leg's bearing,
+    // then snap to the nearest cardinal.
+    let points = all.filter((p) => p.level === selectedLevel);
+    if (points.length < 2) {
+      points = all;
+    }
+
     let startIdx = 0;
     if (currentStepPoint) {
       const idx = points.findIndex(
@@ -332,28 +377,17 @@ export function IndoorMapView({
     }
 
     const slice = points.slice(startIdx);
-    return firstLegBearing(slice);
+    const raw = firstLegBearing(slice);
+    return snapToCardinal(raw);
   }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
+
+  // The heading actually applied to the camera: the route-up heading,
+  // plus a half turn when the student has pressed the flip button.
+  const effectiveHeading = (routeHeading + (flipped ? 180 : 0)) % 360;
 
   // -------------------------------------------------------------------------
   // Camera fit — once per (building, level)
   // -------------------------------------------------------------------------
-  //
-  // The old formula (zoom = 15 + log2(0.0015 / span)) produced a zoom
-  // that was too low for a building: for a 60 m span it gave ~16.6,
-  // which is more zoomed out than the map default of 18. That's why
-  // rooms looked small right after a fit.
-  //
-  // The new formula:
-  //   1. Computes the diagonal of the building's bounding box in
-  //      metres.
-  //   2. Divides by the smaller of the container's two dimensions
-  //      (times 0.9, leaving a margin), giving metres per pixel.
-  //   3. Converts to a Web Mercator zoom at the building's latitude.
-  //
-  // The diagonal (not width or height alone) is the right measure
-  // because the map may be rotated, and either dimension could be
-  // the limiting one.
   useEffect(() => {
     if (!cameraRef.current) return;
     if (loading) return;
@@ -361,7 +395,6 @@ export function IndoorMapView({
 
     const key = `${buildingName}|${selectedLevel}`;
     if (fittedKeyRef.current === key) return;
-    fittedKeyRef.current = key;
 
     const points = [];
     for (const area of areas) {
@@ -393,20 +426,20 @@ export function IndoorMapView({
     const minDim = Math.min(containerSize.width, containerSize.height);
     const mPerPx = diagM / Math.max(minDim * 0.9, 1);
 
-    // Web Mercator: at zoom z, the world is 256 * 2^z pixels wide,
-    // and there are ~78271.5 / cosLat metres per pixel at zoom 0.
-    // So metres-per-pixel at zoom z = (78271.5 * cosLat) / 2^z.
-    // Solving for z:
+    // Web Mercator: metres-per-pixel at zoom z is
+    //   (78271.5 * cosLat) / 2^z.
     const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
 
     const clamped = Math.max(16, Math.min(21, zoom));
 
     const timeout = setTimeout(() => {
+      // Mark as fitted only once we actually issue the camera call.
+      fittedKeyRef.current = key;
       try {
         cameraRef.current?.setCamera({
           centerCoordinate: [centerLon, centerLat],
           zoomLevel: clamped,
-          heading: northUp ? 0 : routeHeading,
+          heading: effectiveHeading,
           animationDuration: 400,
         });
       } catch {
@@ -415,9 +448,9 @@ export function IndoorMapView({
     }, 100);
 
     return () => clearTimeout(timeout);
-    // routeHeading is intentionally excluded: the fit is a one-shot
-    // per floor, and heading changes are handled by the separate
-    // effect below.
+    // effectiveHeading intentionally excluded: the fit is a one-shot
+    // per floor; heading changes are handled by the separate effect
+    // below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [areas, loading, buildingName, selectedLevel, containerSize]);
 
@@ -425,21 +458,21 @@ export function IndoorMapView({
   // Heading effect — turns the map when the route direction changes
   // -------------------------------------------------------------------------
   //
-  // This runs whenever `routeHeading` or `northUp` changes. It only
-  // sets the heading, leaving the centre and zoom untouched, so the
-  // student's pan and zoom are preserved. It is a one-shot turn, not
-  // a continuous follow.
+  // Runs whenever `effectiveHeading` changes. That happens on a Next
+  // press in walking mode (currentStepPoint moves → routeHeading
+  // recomputes → snapped heading may change), and on a flip button
+  // press. It only sets the heading, leaving centre and zoom alone.
   useEffect(() => {
     if (!cameraRef.current) return;
     try {
       cameraRef.current.setCamera({
-        heading: northUp ? 0 : routeHeading,
+        heading: effectiveHeading,
         animationDuration: 500,
       });
     } catch {
       // Silent.
     }
-  }, [routeHeading, northUp]);
+  }, [effectiveHeading]);
 
   // -------------------------------------------------------------------------
   // Render
@@ -497,7 +530,7 @@ export function IndoorMapView({
           defaultSettings={{
             centerCoordinate: initialCenter,
             zoomLevel: 18,
-            heading: 0,
+            heading: effectiveHeading,
           }}
         />
 
@@ -591,25 +624,25 @@ export function IndoorMapView({
         ) : null}
       </MapView>
 
-      {/* Spinner overlay for floor changes after the first load.
-          Shown on top of the existing map so the Camera keeps its
-          state. */}
+      {/* Spinner overlay for floor changes after the first load. */}
       {loading && areas && areas.length > 0 ? (
         <View style={styles.loadingOverlay} pointerEvents="none">
           <ActivityIndicator color={COLORS.primaryDark} />
         </View>
       ) : null}
 
-      {/* North-up toggle. Sits in the top-right corner of the map. */}
+      {/* Flip button, top-right corner. Shows the compass letter that is
+          at the top of the screen right now. Each press turns the map
+          exactly 180 degrees. */}
       <TouchableOpacity
         style={styles.northButton}
-        onPress={() => setNorthUp((v) => !v)}
+        onPress={() => setFlipped((v) => !v)}
         accessibilityRole="button"
-        accessibilityLabel={
-          northUp ? 'Switch to route-up view' : 'Switch to north-up view'
-        }
+        accessibilityLabel={`Map top is ${topLetter(effectiveHeading)}. Turn the map around`}
       >
-        <Text style={styles.northButtonText}>{northUp ? 'N' : '↑'}</Text>
+        <Text style={styles.northButtonText}>
+          {topLetter(effectiveHeading)}
+        </Text>
       </TouchableOpacity>
 
       {showSwitcher ? (

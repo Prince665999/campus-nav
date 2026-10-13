@@ -36,13 +36,23 @@
 // ----------------
 // When this component is used as a preview (followBearing = false),
 // the initial fit turns the map so the route runs from bottom to top
-// of the screen. This is a one-shot turn on the fit call. After that
-// the map is stationary; it does not follow the compass. The walking
-// screen passes followBearing = true, so it skips this and follows
-// the walker's heading instead.
+// of the screen. This is a one-shot turn, not a continuous follow.
+// The walking screen passes followBearing = true, so it skips the
+// preview heading entirely and follows the walker's compass.
+//
+// The preview gets its own N/S flip button (top-right). It shows
+// which compass direction is at the top of the screen right now.
+// One press turns the map 180°.
+//
+// The fit runs only after `onDidFinishLoadingMap` fires, so a
+// setCamera call isn't dropped while the native map is still
+// loading.
+//
+// Walking screen is untouched by all of this: it passes
+// followBearing = true and the whole preview block is skipped.
 
 import { useMemo, useRef, useEffect, useState } from 'react';
-import { StyleSheet, View } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import {
   MapView,
   Camera,
@@ -61,6 +71,7 @@ import {
   CAMERA_MIN_MOVE_M,
   CAMERA_MIN_HEADING_DEG,
 } from '@/constants/config';
+import { COLORS } from '@/constants/theme';
 
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
 const DEFAULT_CENTER = [39.2000, -6.7500];
@@ -77,9 +88,9 @@ const CAMPUS_BOUNDS = {
 // without the circle.
 const ACCURACY_CIRCLE_MAX_M = 60;
 
-// The route preview pulls back by this many zoom levels when it
-// turns the map, because a diagonal route can push its ends toward
-// the screen edges once the map is rotated.
+// The preview fit pulls back by this many zoom levels when the map
+// is rotated, because a diagonal route can push its ends toward the
+// screen edges once the map is turned.
 const PREVIEW_HEADING_ZOOM_OFFSET = 0.5;
 
 function isWithinCampus(lon, lat) {
@@ -128,7 +139,6 @@ function accuracyCircleGeoJSON(userLocation, radiusM) {
     const dLon = (radiusM * Math.sin(angle)) / METERS_PER_DEG_LON;
     ring.push([userLocation.lon + dLon, userLocation.lat + dLat]);
   }
-  // Close the ring.
   ring.push(ring[0]);
 
   return {
@@ -204,9 +214,25 @@ export function RouteMap({
 
   const [indoorNoRooms, setIndoorNoRooms] = useState(false);
 
+  // Preview-only: gate the initial fit on the native map being
+  // loaded, so setCamera({ heading }) isn't dropped while the map is
+  // still initialising. On the walking screen (followBearing = true)
+  // this state is set but never used.
+  const [mapReady, setMapReady] = useState(false);
+
+  // Preview-only: 0°/180° flip. Chosen from the route's overall
+  // bearing, toggled by the button. Irrelevant on the walking screen.
+  const [flipped, setFlipped] = useState(false);
+
   useEffect(() => {
     setIndoorNoRooms(false);
   }, [indoorBuildingName, indoorLevel]);
+
+  // Reset the flip when the route changes, so a new route starts on
+  // its own preferred side rather than inheriting the previous flip.
+  useEffect(() => {
+    setFlipped(false);
+  }, [geometry]);
 
   const routeCoords = useMemo(
     () => geometry.map((p) => [p.lon, p.lat]),
@@ -240,12 +266,9 @@ export function RouteMap({
     [userLocation, bearing]
   );
 
-  // The one-shot heading for the preview fit. Null when the walking
-  // screen is using this map (it follows the walker's heading), or
+  // The route's overall bearing, from first point to last. Null when
+  // the walking screen is using this map (followBearing is true), or
   // when the route is too short for a meaningful bearing.
-  //
-  // Computed from the first to the last route point: the route runs
-  // from the bottom of the screen toward the top.
   const previewHeading = useMemo(() => {
     if (followBearing) return null;
     if (routeCoords.length < 2) return null;
@@ -254,18 +277,24 @@ export function RouteMap({
     return bearingDeg(first[1], first[0], last[1], last[0]);
   }, [routeCoords, followBearing]);
 
-  // Camera throttle state.
-  const lastCamRef = useRef({
-    t: 0,
-    lat: null,
-    lon: null,
-    heading: null,
-  });
+  // The base orientation for the preview, snapped to 0 or 180.
+  // Same idea as the indoor map's baseHeading: only two values, so
+  // the map never sits at a skew angle.
+  const previewBaseHeading = useMemo(() => {
+    if (previewHeading == null) return null;
+    return Math.cos((previewHeading * Math.PI) / 180) >= 0 ? 0 : 180;
+  }, [previewHeading]);
 
-  useEffect(() => {
-    if (mode !== 'outdoor') return;
-    if (routeCoords.length < 2 || !cameraRef.current) return;
+  // Effective heading, including the flip.
+  const mapHeading =
+    previewBaseHeading == null
+      ? null
+      : (previewBaseHeading + (flipped ? 180 : 0)) % 360;
 
+  // Fit parameters, computed once per route. Used by the fit effect
+  // once mapReady is true.
+  const fit = useMemo(() => {
+    if (routeCoords.length < 2) return null;
     const valid = routeCoords.filter(
       (c) =>
         Array.isArray(c) &&
@@ -273,12 +302,10 @@ export function RouteMap({
         Number.isFinite(c[1]) &&
         isWithinCampus(c[0], c[1])
     );
-
-    if (valid.length === 0) return;
+    if (valid.length === 0) return null;
 
     const lons = valid.map((c) => c[0]);
     const lats = valid.map((c) => c[1]);
-
     const west = Math.min(...lons);
     const east = Math.max(...lons);
     const south = Math.min(...lats);
@@ -294,37 +321,72 @@ export function RouteMap({
     }
     zoom = Math.max(14, Math.min(18, zoom));
 
-    // If we're going to turn the map, pull back a little so the ends
-    // of a diagonal route don't get pushed off the top and bottom.
-    const finalZoom =
-      previewHeading != null ? zoom - PREVIEW_HEADING_ZOOM_OFFSET : zoom;
+    return { center: [centerLon, centerLat], zoom };
+  }, [routeCoords]);
 
-    const cam = {
-      centerCoordinate: [centerLon, centerLat],
-      zoomLevel: finalZoom,
-      animationDuration: 500,
-    };
-    if (previewHeading != null) {
-      cam.heading = previewHeading;
-    }
+  // Camera throttle state — used only on the walking screen.
+  const lastCamRef = useRef({
+    t: 0,
+    lat: null,
+    lon: null,
+    heading: null,
+  });
 
-    const timeout = setTimeout(() => {
-      try {
-        cameraRef.current?.setCamera(cam);
-      } catch {
-        // Silent.
-      }
-    }, 200);
-
-    return () => clearTimeout(timeout);
-  }, [routeCoords, mode, previewHeading]);
-
-  // Follow camera. Throttled: at most one update every
-  // CAMERA_MIN_INTERVAL_MS, and only when the student has moved at
-  // least CAMERA_MIN_MOVE_M or the heading has changed by at least
-  // CAMERA_MIN_HEADING_DEG.
+  // Preview fit. Only runs when followBearing is false, when the
+  // native map has finished loading, and when we have a fit and a
+  // heading.
   useEffect(() => {
     if (mode !== 'outdoor') return;
+    if (followBearing) return;
+    if (!mapReady) return;
+    if (!cameraRef.current) return;
+    if (!fit) return;
+
+    const cam = {
+      centerCoordinate: fit.center,
+      zoomLevel:
+        mapHeading != null
+          ? fit.zoom - PREVIEW_HEADING_ZOOM_OFFSET
+          : fit.zoom,
+      animationDuration: 500,
+    };
+    if (mapHeading != null) {
+      cam.heading = mapHeading;
+    }
+
+    // eslint-disable-next-line no-console
+    console.log('[preview fit]', {
+      mapHeading,
+      base: previewBaseHeading,
+      flipped,
+      zoom: cam.zoomLevel,
+      points: routeCoords.length,
+    });
+
+    try {
+      cameraRef.current.setCamera(cam);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.log('[preview fit] setCamera failed:', e && e.message);
+    }
+  }, [
+    mode,
+    followBearing,
+    mapReady,
+    fit,
+    mapHeading,
+    previewBaseHeading,
+    flipped,
+    routeCoords.length,
+  ]);
+
+  // Follow camera (walking screen only). Throttled: at most one
+  // update every CAMERA_MIN_INTERVAL_MS, and only when the student
+  // has moved at least CAMERA_MIN_MOVE_M or the heading has changed
+  // by at least CAMERA_MIN_HEADING_DEG.
+  useEffect(() => {
+    if (mode !== 'outdoor') return;
+    if (!followBearing) return;
     if (!cameraRef.current) return;
     if (!userLocation) return;
     if (!isWithinCampus(userLocation.lon, userLocation.lat)) return;
@@ -360,7 +422,7 @@ export function RouteMap({
       centerCoordinate: [userLocation.lon, userLocation.lat],
       animationDuration: 600,
     };
-    if (followBearing && bearing != null) {
+    if (bearing != null) {
       update.heading = bearing;
     }
 
@@ -394,8 +456,13 @@ export function RouteMap({
     );
   }
 
-  const initialCenter =
-    routeCoords.length > 0 ? routeCoords[0] : DEFAULT_CENTER;
+  const initialCenter = fit ? fit.center : DEFAULT_CENTER;
+
+  // The button label: N or S, whichever is currently at the top of
+  // the screen. Only shown in preview mode.
+  const showFlipButton =
+    !followBearing && mode === 'outdoor' && mapHeading != null;
+  const topLabel = mapHeading === 0 ? 'N' : 'S';
 
   return (
     <View style={[styles.wrapper, style]}>
@@ -404,14 +471,15 @@ export function RouteMap({
         mapStyle={MAP_STYLE}
         logoEnabled={false}
         attributionEnabled={false}
-        compassEnabled={true}
+        compassEnabled={followBearing}
+        onDidFinishLoadingMap={() => setMapReady(true)}
       >
         <Camera
           ref={cameraRef}
           defaultSettings={{
             centerCoordinate: initialCenter,
-            zoomLevel: 16,
-            heading: 0,
+            zoomLevel: fit ? fit.zoom : 16,
+            heading: mapHeading != null ? mapHeading : 0,
           }}
         />
 
@@ -495,6 +563,21 @@ export function RouteMap({
           </ShapeSource>
         ) : null}
       </MapView>
+
+      {/* Preview flip button. Shows which compass direction is at the
+          top of the screen right now. One press turns the map 180°. */}
+      {showFlipButton ? (
+        <TouchableOpacity
+          style={styles.flipButton}
+          onPress={() => setFlipped((v) => !v)}
+          accessibilityRole="button"
+          accessibilityLabel={
+            topLabel === 'N' ? 'Flip map to south-up' : 'Flip map to north-up'
+          }
+        >
+          <Text style={styles.flipButtonText}>{topLabel}</Text>
+        </TouchableOpacity>
+      ) : null}
     </View>
   );
 }
@@ -515,5 +598,21 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 2,
     borderColor: '#ffffff',
+  },
+  flipButton: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  flipButtonText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.primaryDark,
   },
 });

@@ -5,6 +5,7 @@ import {
   Text,
   TouchableOpacity,
   View,
+  Dimensions,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -13,6 +14,12 @@ import { useAccessibility } from '@/hooks/useAccessibility';
 import { t } from '@/i18n';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 import { formatDistance } from '@/utils/format';
+
+// The card grows vertically to fit long instructions, up to this
+// fraction of the screen height. Beyond that, it will scroll the
+// instruction text internally. Short instructions stay at the
+// default size and the card is exactly as it is today.
+const MAX_CARD_HEIGHT_RATIO = 0.55;
 
 export function InstructionCard({
   step,
@@ -30,6 +37,8 @@ export function InstructionCard({
   const { fonts } = useAccessibility();
 
   const isIndoor = mode === 'indoor';
+  const maxCardHeight =
+    Dimensions.get('window').height * MAX_CARD_HEIGHT_RATIO;
 
   if (!step) {
     return (
@@ -43,7 +52,10 @@ export function InstructionCard({
 
   return (
     <View
-      style={[styles.card, { paddingBottom: insets.bottom + SPACING.md }]}
+      style={[
+        styles.card,
+        { paddingBottom: insets.bottom + SPACING.md, maxHeight: maxCardHeight },
+      ]}
       accessible
       accessibilityRole="summary"
       accessibilityLabel={`${step.instruction}. ${
@@ -85,9 +97,10 @@ export function InstructionCard({
         )}
 
         <View style={styles.textBlock}>
+          {/* No numberOfLines cap: the card grows to fit. The
+              maxHeight on the card bounds the growth. */}
           <Text
             style={[styles.instruction, { fontSize: fonts.title }]}
-            numberOfLines={4}
           >
             {step.instruction}
           </Text>
@@ -137,6 +150,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.background,
     borderTopWidth: 1,
     borderTopColor: COLORS.border,
+    overflow: 'hidden',
   },
   progressBar: {
     height: 4,
