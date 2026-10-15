@@ -1,3 +1,4 @@
+
 """
 ingest.py
 
@@ -9,7 +10,7 @@ Reads map.osm once and writes:
 Then reads final.osm and writes:
   - one row per door node       → places (kind="indoor")
   - one row per entrance node   → places (kind="entrance")
-  - one row per indoor polygon  → indoor_areas (rooms and corridors)
+  - one row per indoor polygon  → indoor_areas (rooms, corridors and floor outlines)
   - one row per walkable edge   → indoor_path_edges
 
 Run:
@@ -197,7 +198,11 @@ def ingest_path_edges(nodes, ways, session):
 _INDOOR_WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
 _INDOOR_STAIRS_HIGHWAY = "steps"
 
-_INDOOR_POLYGON_TYPES = {"room", "corridor"}
+# "level" is the outline of a whole floor (draw one closed way around the
+# building on each floor and tag it indoor=level, level=<n>, building_name=<name>).
+# The phone fills it with the interior colour and draws its outline; it is
+# never a room, so it is not searchable and gets no label.
+_INDOOR_POLYGON_TYPES = {"room", "corridor", "level"}
 
 
 def _is_door(tags):
@@ -322,7 +327,9 @@ def ingest_indoor_places(nodes, ways, session):
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
         if not rname:
-            rname = "corridor" if polygon_type == "corridor" else "unnamed"
+            rname = {"corridor": "corridor", "level": "floor outline"}.get(
+                polygon_type, "unnamed"
+            )
 
         refs = [r for r in way["refs"] if r in nodes]
         if len(refs) < 3:
@@ -484,7 +491,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
             n_indoor_edges = counts["edges"]
             print(f"  indoor door places: {n_indoor_places}")
             print(f"  indoor entrances: {n_entrances}")
-            print(f"  indoor rooms + corridors: {n_indoor_areas}")
+            print(f"  indoor rooms + corridors + floor outlines: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
     print("\nIngest complete.")
@@ -502,3 +509,4 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
 if __name__ == "__main__":
     path_arg = sys.argv[1] if len(sys.argv) > 1 else None
     run_ingest(osm_path=path_arg)
+

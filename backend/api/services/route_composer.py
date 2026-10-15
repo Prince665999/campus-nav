@@ -443,7 +443,7 @@ def _route_via_indoor_engine(from_ep, to_ep):
     # engine, and it addresses the same off-by-one: the indoor engine
     # pins "Walk N m, then turn" to the turn node, so the text isn't
     # shown until the walker has already reached the turn.
-    steps = _prospective_indoor_steps(steps, path, total)
+    steps = _prospective_indoor_steps(steps, path, total, nodes)
 
     annotated_steps, legs = _annotate_steps_and_legs(
         steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
@@ -519,7 +519,40 @@ def _is_opening_instruction(text):
     )
 
 
-def _prospective_indoor_steps(steps, path, total_m):
+def _opener_is_complete(text):
+    """
+    True when the opening line already contains its own turn, e.g.
+    "Starting from the bookstore on the ground floor — step out into the
+    corridor, then turn left". Such an opener is a finished instruction and
+    must NOT be glued to the walk that follows it.
+    """
+    lowered = (text or "").strip().lower()
+    return ", then turn" in lowered or lowered.endswith(
+        ("turn left", "turn right", "turn around")
+    )
+
+
+def _first_turn_node(path, nodes):
+    """
+    The path node where the walker makes the first real turn. This is where
+    the walk AFTER a complete opener starts. Mirrors the engine's own rule
+    (turn_descriptor on the change of bearing between consecutive edges).
+    """
+    if not nodes or len(path) < 3:
+        return None
+    from backend.core.indoor.campus_graph import bearing_deg, turn_descriptor
+
+    prev = None
+    for i in range(len(path) - 1):
+        a, b = nodes[path[i]], nodes[path[i + 1]]
+        brg = bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"])
+        if prev is not None and turn_descriptor((brg - prev + 540) % 360 - 180):
+            return path[i]
+        prev = brg
+    return None
+
+
+def _prospective_indoor_steps(steps, path, total_m, nodes=None):
     """
     Move each walk-style step back to where its walk starts, and fold
     the opening line into the first walk.
@@ -605,15 +638,28 @@ def _prospective_indoor_steps(steps, path, total_m):
     # node_id to point at the *previous* action's node.
     out = []
     last_action_node = path[0]
-    for s in merged:
+    for idx, s in enumerate(merged):
         nid = s.get("node_id") or ""
-        is_leg = bool(nid) and s["instruction"].lower().startswith(_LEG_PREFIXES)
+        # A walk step starts where the previous action happened. This must
+        # also apply to walks that have NO node (a walk that ends at the
+        # stairs, an entrance or the destination, with no turn). Before,
+        # those inherited the previous step's point, so the dot stayed put
+        # for one more instruction and then jumped over the skipped points.
+        is_leg = s["instruction"].lower().startswith(_LEG_PREFIXES)
         if is_leg:
             out.append({**s, "node_id": last_action_node})
         else:
             out.append(s)
         if nid:
             last_action_node = nid
+        if (
+            idx == 0
+            and _is_opening_instruction(s["instruction"])
+            and _opener_is_complete(s["instruction"])
+        ):
+            # The opener already includes its turn, so the next walk begins
+            # at the turn node, not at the door.
+            last_action_node = _first_turn_node(path, nodes) or last_action_node
 
     # ---- 3. Fold the opening line into the first walk ----
     #
@@ -628,6 +674,7 @@ def _prospective_indoor_steps(steps, path, total_m):
         and out[0].get("node_id") == path[0]
         and out[1].get("node_id") == path[0]
         and _is_opening_instruction(out[0]["instruction"])
+        and not _opener_is_complete(out[0]["instruction"])
     ):
         opener = out[0]["instruction"]
         first = out[1]["instruction"]
@@ -688,13 +735,22 @@ def _annotate_steps_and_legs(
         nid = step.get("node_id") or ""
         if nid:
             last_mode = "outdoor" if nid.startswith("o") else "indoor"
-            while ptr < len(path) and path[ptr] != nid:
-                ptr += 1
-            if ptr < len(path):
+            found = None
+            for k in range(ptr, len(path)):
+                if path[k] == nid:
+                    found = k
+                    break
+            if found is None:
+                # Not ahead of the pointer: search the whole path instead of
+                # silently keeping the previous point and resetting ptr.
+                for k in range(0, ptr):
+                    if path[k] == nid:
+                        found = k
+                        break
+            if found is not None:
+                ptr = found
                 last_at = max(last_at, cum[ptr])
                 last_gi = ptr
-            else:
-                ptr = 0
         modes.append(last_mode)
         at_ms.append(last_at)
         geometry_indices.append(last_gi)
@@ -812,6 +868,30 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     current_level = None
     current_building = None
 
+    # The level is read from the edge a walker ARRIVES by, so the very first
+    # node has no arriving edge and used to fall back to "0". A route that
+    # starts upstairs therefore showed the ground floor for its first
+    # instruction. Take the start level from the first walking edge instead.
+    if path and not path[0].startswith("o"):
+        for j in range(len(path) - 1):
+            info = None
+            for nb, _d, edge in graph.get(path[j], []):
+                if nb == path[j + 1]:
+                    info = edge
+                    break
+            if info is None:
+                continue
+            raw = (info.get("way_tags") or {}).get("level")
+            if raw is None:
+                continue
+            lv = [p.strip() for p in str(raw).split(";") if p.strip()]
+            if not lv:
+                continue
+            if info.get("kind") == "stairs":
+                break  # started on a staircase: direction unknown, keep old rule
+            current_level = lv[0]
+            break
+
     for i, nid in enumerate(path):
         node_tags = nodes.get(nid, {}).get("tags", {}) or {}
 
@@ -841,3 +921,4 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
             continue
         step["level"] = level_at[gi] or "0"
         step["building_name"] = building_at[gi]
+

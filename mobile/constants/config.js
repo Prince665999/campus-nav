@@ -94,3 +94,8 @@ export const OFF_ROUTE_DISTANCE_M = 35;
 export const CAMERA_MIN_INTERVAL_MS = 700;
 export const CAMERA_MIN_MOVE_M = 1.5;
 export const CAMERA_MIN_HEADING_DEG = 10;
+
+export const INDOOR_BACKGROUND_COLOR = "#f1f5f9";
+export const INDOOR_INTERIOR_COLOR = "#fdf3d7";
+export const INDOOR_BUILDING_OUTLINE_COLOR = "#334155";
+export const INDOOR_BUILDING_OUTLINE_WIDTH = 2.5;

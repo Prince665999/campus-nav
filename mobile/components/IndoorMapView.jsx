@@ -56,7 +56,7 @@ import {
   FillLayer,
   LineLayer,
   SymbolLayer,
-  MarkerView,
+  CircleLayer,
 } from '@maplibre/maplibre-react-native';
 
 import { getIndoorAreas } from '@/services/api';
@@ -64,6 +64,12 @@ import { useSettings } from '@/context/SettingsContext';
 import { bearingDeg, haversineM } from '@/utils/geo';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING } from '@/constants/theme';
+import {
+  INDOOR_BACKGROUND_COLOR,
+  INDOOR_INTERIOR_COLOR,
+  INDOOR_BUILDING_OUTLINE_COLOR,
+  INDOOR_BUILDING_OUTLINE_WIDTH,
+} from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
   version: 8,
@@ -74,7 +80,7 @@ const BLANK_STYLE = JSON.stringify({
     {
       id: 'background',
       type: 'background',
-      paint: { 'background-color': '#f1f5f9' },
+      paint: { 'background-color': INDOOR_BACKGROUND_COLOR },
     },
   ],
 });
@@ -140,7 +146,7 @@ function firstLegBearing(points) {
    * point to the first point at least MIN_HEADING_DISTANCE_M away.
    * Returns 0 if no such point exists.
    */
-  if (!points || points.length < 2) return 0;
+  if (!points || points.length < 2) return null;
   const from = points[0];
   for (let i = 1; i < points.length; i++) {
     const to = points[i];
@@ -151,7 +157,7 @@ function firstLegBearing(points) {
       return bearingDeg(from.lat, from.lon, to.lat, to.lon);
     }
   }
-  return 0;
+  return null;
 }
 
 export function IndoorMapView({
@@ -185,6 +191,19 @@ export function IndoorMapView({
   // advances.
   const fittedKeyRef = useRef(null);
 
+  // The zoom the student chose by pinching. Null until they zoom. While it
+  // is set, floor changes and Next presses keep this zoom instead of
+  // snapping back to the default fit.
+  const userZoomRef = useRef(null);
+  // The zoom currently in use in this building (the fit zoom, or the zoom
+  // the student pinched to). A new floor reuses it instead of re-fitting,
+  // so the zoom stays the same when you change floor.
+  const keptZoomRef = useRef(null);
+  const restoringZoomRef = useRef(false);
+  // Last heading we could compute, reused when no direction is available
+  // (e.g. on the final step), so the map doesn't swing back to north.
+  const lastHeadingRef = useRef(0);
+
   // 180-degree flip. Off by default: the map is route-up (the walking
   // direction is at the top of the screen). The corner button toggles
   // this, which turns the map exactly half a turn.
@@ -196,6 +215,8 @@ export function IndoorMapView({
   useEffect(() => {
     setSelectedLevel(level);
     fittedKeyRef.current = null;
+    userZoomRef.current = null;
+    keptZoomRef.current = null;
     setFlipped(false);
   }, [buildingName]);
 
@@ -232,7 +253,7 @@ export function IndoorMapView({
         const list = data?.areas || [];
         setAreas(list);
         setAvailableLevels(data?.levels || []);
-        if (list.length === 0 && onNoRooms) onNoRooms();
+        if (list.filter((a) => a.type !== 'level').length === 0 && onNoRooms) onNoRooms();
       })
       .catch((err) => {
         if (cancelled) return;
@@ -276,6 +297,26 @@ export function IndoorMapView({
       features.push(_polygonFeature(area, ring));
     }
     return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Floor outline: polygons tagged indoor=level (one closed way around the
+  // building on each floor). Filled with the interior colour and outlined.
+  const footprintGeoJSON = useMemo(() => {
+    if (!areas) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'level') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'Polygon', coordinates: [ring] },
+      });
+    }
+    return features.length > 0
+      ? { type: 'FeatureCollection', features }
+      : null;
   }, [areas]);
 
   const { routeSolidGeoJSON, routeDashedGeoJSON } = useMemo(() => {
@@ -339,7 +380,7 @@ export function IndoorMapView({
   //   The heading is the start-to-end bearing of the whole route,
   //   SNAPPED to N or S only. Tapping a floor chip does not rotate
   //   the preview. This matches the previous version's behaviour.
-  const routeHeading = useMemo(() => {
+  const routeHeadingRaw = useMemo(() => {
     const all = routeByLevel || [];
     if (all.length < 2) return 0;
 
@@ -356,7 +397,7 @@ export function IndoorMapView({
       } else {
         raw = firstLegBearing(all);
       }
-      return snapToNorthSouth(raw);
+      return snapToNorthSouth(raw ?? 0);
     }
 
     // Walking: look at the points on the current floor from
@@ -378,8 +419,13 @@ export function IndoorMapView({
 
     const slice = points.slice(startIdx);
     const raw = firstLegBearing(slice);
-    return snapToCardinal(raw);
+    // No usable direction (last step, or the leg is under 3 m): keep the
+    // previous heading instead of swinging to north.
+    return raw == null ? null : snapToCardinal(raw);
   }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
+
+  if (routeHeadingRaw != null) lastHeadingRef.current = routeHeadingRaw;
+  const routeHeading = routeHeadingRaw ?? lastHeadingRef.current;
 
   // The heading actually applied to the camera: the route-up heading,
   // plus a half turn when the student has pressed the flip button.
@@ -430,14 +476,24 @@ export function IndoorMapView({
     //   (78271.5 * cosLat) / 2^z.
     const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
 
-    const clamped = Math.max(16, Math.min(21, zoom));
+    const fitZoom = Math.max(16, Math.min(21, zoom));
+    // If the student has zoomed in, keep their zoom on the new floor and
+    // centre on where they are, rather than on the whole building.
+    const keepUserZoom = userZoomRef.current != null;
+    const clamped = keptZoomRef.current != null ? keptZoomRef.current : fitZoom;
+    const stepHere =
+      keepUserZoom && currentStepPoint && currentStepLevel === selectedLevel;
+    const camCenter = stepHere
+      ? [currentStepPoint.lon, currentStepPoint.lat]
+      : [centerLon, centerLat];
 
     const timeout = setTimeout(() => {
       // Mark as fitted only once we actually issue the camera call.
       fittedKeyRef.current = key;
+      keptZoomRef.current = clamped;
       try {
         cameraRef.current?.setCamera({
-          centerCoordinate: [centerLon, centerLat],
+          centerCoordinate: camCenter,
           zoomLevel: clamped,
           heading: effectiveHeading,
           animationDuration: 400,
@@ -462,17 +518,51 @@ export function IndoorMapView({
   // press in walking mode (currentStepPoint moves → routeHeading
   // recomputes → snapped heading may change), and on a flip button
   // press. It only sets the heading, leaving centre and zoom alone.
+  //
+  // It also runs on every Next press. If the student has zoomed, their zoom
+  // is sent in the same camera call as the heading, so a turn can never
+  // bring back the default zoom.
   useEffect(() => {
     if (!cameraRef.current) return;
+    const cam = { heading: effectiveHeading, animationDuration: 500 };
+    if (userZoomRef.current != null) cam.zoomLevel = userZoomRef.current;
     try {
-      cameraRef.current.setCamera({
-        heading: effectiveHeading,
-        animationDuration: 500,
-      });
+      cameraRef.current.setCamera(cam);
     } catch {
       // Silent.
     }
-  }, [effectiveHeading]);
+  }, [effectiveHeading, currentStepPoint?.lat, currentStepPoint?.lon]);
+
+  // Remember pinch-zooms. If the zoom changes by itself (not the student)
+  // while they have a zoom set, put it back.
+  const handleRegionDidChange = (feature) => {
+    const props = feature?.properties;
+    if (!props || typeof props.zoomLevel !== 'number') return;
+    if (props.isUserInteraction) {
+      userZoomRef.current = props.zoomLevel;
+      keptZoomRef.current = props.zoomLevel;
+      return;
+    }
+    const wanted = userZoomRef.current;
+    if (
+      wanted != null &&
+      !restoringZoomRef.current &&
+      Math.abs(props.zoomLevel - wanted) > 0.25
+    ) {
+      restoringZoomRef.current = true;
+      try {
+        cameraRef.current?.setCamera({
+          zoomLevel: wanted,
+          animationDuration: 250,
+        });
+      } catch {
+        // Silent.
+      }
+      setTimeout(() => {
+        restoringZoomRef.current = false;
+      }, 400);
+    }
+  };
 
   // -------------------------------------------------------------------------
   // Render
@@ -524,6 +614,7 @@ export function IndoorMapView({
         attributionEnabled={false}
         compassEnabled={false}
         rotateEnabled={false}
+        onRegionDidChange={handleRegionDidChange}
       >
         <Camera
           ref={cameraRef}
@@ -533,6 +624,23 @@ export function IndoorMapView({
             heading: effectiveHeading,
           }}
         />
+
+        {footprintGeoJSON ? (
+          <ShapeSource id="footprintSource" shape={footprintGeoJSON}>
+            <FillLayer
+              id="footprintFill"
+              style={{ fillColor: INDOOR_INTERIOR_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="footprintOutline"
+              style={{
+                lineColor: INDOOR_BUILDING_OUTLINE_COLOR,
+                lineWidth: INDOOR_BUILDING_OUTLINE_WIDTH,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
 
         {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
           <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
@@ -604,23 +712,39 @@ export function IndoorMapView({
         ) : null}
 
         {destination ? (
-          <MarkerView
-            coordinate={[destination.lon, destination.lat]}
-            anchor={{ x: 0.5, y: 0.5 }}
-          >
-            <View style={styles.destMarkerOuter}>
-              <View style={styles.destMarkerInner} />
-            </View>
-          </MarkerView>
+          <ShapeSource id="indoorDestSource" shape={pointFeature(destination)}>
+            <CircleLayer
+              id="indoorDestHalo"
+              style={{ circleRadius: 11, circleColor: '#dc2626', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorDestDot"
+              style={{
+                circleRadius: 6,
+                circleColor: '#dc2626',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 2,
+              }}
+            />
+          </ShapeSource>
         ) : null}
 
         {showYouAreHere ? (
-          <MarkerView
-            coordinate={[currentStepPoint.lon, currentStepPoint.lat]}
-            anchor={{ x: 0.5, y: 0.5 }}
-          >
-            <View style={styles.userDot} />
-          </MarkerView>
+          <ShapeSource id="indoorUserSource" shape={pointFeature(currentStepPoint)}>
+            <CircleLayer
+              id="indoorUserHalo"
+              style={{ circleRadius: 14, circleColor: '#2563eb', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorUserDot"
+              style={{
+                circleRadius: 8,
+                circleColor: '#2563eb',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 3,
+              }}
+            />
+          </ShapeSource>
         ) : null}
       </MapView>
 
@@ -685,6 +809,14 @@ export function IndoorMapView({
   );
 }
 
+function pointFeature(p) {
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
+  };
+}
+
 function _closedRing(boundary) {
   if (!boundary || boundary.length === 0) return null;
   const ring = boundary.map((p) => [p.lon, p.lat]);
@@ -716,7 +848,7 @@ function _polygonFeature(area, ring) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: INDOOR_BACKGROUND_COLOR,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -812,3 +944,4 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
 });
+
