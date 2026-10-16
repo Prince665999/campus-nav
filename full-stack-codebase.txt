@@ -21038,7 +21038,7 @@ def _route_via_indoor_engine(from_ep, to_ep):
     # engine, and it addresses the same off-by-one: the indoor engine
     # pins "Walk N m, then turn" to the turn node, so the text isn't
     # shown until the walker has already reached the turn.
-    steps = _prospective_indoor_steps(steps, path, total)
+    steps = _prospective_indoor_steps(steps, path, total, nodes)
 
     annotated_steps, legs = _annotate_steps_and_legs(
         steps, path, nodes, indoor_node_ids, from_ep, to_ep, total
@@ -21114,7 +21114,40 @@ def _is_opening_instruction(text):
     )
 
 
-def _prospective_indoor_steps(steps, path, total_m):
+def _opener_is_complete(text):
+    """
+    True when the opening line already contains its own turn, e.g.
+    "Starting from the bookstore on the ground floor — step out into the
+    corridor, then turn left". Such an opener is a finished instruction and
+    must NOT be glued to the walk that follows it.
+    """
+    lowered = (text or "").strip().lower()
+    return ", then turn" in lowered or lowered.endswith(
+        ("turn left", "turn right", "turn around")
+    )
+
+
+def _first_turn_node(path, nodes):
+    """
+    The path node where the walker makes the first real turn. This is where
+    the walk AFTER a complete opener starts. Mirrors the engine's own rule
+    (turn_descriptor on the change of bearing between consecutive edges).
+    """
+    if not nodes or len(path) < 3:
+        return None
+    from backend.core.indoor.campus_graph import bearing_deg, turn_descriptor
+
+    prev = None
+    for i in range(len(path) - 1):
+        a, b = nodes[path[i]], nodes[path[i + 1]]
+        brg = bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"])
+        if prev is not None and turn_descriptor((brg - prev + 540) % 360 - 180):
+            return path[i]
+        prev = brg
+    return None
+
+
+def _prospective_indoor_steps(steps, path, total_m, nodes=None):
     """
     Move each walk-style step back to where its walk starts, and fold
     the opening line into the first walk.
@@ -21200,15 +21233,28 @@ def _prospective_indoor_steps(steps, path, total_m):
     # node_id to point at the *previous* action's node.
     out = []
     last_action_node = path[0]
-    for s in merged:
+    for idx, s in enumerate(merged):
         nid = s.get("node_id") or ""
-        is_leg = bool(nid) and s["instruction"].lower().startswith(_LEG_PREFIXES)
+        # A walk step starts where the previous action happened. This must
+        # also apply to walks that have NO node (a walk that ends at the
+        # stairs, an entrance or the destination, with no turn). Before,
+        # those inherited the previous step's point, so the dot stayed put
+        # for one more instruction and then jumped over the skipped points.
+        is_leg = s["instruction"].lower().startswith(_LEG_PREFIXES)
         if is_leg:
             out.append({**s, "node_id": last_action_node})
         else:
             out.append(s)
         if nid:
             last_action_node = nid
+        if (
+            idx == 0
+            and _is_opening_instruction(s["instruction"])
+            and _opener_is_complete(s["instruction"])
+        ):
+            # The opener already includes its turn, so the next walk begins
+            # at the turn node, not at the door.
+            last_action_node = _first_turn_node(path, nodes) or last_action_node
 
     # ---- 3. Fold the opening line into the first walk ----
     #
@@ -21223,6 +21269,7 @@ def _prospective_indoor_steps(steps, path, total_m):
         and out[0].get("node_id") == path[0]
         and out[1].get("node_id") == path[0]
         and _is_opening_instruction(out[0]["instruction"])
+        and not _opener_is_complete(out[0]["instruction"])
     ):
         opener = out[0]["instruction"]
         first = out[1]["instruction"]
@@ -21283,13 +21330,22 @@ def _annotate_steps_and_legs(
         nid = step.get("node_id") or ""
         if nid:
             last_mode = "outdoor" if nid.startswith("o") else "indoor"
-            while ptr < len(path) and path[ptr] != nid:
-                ptr += 1
-            if ptr < len(path):
+            found = None
+            for k in range(ptr, len(path)):
+                if path[k] == nid:
+                    found = k
+                    break
+            if found is None:
+                # Not ahead of the pointer: search the whole path instead of
+                # silently keeping the previous point and resetting ptr.
+                for k in range(0, ptr):
+                    if path[k] == nid:
+                        found = k
+                        break
+            if found is not None:
+                ptr = found
                 last_at = max(last_at, cum[ptr])
                 last_gi = ptr
-            else:
-                ptr = 0
         modes.append(last_mode)
         at_ms.append(last_at)
         geometry_indices.append(last_gi)
@@ -21407,6 +21463,30 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
     current_level = None
     current_building = None
 
+    # The level is read from the edge a walker ARRIVES by, so the very first
+    # node has no arriving edge and used to fall back to "0". A route that
+    # starts upstairs therefore showed the ground floor for its first
+    # instruction. Take the start level from the first walking edge instead.
+    if path and not path[0].startswith("o"):
+        for j in range(len(path) - 1):
+            info = None
+            for nb, _d, edge in graph.get(path[j], []):
+                if nb == path[j + 1]:
+                    info = edge
+                    break
+            if info is None:
+                continue
+            raw = (info.get("way_tags") or {}).get("level")
+            if raw is None:
+                continue
+            lv = [p.strip() for p in str(raw).split(";") if p.strip()]
+            if not lv:
+                continue
+            if info.get("kind") == "stairs":
+                break  # started on a staircase: direction unknown, keep old rule
+            current_level = lv[0]
+            break
+
     for i, nid in enumerate(path):
         node_tags = nodes.get(nid, {}).get("tags", {}) or {}
 
@@ -21436,6 +21516,8 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
             continue
         step["level"] = level_at[gi] or "0"
         step["building_name"] = building_at[gi]
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\routing_service.py ---
 
@@ -27458,6 +27540,7 @@ if str(_CORE_DIR) not in sys.path:
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\ingest.py ---
 
+
 """
 ingest.py
 
@@ -27469,7 +27552,7 @@ Reads map.osm once and writes:
 Then reads final.osm and writes:
   - one row per door node       → places (kind="indoor")
   - one row per entrance node   → places (kind="entrance")
-  - one row per indoor polygon  → indoor_areas (rooms and corridors)
+  - one row per indoor polygon  → indoor_areas (rooms, corridors and floor outlines)
   - one row per walkable edge   → indoor_path_edges
 
 Run:
@@ -27657,7 +27740,11 @@ def ingest_path_edges(nodes, ways, session):
 _INDOOR_WALKABLE_HIGHWAY = {"footway", "corridor", "path"}
 _INDOOR_STAIRS_HIGHWAY = "steps"
 
-_INDOOR_POLYGON_TYPES = {"room", "corridor"}
+# "level" is the outline of a whole floor (draw one closed way around the
+# building on each floor and tag it indoor=level, level=<n>, building_name=<name>).
+# The phone fills it with the interior colour and draws its outline; it is
+# never a room, so it is not searchable and gets no label.
+_INDOOR_POLYGON_TYPES = {"room", "corridor", "level"}
 
 
 def _is_door(tags):
@@ -27782,7 +27869,9 @@ def ingest_indoor_places(nodes, ways, session):
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
         if not rname:
-            rname = "corridor" if polygon_type == "corridor" else "unnamed"
+            rname = {"corridor": "corridor", "level": "floor outline"}.get(
+                polygon_type, "unnamed"
+            )
 
         refs = [r for r in way["refs"] if r in nodes]
         if len(refs) < 3:
@@ -27944,7 +28033,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
             n_indoor_edges = counts["edges"]
             print(f"  indoor door places: {n_indoor_places}")
             print(f"  indoor entrances: {n_entrances}")
-            print(f"  indoor rooms + corridors: {n_indoor_areas}")
+            print(f"  indoor rooms + corridors + floor outlines: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
     print("\nIngest complete.")
@@ -27962,6 +28051,8 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
 if __name__ == "__main__":
     path_arg = sys.argv[1] if len(sys.argv) > 1 else None
     run_ingest(osm_path=path_arg)
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\knowledge_probe.py ---
 
@@ -32465,6 +32556,82 @@ class TestExistingFiltersStillWork:
             pytest.skip("No indoor places")
         detail = client.get(f"/api/places/{items[0]['id']}").json()
         assert "building_name" in detail
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\export-selected.js ---
+
+const fs = require('fs');
+const path = require('path');
+
+// ====== EDIT THIS LIST ======
+// Use a plain file name to match it anywhere in the project: 'App.jsx'
+// Use a partial path if several files share a name: 'src/screens/Home.jsx'
+const selectedFiles = [
+  'FILE_NAME_1.js',
+  'FILE_NAME_2.jsx',
+  'FILE_NAME_3.py',
+];
+// ============================
+
+const outputFile = 'selected-files.txt';
+
+// Directories to skip while searching
+const ignoreDirs = [
+  'node_modules',
+  '.git',
+  '.expo',
+  'assets',
+  'build',
+  '.next',
+  'venv',
+  '.venv',
+  '__pycache__',
+];
+
+const normalize = (p) => p.split(path.sep).join('/').replace(/^\.\//, '');
+const wanted = selectedFiles.map(normalize);
+const found = new Set();
+
+let outputContext = '';
+let fileCount = 0;
+
+function matchEntry(relPath) {
+  // Matches if the relative path equals the entry or ends with "/entry"
+  return wanted.find((w) => relPath === w || relPath.endsWith('/' + w));
+}
+
+function readDirectory(directory) {
+  for (const file of fs.readdirSync(directory)) {
+    const fullPath = path.join(directory, file);
+    const stat = fs.statSync(fullPath);
+
+    if (stat.isDirectory()) {
+      if (!ignoreDirs.includes(file)) readDirectory(fullPath);
+    } else {
+      const relPath = normalize(path.relative(__dirname, fullPath));
+      const match = matchEntry(relPath);
+
+      if (match && file !== path.basename(__filename)) {
+        found.add(match);
+        fileCount++;
+        outputContext += `\n\n--- FILE: ${relPath} ---\n\n`;
+        outputContext += fs.readFileSync(fullPath, 'utf8');
+      }
+    }
+  }
+}
+
+readDirectory(__dirname);
+
+// Report anything you listed that wasn't found
+const missing = wanted.filter((w) => !found.has(w));
+
+fs.writeFileSync(outputFile, outputContext.trimStart());
+
+console.log(`✅ Exported ${fileCount} file(s) to ${outputFile}`);
+console.log(`📏 ~${Math.round(outputContext.length / 4)} tokens (rough estimate)`);
+if (missing.length) {
+  console.log(`⚠️  Not found: ${missing.join(', ')}`);
+}
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\.claude\settings.json ---
 
@@ -38347,7 +38514,7 @@ import {
   FillLayer,
   LineLayer,
   SymbolLayer,
-  MarkerView,
+  CircleLayer,
 } from '@maplibre/maplibre-react-native';
 
 import { getIndoorAreas } from '@/services/api';
@@ -38355,6 +38522,12 @@ import { useSettings } from '@/context/SettingsContext';
 import { bearingDeg, haversineM } from '@/utils/geo';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING } from '@/constants/theme';
+import {
+  INDOOR_BACKGROUND_COLOR,
+  INDOOR_INTERIOR_COLOR,
+  INDOOR_BUILDING_OUTLINE_COLOR,
+  INDOOR_BUILDING_OUTLINE_WIDTH,
+} from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
   version: 8,
@@ -38365,7 +38538,7 @@ const BLANK_STYLE = JSON.stringify({
     {
       id: 'background',
       type: 'background',
-      paint: { 'background-color': '#f1f5f9' },
+      paint: { 'background-color': INDOOR_BACKGROUND_COLOR },
     },
   ],
 });
@@ -38431,7 +38604,7 @@ function firstLegBearing(points) {
    * point to the first point at least MIN_HEADING_DISTANCE_M away.
    * Returns 0 if no such point exists.
    */
-  if (!points || points.length < 2) return 0;
+  if (!points || points.length < 2) return null;
   const from = points[0];
   for (let i = 1; i < points.length; i++) {
     const to = points[i];
@@ -38442,7 +38615,7 @@ function firstLegBearing(points) {
       return bearingDeg(from.lat, from.lon, to.lat, to.lon);
     }
   }
-  return 0;
+  return null;
 }
 
 export function IndoorMapView({
@@ -38476,6 +38649,19 @@ export function IndoorMapView({
   // advances.
   const fittedKeyRef = useRef(null);
 
+  // The zoom the student chose by pinching. Null until they zoom. While it
+  // is set, floor changes and Next presses keep this zoom instead of
+  // snapping back to the default fit.
+  const userZoomRef = useRef(null);
+  // The zoom currently in use in this building (the fit zoom, or the zoom
+  // the student pinched to). A new floor reuses it instead of re-fitting,
+  // so the zoom stays the same when you change floor.
+  const keptZoomRef = useRef(null);
+  const restoringZoomRef = useRef(false);
+  // Last heading we could compute, reused when no direction is available
+  // (e.g. on the final step), so the map doesn't swing back to north.
+  const lastHeadingRef = useRef(0);
+
   // 180-degree flip. Off by default: the map is route-up (the walking
   // direction is at the top of the screen). The corner button toggles
   // this, which turns the map exactly half a turn.
@@ -38487,6 +38673,8 @@ export function IndoorMapView({
   useEffect(() => {
     setSelectedLevel(level);
     fittedKeyRef.current = null;
+    userZoomRef.current = null;
+    keptZoomRef.current = null;
     setFlipped(false);
   }, [buildingName]);
 
@@ -38523,7 +38711,7 @@ export function IndoorMapView({
         const list = data?.areas || [];
         setAreas(list);
         setAvailableLevels(data?.levels || []);
-        if (list.length === 0 && onNoRooms) onNoRooms();
+        if (list.filter((a) => a.type !== 'level').length === 0 && onNoRooms) onNoRooms();
       })
       .catch((err) => {
         if (cancelled) return;
@@ -38567,6 +38755,26 @@ export function IndoorMapView({
       features.push(_polygonFeature(area, ring));
     }
     return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Floor outline: polygons tagged indoor=level (one closed way around the
+  // building on each floor). Filled with the interior colour and outlined.
+  const footprintGeoJSON = useMemo(() => {
+    if (!areas) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'level') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'Polygon', coordinates: [ring] },
+      });
+    }
+    return features.length > 0
+      ? { type: 'FeatureCollection', features }
+      : null;
   }, [areas]);
 
   const { routeSolidGeoJSON, routeDashedGeoJSON } = useMemo(() => {
@@ -38630,7 +38838,7 @@ export function IndoorMapView({
   //   The heading is the start-to-end bearing of the whole route,
   //   SNAPPED to N or S only. Tapping a floor chip does not rotate
   //   the preview. This matches the previous version's behaviour.
-  const routeHeading = useMemo(() => {
+  const routeHeadingRaw = useMemo(() => {
     const all = routeByLevel || [];
     if (all.length < 2) return 0;
 
@@ -38647,7 +38855,7 @@ export function IndoorMapView({
       } else {
         raw = firstLegBearing(all);
       }
-      return snapToNorthSouth(raw);
+      return snapToNorthSouth(raw ?? 0);
     }
 
     // Walking: look at the points on the current floor from
@@ -38669,8 +38877,13 @@ export function IndoorMapView({
 
     const slice = points.slice(startIdx);
     const raw = firstLegBearing(slice);
-    return snapToCardinal(raw);
+    // No usable direction (last step, or the leg is under 3 m): keep the
+    // previous heading instead of swinging to north.
+    return raw == null ? null : snapToCardinal(raw);
   }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
+
+  if (routeHeadingRaw != null) lastHeadingRef.current = routeHeadingRaw;
+  const routeHeading = routeHeadingRaw ?? lastHeadingRef.current;
 
   // The heading actually applied to the camera: the route-up heading,
   // plus a half turn when the student has pressed the flip button.
@@ -38721,14 +38934,24 @@ export function IndoorMapView({
     //   (78271.5 * cosLat) / 2^z.
     const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
 
-    const clamped = Math.max(16, Math.min(21, zoom));
+    const fitZoom = Math.max(16, Math.min(21, zoom));
+    // If the student has zoomed in, keep their zoom on the new floor and
+    // centre on where they are, rather than on the whole building.
+    const keepUserZoom = userZoomRef.current != null;
+    const clamped = keptZoomRef.current != null ? keptZoomRef.current : fitZoom;
+    const stepHere =
+      keepUserZoom && currentStepPoint && currentStepLevel === selectedLevel;
+    const camCenter = stepHere
+      ? [currentStepPoint.lon, currentStepPoint.lat]
+      : [centerLon, centerLat];
 
     const timeout = setTimeout(() => {
       // Mark as fitted only once we actually issue the camera call.
       fittedKeyRef.current = key;
+      keptZoomRef.current = clamped;
       try {
         cameraRef.current?.setCamera({
-          centerCoordinate: [centerLon, centerLat],
+          centerCoordinate: camCenter,
           zoomLevel: clamped,
           heading: effectiveHeading,
           animationDuration: 400,
@@ -38753,17 +38976,51 @@ export function IndoorMapView({
   // press in walking mode (currentStepPoint moves → routeHeading
   // recomputes → snapped heading may change), and on a flip button
   // press. It only sets the heading, leaving centre and zoom alone.
+  //
+  // It also runs on every Next press. If the student has zoomed, their zoom
+  // is sent in the same camera call as the heading, so a turn can never
+  // bring back the default zoom.
   useEffect(() => {
     if (!cameraRef.current) return;
+    const cam = { heading: effectiveHeading, animationDuration: 500 };
+    if (userZoomRef.current != null) cam.zoomLevel = userZoomRef.current;
     try {
-      cameraRef.current.setCamera({
-        heading: effectiveHeading,
-        animationDuration: 500,
-      });
+      cameraRef.current.setCamera(cam);
     } catch {
       // Silent.
     }
-  }, [effectiveHeading]);
+  }, [effectiveHeading, currentStepPoint?.lat, currentStepPoint?.lon]);
+
+  // Remember pinch-zooms. If the zoom changes by itself (not the student)
+  // while they have a zoom set, put it back.
+  const handleRegionDidChange = (feature) => {
+    const props = feature?.properties;
+    if (!props || typeof props.zoomLevel !== 'number') return;
+    if (props.isUserInteraction) {
+      userZoomRef.current = props.zoomLevel;
+      keptZoomRef.current = props.zoomLevel;
+      return;
+    }
+    const wanted = userZoomRef.current;
+    if (
+      wanted != null &&
+      !restoringZoomRef.current &&
+      Math.abs(props.zoomLevel - wanted) > 0.25
+    ) {
+      restoringZoomRef.current = true;
+      try {
+        cameraRef.current?.setCamera({
+          zoomLevel: wanted,
+          animationDuration: 250,
+        });
+      } catch {
+        // Silent.
+      }
+      setTimeout(() => {
+        restoringZoomRef.current = false;
+      }, 400);
+    }
+  };
 
   // -------------------------------------------------------------------------
   // Render
@@ -38815,6 +39072,7 @@ export function IndoorMapView({
         attributionEnabled={false}
         compassEnabled={false}
         rotateEnabled={false}
+        onRegionDidChange={handleRegionDidChange}
       >
         <Camera
           ref={cameraRef}
@@ -38824,6 +39082,23 @@ export function IndoorMapView({
             heading: effectiveHeading,
           }}
         />
+
+        {footprintGeoJSON ? (
+          <ShapeSource id="footprintSource" shape={footprintGeoJSON}>
+            <FillLayer
+              id="footprintFill"
+              style={{ fillColor: INDOOR_INTERIOR_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="footprintOutline"
+              style={{
+                lineColor: INDOOR_BUILDING_OUTLINE_COLOR,
+                lineWidth: INDOOR_BUILDING_OUTLINE_WIDTH,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
 
         {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
           <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
@@ -38895,23 +39170,39 @@ export function IndoorMapView({
         ) : null}
 
         {destination ? (
-          <MarkerView
-            coordinate={[destination.lon, destination.lat]}
-            anchor={{ x: 0.5, y: 0.5 }}
-          >
-            <View style={styles.destMarkerOuter}>
-              <View style={styles.destMarkerInner} />
-            </View>
-          </MarkerView>
+          <ShapeSource id="indoorDestSource" shape={pointFeature(destination)}>
+            <CircleLayer
+              id="indoorDestHalo"
+              style={{ circleRadius: 11, circleColor: '#dc2626', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorDestDot"
+              style={{
+                circleRadius: 6,
+                circleColor: '#dc2626',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 2,
+              }}
+            />
+          </ShapeSource>
         ) : null}
 
         {showYouAreHere ? (
-          <MarkerView
-            coordinate={[currentStepPoint.lon, currentStepPoint.lat]}
-            anchor={{ x: 0.5, y: 0.5 }}
-          >
-            <View style={styles.userDot} />
-          </MarkerView>
+          <ShapeSource id="indoorUserSource" shape={pointFeature(currentStepPoint)}>
+            <CircleLayer
+              id="indoorUserHalo"
+              style={{ circleRadius: 14, circleColor: '#2563eb', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorUserDot"
+              style={{
+                circleRadius: 8,
+                circleColor: '#2563eb',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 3,
+              }}
+            />
+          </ShapeSource>
         ) : null}
       </MapView>
 
@@ -38976,6 +39267,14 @@ export function IndoorMapView({
   );
 }
 
+function pointFeature(p) {
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
+  };
+}
+
 function _closedRing(boundary) {
   if (!boundary || boundary.length === 0) return null;
   const ring = boundary.map((p) => [p.lon, p.lat]);
@@ -39007,7 +39306,7 @@ function _polygonFeature(area, ring) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: INDOOR_BACKGROUND_COLOR,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -39103,6 +39402,8 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\InstructionCard.jsx ---
 
@@ -41946,7 +42247,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
+const DEFAULT_API_BASE_URL = 'https://nomination-flour-learn-leeds.trycloudflare.com';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -42039,6 +42340,12 @@ export const OFF_ROUTE_DISTANCE_M = 35;
 export const CAMERA_MIN_INTERVAL_MS = 700;
 export const CAMERA_MIN_MOVE_M = 1.5;
 export const CAMERA_MIN_HEADING_DEG = 10;
+
+export const INDOOR_BACKGROUND_COLOR = "#f1f5f9";
+export const INDOOR_INTERIOR_COLOR = "#fdf3d7";
+export const INDOOR_BUILDING_OUTLINE_COLOR = "#334155";
+export const INDOOR_BUILDING_OUTLINE_WIDTH = 2.5;
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\icons.js ---
 

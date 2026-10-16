@@ -47,14 +47,20 @@ class Place(Base, TimestampMixin):
     intents: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # "outdoor", "indoor", or "entrance".
+    #
+    # The index on this column is declared explicitly in __table_args__
+    # below. We deliberately do NOT pass index=True here, because that
+    # would also generate an index with the same auto-generated name
+    # (ix_places_kind), producing a duplicate CREATE INDEX statement.
+    # SQLite silently tolerates that; Postgres raises DuplicateTable.
     kind: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="outdoor", index=True
+        String(16), nullable=False, default="outdoor"
     )
 
     # Which building the place belongs to. Null for outdoor places.
     # Free text, matches the building_name tag on rooms and doors.
     building_name: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, index=True
+        String(255), nullable=True
     )
 
     # For indoor places: the level the door is on, e.g. "0", "1", "-1".
