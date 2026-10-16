@@ -1,35 +1,48 @@
 // Compass heading.
 //
-// Two sources, in order:
-//   1. The magnetometer — accurate when it works. Some phones have
-//      it, some don't.
-//   2. The GPS direction of travel — less accurate, only works while
-//      moving, but always available when a fix is being received.
+// Sources, tried in this order:
+//   1. The OS's fused heading (expo-location watchHeadingAsync). It combines
+//      the magnetometer with the accelerometer, so it stays correct when the
+//      phone is held tilted, which is how people hold it while walking. It
+//      also corrects for magnetic declination when it knows where you are.
+//   2. The raw magnetometer, used if (1) gives nothing within a few seconds.
+//      Only accurate with the phone flat.
+//   3. GPS direction of travel (Plan B). This file does not do that part:
+//      hooks/useCompass.js feeds it in from headingFromMovement() whenever
+//      no sensor heading has arrived. Phones with no magnetometer use it,
+//      exactly as before.
 //
-// The caller gets a heading in degrees, 0 = north. The source is
-// included so the caller can decide whether to trust it.
+// The caller gets a heading in degrees, 0 = north.
 
 import { Magnetometer } from 'expo-sensors';
+import * as Location from 'expo-location';
+
+import { magneticHeadingFromXY, smoothHeading } from '@/utils/heading';
+
+// If the fused heading hasn't produced a value after this long, switch to
+// the raw magnetometer.
+const FUSED_TIMEOUT_MS = 3000;
 
 let _subscription = null;
 
-// Convert a magnetometer reading to a compass heading.
-function readingToHeading({ x, y }) {
-  const angle = Math.atan2(y, x) * (180 / Math.PI);
-  return (angle + 360) % 360;
+// OS-fused heading. Returns a stop function, or null if unavailable.
+async function tryFusedHeading(onHeading) {
+  const perm = await Location.getForegroundPermissionsAsync();
+  if (!perm || !perm.granted) return null;
+
+  let last = null;
+  const sub = await Location.watchHeadingAsync((h) => {
+    // trueHeading is -1 when the OS can't work it out yet; then use the
+    // magnetic heading (the difference is only a few degrees here).
+    const raw = h.trueHeading >= 0 ? h.trueHeading : h.magHeading;
+    if (!Number.isFinite(raw) || raw < 0) return;
+    last = smoothHeading(last, raw);
+    onHeading(last);
+  });
+  return () => sub.remove();
 }
 
-// Smooth a heading, handling the 0/360 wrap-around.
-function smooth(prev, next) {
-  if (prev === null || prev === undefined) return next;
-  let diff = next - prev;
-  if (diff > 180) diff -= 360;
-  if (diff < -180) diff += 360;
-  return (prev + diff * 0.2 + 360) % 360;
-}
-
-// Try to subscribe to the magnetometer.
-// Returns a stop function on success, or null if unavailable.
+// Raw magnetometer. Returns a stop function, or null if unavailable.
 async function tryMagnetometer(onHeading) {
   const available = await Magnetometer.isAvailableAsync();
   if (!available) return null;
@@ -38,9 +51,9 @@ async function tryMagnetometer(onHeading) {
 
   let last = null;
   const sub = Magnetometer.addListener((reading) => {
-    const raw = readingToHeading(reading);
+    const raw = magneticHeadingFromXY(reading.x, reading.y);
     if (Number.isFinite(raw)) {
-      last = smooth(last, raw);
+      last = smoothHeading(last, raw, 0.2);
       onHeading(last);
     }
   });
@@ -50,6 +63,7 @@ async function tryMagnetometer(onHeading) {
 
 // Compute a heading from two GPS positions. Returns degrees or null
 // if the movement is too small to get a reliable direction.
+// (Plan B. Unchanged.)
 export function headingFromMovement(prev, next) {
   if (!prev || !next) return null;
 
@@ -75,7 +89,7 @@ export function headingFromMovement(prev, next) {
 }
 
 // Subscribe to heading updates. The callback receives a heading in
-// degrees, or null if no source is available.
+// degrees, or null if no sensor is available.
 //
 // Returns a stop function.
 export async function watch(onHeading, onError) {
@@ -83,24 +97,64 @@ export async function watch(onHeading, onError) {
     return () => stop();
   }
 
-  let magnetometerStop = null;
+  let stopped = false;
+  let current = null; // stop function of whichever source is live
+  let timer = null;
+
+  const emit = (h) => {
+    if (!stopped) onHeading(h);
+  };
+
+  const startRaw = async () => {
+    try {
+      const s = await tryMagnetometer(emit);
+      if (stopped) {
+        if (s) s();
+        return;
+      }
+      current = s;
+      if (!s) emit(null);
+    } catch (e) {
+      if (onError) onError(e);
+    }
+  };
+
   try {
-    magnetometerStop = await tryMagnetometer(onHeading);
+    let gotFused = false;
+    const s = await tryFusedHeading((h) => {
+      gotFused = true;
+      emit(h);
+    });
+    if (s) {
+      current = s;
+      timer = setTimeout(async () => {
+        if (stopped || gotFused) return;
+        s();
+        current = null;
+        await startRaw();
+      }, FUSED_TIMEOUT_MS);
+    }
   } catch (e) {
     if (onError) onError(e);
   }
 
-  if (magnetometerStop) {
-    _subscription = { remove: magnetometerStop };
-    return () => stop();
+  if (!current) await startRaw();
+
+  if (!current && !timer) {
+    // No sensor at all. Plan B (GPS) takes over in the caller.
+    _subscription = null;
+    return () => {};
   }
 
-  // No magnetometer. The caller will need to feed GPS-derived
-  // headings in manually — see headingFromMovement above.
-  // Report null so the caller knows there's no sensor.
-  if (onHeading) onHeading(null);
-  _subscription = null;
-  return () => {};
+  _subscription = {
+    remove: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      if (current) current();
+      current = null;
+    },
+  };
+  return () => stop();
 }
 
 export function stop() {

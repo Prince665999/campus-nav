@@ -8,6 +8,7 @@ import {
   progressFraction,
   OFF_ROUTE_THRESHOLD_M,
   OFF_ROUTE_CONSECUTIVE_FIXES,
+  OFF_ROUTE_WARMUP_FIXES,
 } from '@/utils/progress';
 
 const steps = [
@@ -64,6 +65,30 @@ describe('distanceToNextStep', () => {
   });
 });
 
+// Helpers ----------------------------------------------------------------
+//
+// The detector ignores the first OFF_ROUTE_WARMUP_FIXES fixes entirely
+// (to avoid firing during the noisy startup period of a walk), and
+// then requires OFF_ROUTE_CONSECUTIVE_FIXES consecutive off-route
+// fixes before it reports true. The tests below respect that.
+
+function feedOffRoute(detector, n) {
+  const above = OFF_ROUTE_THRESHOLD_M + 5;
+  let result = false;
+  for (let i = 0; i < n; i++) {
+    result = detector.record(above);
+  }
+  return result;
+}
+
+function feedOnRoute(detector, n) {
+  let result = false;
+  for (let i = 0; i < n; i++) {
+    result = detector.record(0);
+  }
+  return result;
+}
+
 describe('createOffRouteDetector', () => {
   test('not off-route when within threshold', () => {
     const d = createOffRouteDetector();
@@ -72,41 +97,48 @@ describe('createOffRouteDetector', () => {
     expect(d.record(5)).toBe(false);
   });
 
-  test('fires after three consecutive off-route fixes', () => {
+  test('does not fire during the warmup window', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(true);
+    // Even a long run of off-route fixes must not fire while we are
+    // still inside the warmup period.
+    expect(feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES)).toBe(false);
+  });
+
+  test('fires after the warmup plus the consecutive-fix requirement', () => {
+    const d = createOffRouteDetector();
+    // Consume the warmup (all ignored).
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
+    // Now the consecutive count starts. The last fix should fire.
+    expect(feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES)).toBe(true);
   });
 
   test('a single on-route fix resets the counter', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
-    d.record(above);
-    d.record(above);
-    d.record(0); // back on route
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(true);
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
+    feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES - 1);
+    // One on-route fix.
+    d.record(0);
+    // We now need the full count again.
+    expect(feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES - 1)).toBe(false);
+    expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(true);
   });
 
   test('reset clears the counter', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
-    d.record(above);
-    d.record(above);
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
+    feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES - 1);
     d.reset();
-    expect(d.record(above)).toBe(false);
+    // After reset, we start over, including the warmup.
+    expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(false);
   });
 
   test('consecutive-fix requirement matches the exported constant', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
     for (let i = 0; i < OFF_ROUTE_CONSECUTIVE_FIXES - 1; i++) {
-      expect(d.record(above)).toBe(false);
+      expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(false);
     }
-    expect(d.record(above)).toBe(true);
+    expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(true);
   });
 });
 

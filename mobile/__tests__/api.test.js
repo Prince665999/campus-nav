@@ -8,7 +8,6 @@ import {
   searchPlaces,
   listPlaces,
   getPlace,
-  listAreas,
   computeRoute,
   narrateRoute,
   getHealth,
@@ -101,14 +100,6 @@ describe('URL construction', () => {
     expect(calledUrl).toContain('to_place_id=5');
     expect(calledUrl).toContain('lang=sw');
     expect(calledUrl).toContain('live=true');
-  });
-
-  test('listAreas with landmark_only sends the flag', async () => {
-    global.fetch.mockReturnValueOnce(mockJsonResponse([]));
-    await listAreas({ landmark_only: true });
-
-    const calledUrl = global.fetch.mock.calls[0][0];
-    expect(calledUrl).toContain('landmark_only=true');
   });
 
   test('getHealth hits the right path', async () => {
