@@ -18,7 +18,7 @@ export default function PlaceEditorPage() {
 
   useEffect(() => {
     api
-      .listPlaces({ limit: 200 })
+      .listPlaces({ limit: 500 })
       .then(setPlaces)
       .catch((err) => setError(err.message));
   }, []);

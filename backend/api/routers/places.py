@@ -57,7 +57,7 @@ def list_places(
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
     radius_m: float = Query(500, gt=0, le=5000),
-    limit: int = Query(50, gt=0, le=200),
+    limit: int = Query(50, gt=0, le=2000),
     session: Session = Depends(db_session),
 ):
     """
@@ -84,7 +84,7 @@ def search_places(
     q: str = Query(..., min_length=1),
     kind: str | None = Query(None),
     building_name: str | None = Query(None),
-    limit: int = Query(20, gt=0, le=100),
+    limit: int = Query(20, gt=0, le=2000),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
