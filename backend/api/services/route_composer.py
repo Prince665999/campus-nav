@@ -647,7 +647,29 @@ def _prospective_indoor_steps(steps, path, total_m, nodes=None):
         # for one more instruction and then jumped over the skipped points.
         is_leg = s["instruction"].lower().startswith(_LEG_PREFIXES)
         if is_leg:
-            out.append({**s, "node_id": last_action_node})
+            # Where the walk ends: its own turn node, or (for a walk with no
+            # turn) the node of the next step.
+            end_nid = nid
+            if not end_nid:
+                for later in merged[idx + 1:]:
+                    if later.get("node_id"):
+                        end_nid = later["node_id"]
+                        break
+            # A walk that starts or ends outdoors is an OUTDOOR step, even
+            # though it is anchored (for the dot) at an indoor node such as
+            # the entrance. Without this, the first walk after leaving a
+            # building was labelled indoor: it showed the "Next step" button
+            # and a tap on it skipped one outdoor instruction.
+            touches_outdoor = last_action_node.startswith("o") or (
+                end_nid or ""
+            ).startswith("o")
+            out.append(
+                {
+                    **s,
+                    "node_id": last_action_node,
+                    "touches_outdoor": touches_outdoor,
+                }
+            )
         else:
             out.append(s)
         if nid:
@@ -733,6 +755,7 @@ def _annotate_steps_and_legs(
 
     for step in steps:
         nid = step.get("node_id") or ""
+        step_mode_override = "outdoor" if step.get("touches_outdoor") else None
         if nid:
             last_mode = "outdoor" if nid.startswith("o") else "indoor"
             found = None
@@ -751,7 +774,7 @@ def _annotate_steps_and_legs(
                 ptr = found
                 last_at = max(last_at, cum[ptr])
                 last_gi = ptr
-        modes.append(last_mode)
+        modes.append(step_mode_override or last_mode)
         at_ms.append(last_at)
         geometry_indices.append(last_gi)
 

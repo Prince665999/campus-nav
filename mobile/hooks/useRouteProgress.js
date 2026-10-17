@@ -13,11 +13,26 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
   const [manualStepIndex, setManualStepIndex] = useState(null);
   const lastModeRef = useRef(null);
 
+  // The lowest step GPS may report after a stretch of manual (indoor)
+  // stepping. When the walker steps out of a building onto the first
+  // outdoor instruction, GPS takes over from that step, and must never
+  // report an earlier (indoor) one.
+  const [gpsFloorIdx, setGpsFloorIdx] = useState(0);
+  const sawIndoorManualRef = useRef(false);
+  const startedManualRef = useRef(false);
+
   const steps = route?.steps || [];
   const indoorsEnabled = settings.indoorsEnabled !== false;
 
   useEffect(() => {
-    if (startedFromPlace && manualStepIndex === null) {
+    // Once per screen: after GPS takes over outdoors, manual mode must
+    // not be switched back on here.
+    if (
+      startedFromPlace &&
+      manualStepIndex === null &&
+      !startedManualRef.current
+    ) {
+      startedManualRef.current = true;
       setManualStepIndex(0);
     }
   }, [startedFromPlace, manualStepIndex]);
@@ -39,10 +54,32 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
       const step = steps[idx] || null;
       return { index: idx, mode: step?.mode || 'outdoor', step };
     }
-    const idx = outdoorStepIndex;
+    const idx = Math.max(outdoorStepIndex, Math.min(gpsFloorIdx, steps.length - 1));
     const step = steps[idx] || null;
     return { index: idx, mode: step?.mode || 'outdoor', step };
-  }, [steps, indoorsEnabled, manualStepIndex, outdoorStepIndex]);
+  }, [steps, indoorsEnabled, manualStepIndex, outdoorStepIndex, gpsFloorIdx]);
+
+  // Indoor -> outdoor hand-over. While the walker taps through indoor
+  // steps, steps are manual. The moment the manual step is an outdoor one
+  // (they have left the building), hand the route back to GPS, starting
+  // at that step. Before this, manual mode stayed on for the whole trip:
+  // the first outdoor instruction kept the Next button and a tap skipped
+  // an outdoor instruction.
+  useEffect(() => {
+    if (manualStepIndex === null || !steps.length || !indoorsEnabled) return;
+    const idx = Math.min(manualStepIndex, steps.length - 1);
+    const step = steps[idx];
+    if (!step) return;
+    if (step.mode === 'indoor') {
+      sawIndoorManualRef.current = true;
+      return;
+    }
+    if (sawIndoorManualRef.current) {
+      sawIndoorManualRef.current = false;
+      setGpsFloorIdx(idx);
+      setManualStepIndex(null);
+    }
+  }, [manualStepIndex, steps, indoorsEnabled]);
 
   useEffect(() => {
     const mode = currentStep.mode;
@@ -60,6 +97,8 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     if (!startedFromPlace) {
       setManualStepIndex(null);
     }
+    setGpsFloorIdx(0);
+    sawIndoorManualRef.current = false;
     lastModeRef.current = null;
   }, [route, startedFromPlace]);
 
@@ -163,3 +202,4 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     currentStepGeometryPoint,
   };
 }
+
