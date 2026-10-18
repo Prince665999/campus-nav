@@ -7,8 +7,10 @@
 // chips we can't count.
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
 
 import { INTENTS } from '@/constants/intents';
+import { ICONS } from '@/constants/icons';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
@@ -41,6 +43,12 @@ export function IntentChips({ selected, onSelect, counts = null }) {
             accessibilityState={{ selected: isSelected }}
             accessibilityLabel={t(intent.labelKey)}
           >
+            <MaterialIcons
+              name={ICONS[intent.iconKey] || ICONS.place}
+              size={16}
+              color={isSelected ? '#ffffff' : COLORS.textMuted}
+              style={styles.icon}
+            />
             <Text
               style={[styles.label, isSelected && styles.labelSelected]}
               numberOfLines={1}
@@ -67,19 +75,21 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: COLORS.background,
     borderWidth: 1,
     borderColor: COLORS.border,
     borderRadius: RADIUS.pill,
     paddingHorizontal: 12,
     height: TOUCH.minHeight,
-    alignItems: 'center',
-    justifyContent: 'center',
+    gap: 6,
   },
   chipSelected: {
     backgroundColor: '#0d9488',
     borderColor: '#0d9488',
   },
+  icon: { marginTop: 1 },
   label: {
     fontSize: 14,
     color: COLORS.text,

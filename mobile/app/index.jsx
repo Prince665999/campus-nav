@@ -416,7 +416,7 @@ export default function HomeScreen() {
           accessibilityRole="button"
           accessibilityLabel={t('timetable.title')}
         >
-          <MaterialIcons name="calendar-today" size={22} color={COLORS.text} />
+          <MaterialIcons name="calendar-today" size={22} color={COLORS.headerText} />
         </TouchableOpacity>
         <Link href="/settings" asChild>
           <TouchableOpacity
@@ -424,7 +424,7 @@ export default function HomeScreen() {
             accessibilityRole="button"
             accessibilityLabel="Settings"
           >
-            <MaterialIcons name={ICONS.settings} size={22} color={COLORS.text} />
+            <MaterialIcons name={ICONS.settings} size={22} color={COLORS.headerText} />
           </TouchableOpacity>
         </Link>
       </View>
@@ -605,3 +605,4 @@ const styles = StyleSheet.create({
   },
   listContent: { paddingBottom: 32 },
 });
+

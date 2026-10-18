@@ -16,14 +16,19 @@
 //
 // If you later want a structured, enforced vocabulary, this is the
 // file to change. For now it's advisory.
+//
+// Each entry has:
+//   key      — what the API stores in `intents` (used as the filter)
+//   labelKey — the i18n lookup for the visible label
+//   iconKey  — the ICONS key from constants/icons.js
 
 export const INTENTS = [
-  { key: 'eat',     labelKey: 'intents.eat'     },
-  { key: 'study',   labelKey: 'intents.study'   },
-  { key: 'print',   labelKey: 'intents.print'   },
-  { key: 'wifi',    labelKey: 'intents.wifi'    },
-  { key: 'sports',  labelKey: 'intents.sports'  },
-  { key: 'meet',    labelKey: 'intents.meet'    },
-  { key: 'toilet',  labelKey: 'intents.toilet'  },
-  { key: 'prayer',  labelKey: 'intents.prayer'  },
+  { key: 'eat',     labelKey: 'intents.eat',    iconKey: 'eat'    },
+  { key: 'study',   labelKey: 'intents.study',  iconKey: 'study'  },
+  { key: 'print',   labelKey: 'intents.print',  iconKey: 'print'  },
+  { key: 'wifi',    labelKey: 'intents.wifi',   iconKey: 'wifi'   },
+  { key: 'sports',  labelKey: 'intents.sports', iconKey: 'sports' },
+  { key: 'meet',    labelKey: 'intents.meet',   iconKey: 'meet'   },
+  { key: 'toilet',  labelKey: 'intents.toilet', iconKey: 'toilet' },
+  { key: 'prayer',  labelKey: 'intents.prayer', iconKey: 'prayer' },
 ];

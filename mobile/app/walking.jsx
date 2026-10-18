@@ -433,7 +433,7 @@ export default function WalkingScreen() {
                 <MaterialIcons
                   name="my-location"
                   size={22}
-                  color={mode === 'indoor' ? COLORS.textFaint : COLORS.text}
+                  color={mode === 'indoor' ? COLORS.headerTextFaint : COLORS.headerText}
                 />
               </TouchableOpacity>
               <TouchableOpacity
@@ -442,7 +442,7 @@ export default function WalkingScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={t('chat.titleWalk')}
               >
-                <MaterialIcons name={ICONS.chat} size={22} color={COLORS.text} />
+                <MaterialIcons name={ICONS.chat} size={22} color={COLORS.headerText} />
               </TouchableOpacity>
               <TouchableOpacity
                 onPress={() => setReportOpen(true)}
@@ -453,7 +453,7 @@ export default function WalkingScreen() {
                 <MaterialIcons
                   name={ICONS.report}
                   size={22}
-                  color={COLORS.text}
+                  color={COLORS.headerText}
                 />
               </TouchableOpacity>
             </View>
@@ -565,3 +565,4 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
 });
+

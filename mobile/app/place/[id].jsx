@@ -325,7 +325,7 @@ export default function PlaceDetailScreen() {
               <MaterialIcons
                 name={favorited ? ICONS.favoriteFilled : ICONS.favoriteOutline}
                 size={22}
-                color={favorited ? COLORS.warning : COLORS.text}
+                color={favorited ? COLORS.headerAccent : COLORS.headerText}
               />
             </TouchableOpacity>
           ),
@@ -598,3 +598,4 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 });
+

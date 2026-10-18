@@ -16,6 +16,7 @@ import {
 } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
+import { StatusBar } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ProgramYearPicker } from '@/components/ProgramYearPicker';
@@ -92,6 +93,8 @@ export default function OnboardingScreen() {
 
   return (
     <View style={styles.container}>
+      {/* This screen has no green header, so the status bar icons go dark. */}
+      <StatusBar style="dark" />
       {/* Skip is hidden on the picker slide — the student can tap
           "Get started" without picking instead. */}
       {!isPickerSlide ? (
@@ -280,3 +283,4 @@ const styles = StyleSheet.create({
   },
   nextText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
 });
+

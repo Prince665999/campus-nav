@@ -25,7 +25,7 @@ function SettingsButton() {
         accessibilityRole="button"
         accessibilityLabel="Settings"
       >
-        <MaterialIcons name={ICONS.settings} size={22} color={COLORS.text} />
+        <MaterialIcons name={ICONS.settings} size={22} color={COLORS.headerText} />
       </TouchableOpacity>
     </Link>
   );
@@ -42,9 +42,9 @@ function AppStack() {
     <Stack
       key={settings.language}
       screenOptions={{
-        headerStyle: { backgroundColor: COLORS.background },
-        headerTintColor: COLORS.text,
-        headerTitleStyle: { fontWeight: '600' },
+        headerStyle: { backgroundColor: COLORS.headerBackground },
+        headerTintColor: COLORS.headerText,
+        headerTitleStyle: { fontWeight: '600', color: COLORS.headerText },
         contentStyle: { backgroundColor: COLORS.backgroundSubtle },
       }}
     >
@@ -79,9 +79,10 @@ export default function RootLayout() {
   return (
     <SafeAreaProvider>
       <SettingsProvider>
-        <StatusBar style="auto" />
+        <StatusBar style="light" />
         <AppStack />
       </SettingsProvider>
     </SafeAreaProvider>
   );
 }
+

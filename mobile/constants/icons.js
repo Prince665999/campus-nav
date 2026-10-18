@@ -46,4 +46,12 @@ export const ICONS = {
   compass: 'explore',
   wifi: 'wifi',
   photo: 'photo-camera',
+
+  // Intents (used by the intent chips on Explore)
+  eat: 'restaurant',
+  study: 'menu-book',
+  print: 'print',
+  sports: 'sports-soccer',
+  meet: 'groups',
+  prayer: 'place-of-worship',
 };

@@ -1,31 +1,69 @@
+
 // Shared colours, spacing, and typography.
 //
 // Every colour in the app pulls from here. The contrast ratio between
 // each text colour and its background meets WCAG AA (4.5:1 for body
-// text, 3:1 for large text).
+// text, 3:1 for large text) on both the white cards and the cream
+// screen background. If you change a colour, keep that in mind: very
+// light text colours on the cream background are the first thing to fail.
+
+// ---------------------------------------------------------------------------
+// THE PALETTE — change the look of the whole app from these few lines.
+// Deep green + warm cream.
+// ---------------------------------------------------------------------------
+const BRAND = {
+  // Buttons, links, selected chips, the route line, the header title.
+  primary: '#046c2f',
+  primaryDark: '#03501f',
+
+  // The screen background behind the cards, and the top bar.
+  cream: '#fbf7ec',
+
+  // Cards, sheets, the search bar, input fields. A very slightly warm white.
+  card: '#fffefb',
+
+  // Thin beige lines around cards and between rows.
+  border: '#e6e0cc',
+  borderSubtle: '#efead9',
+
+  // Text: dark green-black, then two softer greys with a green undertone.
+  text: '#12201a',
+  textMuted: '#4a574f',
+  textFaint: '#66705f',
+};
 
 export const COLORS = {
-  background: '#ffffff',
-  backgroundSubtle: '#f9fafb',
-  border: '#e5e7eb',
-  borderSubtle: '#f3f4f6',
+  // Cards, sheets, the search bar, input fields.
+  background: BRAND.card,
+  // The cream screen background (home, Explore, Settings, and anything
+  // that doesn't set its own).
+  backgroundSubtle: BRAND.cream,
+  border: BRAND.border,
+  borderSubtle: BRAND.borderSubtle,
 
-  // Body text. 4.5:1 contrast against background.
-  // #111827 on #ffffff = 16.75:1 — well above AA.
-  text: '#111827',
+  // The top bar: solid green, with light text and icons on it.
+  headerBackground: BRAND.primary,
+  headerText: '#ffffff', // 6.6:1 on the green
+  headerTextFaint: '#a9d3b6', // disabled header icons (4.0:1 on the green)
+  headerAccent: '#fcd34d', // the filled favourite heart on the green (4.6:1)
 
-  // Secondary text. 4.5:1 against background.
-  // #4b5563 on #ffffff = 8.6:1 — above AA.
-  textMuted: '#4b5563',
+  // Body text. 16.8:1 on white — well above AA.
+  text: BRAND.text,
 
-  // Tertiary text. Kept above 4.5:1 for AA compliance.
-  // Earlier versions used #9ca3af (2.8:1) which fails AA for body.
-  textFaint: '#6b7280',
+  // Secondary text. 7.6:1 on white, 7.1:1 on the cream.
+  textMuted: BRAND.textMuted,
 
-  primary: '#2563eb',
-  primaryDark: '#1e3a8a', // darkened for better contrast against white
+  // Tertiary text. 5.2:1 on white, 4.9:1 on the cream. Don't go lighter:
+  // earlier versions used #9ca3af (2.8:1), which fails AA for body text.
+  textFaint: BRAND.textFaint,
 
-  success: '#15803d',
+  primary: BRAND.primary,
+  primaryDark: BRAND.primaryDark, // darkened for better contrast against white
+  // A pale green tint of the primary colour, for selected rows, icon
+  // circles and highlights. Not used everywhere yet.
+  primaryTint: '#dcefe2',
+
+  success: '#046c2f',
   danger: '#b91c1c', // darkened for contrast
   warning: '#b45309', // darkened for contrast
   warningBg: '#fef3c7',
