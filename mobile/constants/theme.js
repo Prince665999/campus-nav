@@ -1,23 +1,23 @@
-
 // Shared colours, spacing, and typography.
 //
 // Every colour in the app pulls from here. The contrast ratio between
 // each text colour and its background meets WCAG AA (4.5:1 for body
-// text, 3:1 for large text) on both the white cards and the cream
+// text, 3:1 for large text) on both the white cards and the light grey
 // screen background. If you change a colour, keep that in mind: very
-// light text colours on the cream background are the first thing to fail.
+// light text colours on the grey background are the first thing to fail.
 
 // ---------------------------------------------------------------------------
 // THE PALETTE — change the look of the whole app from these few lines.
-// Deep green + warm cream.
+// Deep green + light grey-blue screen background.
 // ---------------------------------------------------------------------------
 const BRAND = {
   // Buttons, links, selected chips, the route line, the header title.
   primary: '#046c2f',
   primaryDark: '#03501f',
 
-  // The screen background behind the cards, and the top bar.
-  cream: '#fbf7ec',
+  // The screen background behind the cards (home, Explore, Settings...).
+  // This is the same colour the indoor map uses.
+  canvas: '#f1f5f9',
 
   // Cards, sheets, the search bar, input fields. A very slightly warm white.
   card: '#fffefb',
@@ -35,9 +35,9 @@ const BRAND = {
 export const COLORS = {
   // Cards, sheets, the search bar, input fields.
   background: BRAND.card,
-  // The cream screen background (home, Explore, Settings, and anything
-  // that doesn't set its own).
-  backgroundSubtle: BRAND.cream,
+  // The screen background (home, Explore, Settings, and anything that
+  // doesn't set its own).
+  backgroundSubtle: BRAND.canvas,
   border: BRAND.border,
   borderSubtle: BRAND.borderSubtle,
 
@@ -50,10 +50,10 @@ export const COLORS = {
   // Body text. 16.8:1 on white — well above AA.
   text: BRAND.text,
 
-  // Secondary text. 7.6:1 on white, 7.1:1 on the cream.
+  // Secondary text. 7.6:1 on white, 6.9:1 on the grey.
   textMuted: BRAND.textMuted,
 
-  // Tertiary text. 5.2:1 on white, 4.9:1 on the cream. Don't go lighter:
+  // Tertiary text. 5.2:1 on white, 4.7:1 on the grey. Don't go lighter:
   // earlier versions used #9ca3af (2.8:1), which fails AA for body text.
   textFaint: BRAND.textFaint,
 
