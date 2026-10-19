@@ -115,7 +115,7 @@
     "titleDoc": "Campus Chat",
     "greetingGeneral": "Hi! Ask me where you want to go — try \"take me to the library\".",
     "greetingWalk": "Ask me anything about this walk. I can tell you what's around and what's coming up.",
-    "greetingDoc": "Hi! Ask me about the university — its rules, history, opening hours, or anything else.",
+    "greetingDoc": "Hi! Ask me about the university — its rules, almanac, courses, events, or anything else.",
     "placeholder": "Ask something…",
     "placeholderWalk": "Ask about this walk…",
     "placeholderDoc": "Ask about the university…",

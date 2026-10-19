@@ -457,3 +457,33 @@ def retrieve(query, top_k=KNOWLEDGE_TOP_K):
         })
 
     return out
+
+
+def retrieve_containing(substring, limit=40):
+    """
+    Find chunks whose text literally contains `substring` (case-sensitive).
+
+    Retrieval by meaning (retrieve above) is weak at exact values such as
+    dates; this is a plain text match, used for those. Returns the same
+    {text, metadata, score} shape as retrieve(). Returns [] on any problem.
+    """
+    if not substring:
+        return []
+    try:
+        collection = _get_collection()
+        result = collection.get(
+            where_document={"$contains": substring},
+            limit=limit,
+            include=["documents", "metadatas"],
+        )
+    except Exception as e:
+        logger.warning("Chroma text lookup failed for %r: %s", substring, e)
+        return []
+
+    docs = result.get("documents") or []
+    metas = result.get("metadatas") or []
+    return [
+        {"text": text, "metadata": metadata or {}, "score": 1.0}
+        for text, metadata in zip(docs, metas)
+    ]
+

@@ -42,9 +42,9 @@ import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 // with that question and sends it.
 const DOC_QUICK_PROMPTS = [
   'When does the semester end?',
-  'What are the library hours?',
-  'How do I contact the dean?',
   'What are the exam rules?',
+  'What does MUSTSO cabinet comprise of?',
+  'Who is the head of the Computer Science department?',
 ];
 
 export default function ChatScreen() {

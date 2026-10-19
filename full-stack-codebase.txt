@@ -2026,7 +2026,7 @@ export default function PlaceEditorPage() {
 
   useEffect(() => {
     api
-      .listPlaces({ limit: 200 })
+      .listPlaces({ limit: 500 })
       .then(setPlaces)
       .catch((err) => setError(err.message));
   }, []);
@@ -10900,43 +10900,61 @@ Safety note
 -----------
 Some of our indexes and columns were added by Alembic migrations or
 raw-SQL scripts, not by SQLAlchemy's metadata. `create_all` doesn't
-know about them and will fail with "index already exists" on a
-database that's already migrated.
+know about them and will fail with "already exists" on a database that
+is already migrated.
 
-To make this safe to run on any DB state, we create tables one at a
-time so a failure on one table's index doesn't stop the rest.
+Rather than creating tables one at a time (which does not let
+SQLAlchemy order them by foreign key), we call create_all() once and
+catch the benign "already exists" errors. create_all() builds tables in
+dependency order, so a table with a foreign key is always created after
+the table it references.
+
+Postgres raises ProgrammingError for duplicate objects in some paths
+and OperationalError in others. We catch both and treat any "already
+exists" / "duplicate" message as a benign skip.
 """
 
 import logging
 
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
+
+# Import the models package fully, so every model module is loaded and
+# every table is registered with Base.metadata before we call create_all.
+# A partial import (e.g. only `area, path_edge, place`) would leave the
+# metadata incomplete, and tables added by migration scripts would not
+# be created.
+from backend.api import models  # noqa: F401
+from backend.api.models.base import Base
 
 from .session import get_engine
-from ..models import area, path_edge, place  # noqa: F401 (registers models)
-from ..models.base import Base
 
 logger = logging.getLogger(__name__)
 
 
+_BENIGN_STRINGS = ("already exists", "duplicate")
+
+
+def _is_benign_duplicate(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(s in msg for s in _BENIGN_STRINGS)
+
+
 def init_db():
-    """Create every table that doesn't already exist."""
+    """
+    Create every table that doesn't already exist.
+
+    create_all() does the FK-aware ordering. If a benign duplicate is
+    raised (an index or table already present from a prior migration),
+    we log it and continue — the schema we need is still there.
+    """
     engine = get_engine()
-    for table in Base.metadata.sorted_tables:
-        try:
-            table.create(bind=engine, checkfirst=True)
-        except OperationalError as e:
-            msg = str(e).lower()
-            if "already exists" in msg:
-                # Expected on an already-migrated database. Log at
-                # debug level — this is not a problem worth warning
-                # about on every startup.
-                logger.debug(
-                    "init_db: skipped duplicate index on %s (%s)",
-                    table.name,
-                    e,
-                )
-                continue
-            raise
+    try:
+        Base.metadata.create_all(bind=engine, checkfirst=True)
+    except (OperationalError, ProgrammingError) as e:
+        if _is_benign_duplicate(e):
+            logger.debug("init_db: benign duplicate during create_all (%s)", e)
+            return
+        raise
 
 
 def drop_all():
@@ -12434,14 +12452,20 @@ class Place(Base, TimestampMixin):
     intents: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # "outdoor", "indoor", or "entrance".
+    #
+    # The index on this column is declared explicitly in __table_args__
+    # below. We deliberately do NOT pass index=True here, because that
+    # would also generate an index with the same auto-generated name
+    # (ix_places_kind), producing a duplicate CREATE INDEX statement.
+    # SQLite silently tolerates that; Postgres raises DuplicateTable.
     kind: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="outdoor", index=True
+        String(16), nullable=False, default="outdoor"
     )
 
     # Which building the place belongs to. Null for outdoor places.
     # Free text, matches the building_name tag on rooms and doors.
     building_name: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, index=True
+        String(255), nullable=True
     )
 
     # For indoor places: the level the door is on, e.g. "0", "1", "-1".
@@ -14942,7 +14966,7 @@ def list_places(
     lat: float | None = Query(None, ge=-90, le=90),
     lon: float | None = Query(None, ge=-180, le=180),
     radius_m: float = Query(500, gt=0, le=5000),
-    limit: int = Query(50, gt=0, le=200),
+    limit: int = Query(50, gt=0, le=2000),
     session: Session = Depends(db_session),
 ):
     """
@@ -14969,7 +14993,7 @@ def search_places(
     q: str = Query(..., min_length=1),
     kind: str | None = Query(None),
     building_name: str | None = Query(None),
-    limit: int = Query(20, gt=0, le=100),
+    limit: int = Query(20, gt=0, le=2000),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
@@ -21242,7 +21266,29 @@ def _prospective_indoor_steps(steps, path, total_m, nodes=None):
         # for one more instruction and then jumped over the skipped points.
         is_leg = s["instruction"].lower().startswith(_LEG_PREFIXES)
         if is_leg:
-            out.append({**s, "node_id": last_action_node})
+            # Where the walk ends: its own turn node, or (for a walk with no
+            # turn) the node of the next step.
+            end_nid = nid
+            if not end_nid:
+                for later in merged[idx + 1:]:
+                    if later.get("node_id"):
+                        end_nid = later["node_id"]
+                        break
+            # A walk that starts or ends outdoors is an OUTDOOR step, even
+            # though it is anchored (for the dot) at an indoor node such as
+            # the entrance. Without this, the first walk after leaving a
+            # building was labelled indoor: it showed the "Next step" button
+            # and a tap on it skipped one outdoor instruction.
+            touches_outdoor = last_action_node.startswith("o") or (
+                end_nid or ""
+            ).startswith("o")
+            out.append(
+                {
+                    **s,
+                    "node_id": last_action_node,
+                    "touches_outdoor": touches_outdoor,
+                }
+            )
         else:
             out.append(s)
         if nid:
@@ -21328,6 +21374,7 @@ def _annotate_steps_and_legs(
 
     for step in steps:
         nid = step.get("node_id") or ""
+        step_mode_override = "outdoor" if step.get("touches_outdoor") else None
         if nid:
             last_mode = "outdoor" if nid.startswith("o") else "indoor"
             found = None
@@ -21346,7 +21393,7 @@ def _annotate_steps_and_legs(
                 ptr = found
                 last_at = max(last_at, cum[ptr])
                 last_gi = ptr
-        modes.append(last_mode)
+        modes.append(step_mode_override or last_mode)
         at_ms.append(last_at)
         geometry_indices.append(last_gi)
 
@@ -34066,7 +34113,7 @@ export default function HomeScreen() {
           accessibilityRole="button"
           accessibilityLabel={t('timetable.title')}
         >
-          <MaterialIcons name="calendar-today" size={22} color={COLORS.text} />
+          <MaterialIcons name="calendar-today" size={22} color={COLORS.headerText} />
         </TouchableOpacity>
         <Link href="/settings" asChild>
           <TouchableOpacity
@@ -34074,7 +34121,7 @@ export default function HomeScreen() {
             accessibilityRole="button"
             accessibilityLabel="Settings"
           >
-            <MaterialIcons name={ICONS.settings} size={22} color={COLORS.text} />
+            <MaterialIcons name={ICONS.settings} size={22} color={COLORS.headerText} />
           </TouchableOpacity>
         </Link>
       </View>
@@ -34256,6 +34303,8 @@ const styles = StyleSheet.create({
   listContent: { paddingBottom: 32 },
 });
 
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\onboarding.jsx ---
 
 // Onboarding. Shown once, on first launch.
@@ -34276,6 +34325,7 @@ import {
 } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
+import { StatusBar } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ProgramYearPicker } from '@/components/ProgramYearPicker';
@@ -34352,6 +34402,8 @@ export default function OnboardingScreen() {
 
   return (
     <View style={styles.container}>
+      {/* This screen has no green header, so the status bar icons go dark. */}
+      <StatusBar style="dark" />
       {/* Skip is hidden on the picker slide — the student can tap
           "Get started" without picking instead. */}
       {!isPickerSlide ? (
@@ -34540,6 +34592,8 @@ const styles = StyleSheet.create({
   },
   nextText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\place\[id].jsx ---
 
@@ -34870,7 +34924,7 @@ export default function PlaceDetailScreen() {
               <MaterialIcons
                 name={favorited ? ICONS.favoriteFilled : ICONS.favoriteOutline}
                 size={22}
-                color={favorited ? COLORS.warning : COLORS.text}
+                color={favorited ? COLORS.headerAccent : COLORS.headerText}
               />
             </TouchableOpacity>
           ),
@@ -35143,6 +35197,8 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\route-preview.jsx ---
 
@@ -36493,7 +36549,7 @@ export default function WalkingScreen() {
                 <MaterialIcons
                   name="my-location"
                   size={22}
-                  color={mode === 'indoor' ? COLORS.textFaint : COLORS.text}
+                  color={mode === 'indoor' ? COLORS.headerTextFaint : COLORS.headerText}
                 />
               </TouchableOpacity>
               <TouchableOpacity
@@ -36502,7 +36558,7 @@ export default function WalkingScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={t('chat.titleWalk')}
               >
-                <MaterialIcons name={ICONS.chat} size={22} color={COLORS.text} />
+                <MaterialIcons name={ICONS.chat} size={22} color={COLORS.headerText} />
               </TouchableOpacity>
               <TouchableOpacity
                 onPress={() => setReportOpen(true)}
@@ -36513,7 +36569,7 @@ export default function WalkingScreen() {
                 <MaterialIcons
                   name={ICONS.report}
                   size={22}
-                  color={COLORS.text}
+                  color={COLORS.headerText}
                 />
               </TouchableOpacity>
             </View>
@@ -36626,6 +36682,8 @@ const styles = StyleSheet.create({
   },
 });
 
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\_layout.jsx ---
 
 // Root layout for Expo Router.
@@ -36655,7 +36713,7 @@ function SettingsButton() {
         accessibilityRole="button"
         accessibilityLabel="Settings"
       >
-        <MaterialIcons name={ICONS.settings} size={22} color={COLORS.text} />
+        <MaterialIcons name={ICONS.settings} size={22} color={COLORS.headerText} />
       </TouchableOpacity>
     </Link>
   );
@@ -36672,9 +36730,9 @@ function AppStack() {
     <Stack
       key={settings.language}
       screenOptions={{
-        headerStyle: { backgroundColor: COLORS.background },
-        headerTintColor: COLORS.text,
-        headerTitleStyle: { fontWeight: '600' },
+        headerStyle: { backgroundColor: COLORS.headerBackground },
+        headerTintColor: COLORS.headerText,
+        headerTitleStyle: { fontWeight: '600', color: COLORS.headerText },
         contentStyle: { backgroundColor: COLORS.backgroundSubtle },
       }}
     >
@@ -36709,12 +36767,14 @@ export default function RootLayout() {
   return (
     <SafeAreaProvider>
       <SettingsProvider>
-        <StatusBar style="auto" />
+        <StatusBar style="light" />
         <AppStack />
       </SettingsProvider>
     </SafeAreaProvider>
   );
 }
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app.json ---
 
@@ -39660,8 +39720,10 @@ const styles = StyleSheet.create({
 // chips we can't count.
 
 import { ScrollView, StyleSheet, Text, TouchableOpacity } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
 
 import { INTENTS } from '@/constants/intents';
+import { ICONS } from '@/constants/icons';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
@@ -39694,6 +39756,12 @@ export function IntentChips({ selected, onSelect, counts = null }) {
             accessibilityState={{ selected: isSelected }}
             accessibilityLabel={t(intent.labelKey)}
           >
+            <MaterialIcons
+              name={ICONS[intent.iconKey] || ICONS.place}
+              size={16}
+              color={isSelected ? '#ffffff' : COLORS.textMuted}
+              style={styles.icon}
+            />
             <Text
               style={[styles.label, isSelected && styles.labelSelected]}
               numberOfLines={1}
@@ -39720,19 +39788,21 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: COLORS.background,
     borderWidth: 1,
     borderColor: COLORS.border,
     borderRadius: RADIUS.pill,
     paddingHorizontal: 12,
     height: TOUCH.minHeight,
-    alignItems: 'center',
-    justifyContent: 'center',
+    gap: 6,
   },
   chipSelected: {
     backgroundColor: '#0d9488',
     borderColor: '#0d9488',
   },
+  icon: { marginTop: 1 },
   label: {
     fontSize: 14,
     color: COLORS.text,
@@ -42247,7 +42317,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'https://nomination-flour-learn-leeds.trycloudflare.com';
+const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -42397,6 +42467,14 @@ export const ICONS = {
   compass: 'explore',
   wifi: 'wifi',
   photo: 'photo-camera',
+
+  // Intents (used by the intent chips on Explore)
+  eat: 'restaurant',
+  study: 'menu-book',
+  print: 'print',
+  sports: 'sports-soccer',
+  meet: 'groups',
+  prayer: 'place-of-worship',
 };
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\intents.js ---
@@ -42419,16 +42497,21 @@ export const ICONS = {
 //
 // If you later want a structured, enforced vocabulary, this is the
 // file to change. For now it's advisory.
+//
+// Each entry has:
+//   key      — what the API stores in `intents` (used as the filter)
+//   labelKey — the i18n lookup for the visible label
+//   iconKey  — the ICONS key from constants/icons.js
 
 export const INTENTS = [
-  { key: 'eat',     labelKey: 'intents.eat'     },
-  { key: 'study',   labelKey: 'intents.study'   },
-  { key: 'print',   labelKey: 'intents.print'   },
-  { key: 'wifi',    labelKey: 'intents.wifi'    },
-  { key: 'sports',  labelKey: 'intents.sports'  },
-  { key: 'meet',    labelKey: 'intents.meet'    },
-  { key: 'toilet',  labelKey: 'intents.toilet'  },
-  { key: 'prayer',  labelKey: 'intents.prayer'  },
+  { key: 'eat',     labelKey: 'intents.eat',    iconKey: 'eat'    },
+  { key: 'study',   labelKey: 'intents.study',  iconKey: 'study'  },
+  { key: 'print',   labelKey: 'intents.print',  iconKey: 'print'  },
+  { key: 'wifi',    labelKey: 'intents.wifi',   iconKey: 'wifi'   },
+  { key: 'sports',  labelKey: 'intents.sports', iconKey: 'sports' },
+  { key: 'meet',    labelKey: 'intents.meet',   iconKey: 'meet'   },
+  { key: 'toilet',  labelKey: 'intents.toilet', iconKey: 'toilet' },
+  { key: 'prayer',  labelKey: 'intents.prayer', iconKey: 'prayer' },
 ];
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\profiles.js ---
@@ -42441,36 +42524,208 @@ export const INTENTS = [
 //
 // Every colour in the app pulls from here. The contrast ratio between
 // each text colour and its background meets WCAG AA (4.5:1 for body
-// text, 3:1 for large text).
+// text, 3:1 for large text) on both the white cards and the light grey
+// screen background. If you change a colour, keep that in mind: very
+// light text colours on the grey background are the first thing to fail.
+
+// ---------------------------------------------------------------------------
+// THE PALETTE — change the look of the whole app from these few lines.
+// Deep green + light grey-blue screen background.
+// ---------------------------------------------------------------------------
+const BRAND = {
+  // Buttons, links, selected chips, the route line, the header title.
+  primary: '#046c2f',
+  primaryDark: '#03501f',
+
+  // The screen background behind the cards (home, Explore, Settings...).
+  // This is the same colour the indoor map uses.
+  canvas: '#f1f5f9',
+
+  // Cards, sheets, the search bar, input fields. A very slightly warm white.
+  card: '#fffefb',
+
+  // Thin beige lines around cards and between rows.
+  border: '#e6e0cc',
+  borderSubtle: '#efead9',
+
+  // Text: dark green-black, then two softer greys with a green undertone.
+  text: '#12201a',
+  textMuted: '#4a574f',
+  textFaint: '#66705f',
+};
 
 export const COLORS = {
-  background: '#ffffff',
-  backgroundSubtle: '#f9fafb',
-  border: '#e5e7eb',
-  borderSubtle: '#f3f4f6',
+  // Cards, sheets, the search bar, input fields.
+  background: BRAND.card,
+  // The screen background (home, Explore, Settings, and anything that
+  // doesn't set its own).
+  backgroundSubtle: BRAND.canvas,
+  border: BRAND.border,
+  borderSubtle: BRAND.borderSubtle,
 
-  // Body text. 4.5:1 contrast against background.
-  // #111827 on #ffffff = 16.75:1 — well above AA.
-  text: '#111827',
+  // The top bar: solid green, with light text and icons on it.
+  headerBackground: BRAND.primary,
+  headerText: '#ffffff', // 6.6:1 on the green
+  headerTextFaint: '#a9d3b6', // disabled header icons (4.0:1 on the green)
+  headerAccent: '#fcd34d', // the filled favourite heart on the green (4.6:1)
 
-  // Secondary text. 4.5:1 against background.
-  // #4b5563 on #ffffff = 8.6:1 — above AA.
-  textMuted: '#4b5563',
+  // Body text. 16.8:1 on white — well above AA.
+  text: BRAND.text,
 
-  // Tertiary text. Kept above 4.5:1 for AA compliance.
-  // Earlier versions used #9ca3af (2.8:1) which fails AA for body.
-  textFaint: '#6b7280',
+  // Secondary text. 7.6:1 on white, 6.9:1 on the grey.
+  textMuted: BRAND.textMuted,
 
-  primary: '#2563eb',
-  primaryDark: '#1e3a8a', // darkened for better contrast against white
+  // Tertiary text. 5.2:1 on white, 4.7:1 on the grey. Don't go lighter:
+  // earlier versions used #9ca3af (2.8:1), which fails AA for body text.
+  textFaint: BRAND.textFaint,
 
-  success: '#15803d',
+  primary: BRAND.primary,
+  primaryDark: BRAND.primaryDark, // darkened for better contrast against white
+  // A pale green tint of the primary colour, for selected rows, icon
+  // circles and highlights. Not used everywhere yet.
+  primaryTint: '#dcefe2',
+
+  success: '#046c2f',
   danger: '#b91c1c', // darkened for contrast
   warning: '#b45309', // darkened for contrast
   warningBg: '#fef3c7',
   warningBorder: '#f59e0b',
   warningText: '#78350f',
   warningTextSubtle: '#92400e',
+};
+
+export const SPACING = {
+  xs: 4,
+  sm: 8,
+  md: 16,
+  lg: 24,
+  xl: 32,
+};
+
+export const RADIUS = {
+  sm: 8,
+  md: 12,
+  lg: 20,
+  pill: 999,
+};
+
+// Touch targets. Apple's HIG and Android's Material both recommend a
+// 44pt minimum. We use 48 to be safe.
+export const TOUCH = {
+  minHeight: 48,
+  minWidth: 48,
+};
+
+// Font sizes. These are the base sizes. A large-text accessibility
+// setting multiplies them by 1.3 — see useAccessibility.js.
+export const FONT_SIZE = {
+  small: 13,
+  body: 15,
+  large: 17,
+  title: 22,
+  hero: 26,
+};
+
+// Multiplier applied when the user has enabled large text.
+export const LARGE_TEXT_MULTIPLIER = 1.3;
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\theme_dark.js ---
+
+// Shared colours, spacing, and typography.
+//
+// Dark theme variant. Every colour the app uses is defined here, and the
+// contrast ratios have been chosen so body text is at least 4.5:1 against
+// the background it sits on. Edit the PALETTE block to adjust the whole app.
+//
+// To go back to the light theme, restore the previous version of this file.
+// Nothing else in the app needs to change.
+
+// ---------------------------------------------------------------------------
+// THE PALETTE — change the look of the whole app from these few lines.
+// ---------------------------------------------------------------------------
+const PALETTE = {
+  // Surfaces, from furthest back to closest.
+  // The screen background. Very dark slate, not pure black: pure black on
+  // OLED screens can look harsh, and it makes shadows impossible.
+  canvas: '#0f172a',
+  // Cards, sheets, the search bar, input fields. One step lighter than the
+  // canvas so they read as raised surfaces.
+  surface: '#1e293b',
+  // A slightly lighter surface for nested elements (chips, list rows).
+  surfaceRaised: '#273449',
+
+  // Thin lines around cards and between rows. Dark-mode borders are
+  // subtle — they define edges without shouting.
+  border: '#334155',
+  borderSubtle: '#25324a',
+
+  // Text. Very light greys, slightly blue-tinted so they feel coherent
+  // with the slate surfaces.
+  // #e2e8f0 on #0f172a = 14.6:1 — well above AA.
+  text: '#e2e8f0',
+  // #94a3b8 on #0f172a = 6.9:1 — above AA.
+  textMuted: '#94a3b8',
+  // #64748b on #0f172a = 4.6:1 — just above AA for body text.
+  textFaint: '#64748b',
+
+  // Brand colours. The primary is a lighter blue than the light theme's
+  // #2563eb, so it stands out against the dark background.
+  primary: '#60a5fa',
+  primaryDark: '#3b82f6',
+
+  // A very dark tint of the primary, for selected rows and icon circles.
+  primaryTint: '#1e3a5f',
+
+  // Second accent (teal).
+  accent: '#5eead4',
+
+  // Status colours, adjusted for dark backgrounds. The "bg" variants are
+  // dark tints, and the text variants are light enough to read on them.
+  success: '#4ade80',
+  successBg: '#052e16',
+  danger: '#f87171',
+  dangerBg: '#450a0a',
+  warning: '#fbbf24',
+  warningBg: '#422006',
+  warningBorder: '#a16207',
+  warningText: '#fde68a',
+  warningTextSubtle: '#fcd34d',
+};
+
+export const COLORS = {
+  // This is the "surface" colour — cards, sheets, search bar. In light
+  // themes this was #ffffff. In dark it's the raised slate.
+  background: PALETTE.surface,
+  // The screen background behind the cards.
+  backgroundSubtle: PALETTE.canvas,
+  border: PALETTE.border,
+  borderSubtle: PALETTE.borderSubtle,
+
+  // Header / title bar. A touch lighter than the canvas so it separates
+  // from the content below.
+  headerBackground: PALETTE.surface,
+
+  // Text colours.
+  text: PALETTE.text,
+  textMuted: PALETTE.textMuted,
+  textFaint: PALETTE.textFaint,
+
+  // Brand colours.
+  primary: PALETTE.primary,
+  primaryDark: PALETTE.primaryDark,
+  primaryTint: PALETTE.primaryTint,
+  accent: PALETTE.accent,
+
+  // Status colours.
+  success: PALETTE.success,
+  successBg: PALETTE.successBg,
+  danger: PALETTE.danger,
+  dangerBg: PALETTE.dangerBg,
+  warning: PALETTE.warning,
+  warningBg: PALETTE.warningBg,
+  warningBorder: PALETTE.warningBorder,
+  warningText: PALETTE.warningText,
+  warningTextSubtle: PALETTE.warningTextSubtle,
 };
 
 export const SPACING = {
@@ -43007,11 +43262,26 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
   const [manualStepIndex, setManualStepIndex] = useState(null);
   const lastModeRef = useRef(null);
 
+  // The lowest step GPS may report after a stretch of manual (indoor)
+  // stepping. When the walker steps out of a building onto the first
+  // outdoor instruction, GPS takes over from that step, and must never
+  // report an earlier (indoor) one.
+  const [gpsFloorIdx, setGpsFloorIdx] = useState(0);
+  const sawIndoorManualRef = useRef(false);
+  const startedManualRef = useRef(false);
+
   const steps = route?.steps || [];
   const indoorsEnabled = settings.indoorsEnabled !== false;
 
   useEffect(() => {
-    if (startedFromPlace && manualStepIndex === null) {
+    // Once per screen: after GPS takes over outdoors, manual mode must
+    // not be switched back on here.
+    if (
+      startedFromPlace &&
+      manualStepIndex === null &&
+      !startedManualRef.current
+    ) {
+      startedManualRef.current = true;
       setManualStepIndex(0);
     }
   }, [startedFromPlace, manualStepIndex]);
@@ -43033,10 +43303,32 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
       const step = steps[idx] || null;
       return { index: idx, mode: step?.mode || 'outdoor', step };
     }
-    const idx = outdoorStepIndex;
+    const idx = Math.max(outdoorStepIndex, Math.min(gpsFloorIdx, steps.length - 1));
     const step = steps[idx] || null;
     return { index: idx, mode: step?.mode || 'outdoor', step };
-  }, [steps, indoorsEnabled, manualStepIndex, outdoorStepIndex]);
+  }, [steps, indoorsEnabled, manualStepIndex, outdoorStepIndex, gpsFloorIdx]);
+
+  // Indoor -> outdoor hand-over. While the walker taps through indoor
+  // steps, steps are manual. The moment the manual step is an outdoor one
+  // (they have left the building), hand the route back to GPS, starting
+  // at that step. Before this, manual mode stayed on for the whole trip:
+  // the first outdoor instruction kept the Next button and a tap skipped
+  // an outdoor instruction.
+  useEffect(() => {
+    if (manualStepIndex === null || !steps.length || !indoorsEnabled) return;
+    const idx = Math.min(manualStepIndex, steps.length - 1);
+    const step = steps[idx];
+    if (!step) return;
+    if (step.mode === 'indoor') {
+      sawIndoorManualRef.current = true;
+      return;
+    }
+    if (sawIndoorManualRef.current) {
+      sawIndoorManualRef.current = false;
+      setGpsFloorIdx(idx);
+      setManualStepIndex(null);
+    }
+  }, [manualStepIndex, steps, indoorsEnabled]);
 
   useEffect(() => {
     const mode = currentStep.mode;
@@ -43054,6 +43346,8 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     if (!startedFromPlace) {
       setManualStepIndex(null);
     }
+    setGpsFloorIdx(0);
+    sawIndoorManualRef.current = false;
     lastModeRef.current = null;
   }, [route, startedFromPlace]);
 
@@ -43157,6 +43451,8 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     currentStepGeometryPoint,
   };
 }
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\hooks\useStartingPoint.js ---
 
@@ -61664,36 +61960,49 @@ export async function getHealth() {
 
 // Compass heading.
 //
-// Two sources, in order:
-//   1. The magnetometer — accurate when it works. Some phones have
-//      it, some don't.
-//   2. The GPS direction of travel — less accurate, only works while
-//      moving, but always available when a fix is being received.
+// Sources, tried in this order:
+//   1. The OS's fused heading (expo-location watchHeadingAsync). It combines
+//      the magnetometer with the accelerometer, so it stays correct when the
+//      phone is held tilted, which is how people hold it while walking. It
+//      also corrects for magnetic declination when it knows where you are.
+//   2. The raw magnetometer, used if (1) gives nothing within a few seconds.
+//      Only accurate with the phone flat.
+//   3. GPS direction of travel (Plan B). This file does not do that part:
+//      hooks/useCompass.js feeds it in from headingFromMovement() whenever
+//      no sensor heading has arrived. Phones with no magnetometer use it,
+//      exactly as before.
 //
-// The caller gets a heading in degrees, 0 = north. The source is
-// included so the caller can decide whether to trust it.
+// The caller gets a heading in degrees, 0 = north.
 
 import { Magnetometer } from 'expo-sensors';
+import * as Location from 'expo-location';
+
+import { magneticHeadingFromXY, smoothHeading } from '@/utils/heading';
+
+// If the fused heading hasn't produced a value after this long, switch to
+// the raw magnetometer.
+const FUSED_TIMEOUT_MS = 3000;
 
 let _subscription = null;
 
-// Convert a magnetometer reading to a compass heading.
-function readingToHeading({ x, y }) {
-  const angle = Math.atan2(y, x) * (180 / Math.PI);
-  return (angle + 360) % 360;
+// OS-fused heading. Returns a stop function, or null if unavailable.
+async function tryFusedHeading(onHeading) {
+  const perm = await Location.getForegroundPermissionsAsync();
+  if (!perm || !perm.granted) return null;
+
+  let last = null;
+  const sub = await Location.watchHeadingAsync((h) => {
+    // trueHeading is -1 when the OS can't work it out yet; then use the
+    // magnetic heading (the difference is only a few degrees here).
+    const raw = h.trueHeading >= 0 ? h.trueHeading : h.magHeading;
+    if (!Number.isFinite(raw) || raw < 0) return;
+    last = smoothHeading(last, raw);
+    onHeading(last);
+  });
+  return () => sub.remove();
 }
 
-// Smooth a heading, handling the 0/360 wrap-around.
-function smooth(prev, next) {
-  if (prev === null || prev === undefined) return next;
-  let diff = next - prev;
-  if (diff > 180) diff -= 360;
-  if (diff < -180) diff += 360;
-  return (prev + diff * 0.2 + 360) % 360;
-}
-
-// Try to subscribe to the magnetometer.
-// Returns a stop function on success, or null if unavailable.
+// Raw magnetometer. Returns a stop function, or null if unavailable.
 async function tryMagnetometer(onHeading) {
   const available = await Magnetometer.isAvailableAsync();
   if (!available) return null;
@@ -61702,9 +62011,9 @@ async function tryMagnetometer(onHeading) {
 
   let last = null;
   const sub = Magnetometer.addListener((reading) => {
-    const raw = readingToHeading(reading);
+    const raw = magneticHeadingFromXY(reading.x, reading.y);
     if (Number.isFinite(raw)) {
-      last = smooth(last, raw);
+      last = smoothHeading(last, raw, 0.2);
       onHeading(last);
     }
   });
@@ -61714,6 +62023,7 @@ async function tryMagnetometer(onHeading) {
 
 // Compute a heading from two GPS positions. Returns degrees or null
 // if the movement is too small to get a reliable direction.
+// (Plan B. Unchanged.)
 export function headingFromMovement(prev, next) {
   if (!prev || !next) return null;
 
@@ -61739,7 +62049,7 @@ export function headingFromMovement(prev, next) {
 }
 
 // Subscribe to heading updates. The callback receives a heading in
-// degrees, or null if no source is available.
+// degrees, or null if no sensor is available.
 //
 // Returns a stop function.
 export async function watch(onHeading, onError) {
@@ -61747,24 +62057,64 @@ export async function watch(onHeading, onError) {
     return () => stop();
   }
 
-  let magnetometerStop = null;
+  let stopped = false;
+  let current = null; // stop function of whichever source is live
+  let timer = null;
+
+  const emit = (h) => {
+    if (!stopped) onHeading(h);
+  };
+
+  const startRaw = async () => {
+    try {
+      const s = await tryMagnetometer(emit);
+      if (stopped) {
+        if (s) s();
+        return;
+      }
+      current = s;
+      if (!s) emit(null);
+    } catch (e) {
+      if (onError) onError(e);
+    }
+  };
+
   try {
-    magnetometerStop = await tryMagnetometer(onHeading);
+    let gotFused = false;
+    const s = await tryFusedHeading((h) => {
+      gotFused = true;
+      emit(h);
+    });
+    if (s) {
+      current = s;
+      timer = setTimeout(async () => {
+        if (stopped || gotFused) return;
+        s();
+        current = null;
+        await startRaw();
+      }, FUSED_TIMEOUT_MS);
+    }
   } catch (e) {
     if (onError) onError(e);
   }
 
-  if (magnetometerStop) {
-    _subscription = { remove: magnetometerStop };
-    return () => stop();
+  if (!current) await startRaw();
+
+  if (!current && !timer) {
+    // No sensor at all. Plan B (GPS) takes over in the caller.
+    _subscription = null;
+    return () => {};
   }
 
-  // No magnetometer. The caller will need to feed GPS-derived
-  // headings in manually — see headingFromMovement above.
-  // Report null so the caller knows there's no sensor.
-  if (onHeading) onHeading(null);
-  _subscription = null;
-  return () => {};
+  _subscription = {
+    remove: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      if (current) current();
+      current = null;
+    },
+  };
+  return () => stop();
 }
 
 export function stop() {
@@ -61784,6 +62134,7 @@ export async function hasMagnetometer() {
     return false;
   }
 }
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\haptics.js ---
 
@@ -61955,20 +62306,43 @@ export async function requestPermission() {
   return status === 'granted';
 }
 
-// Get the current position once, with a timeout.
+// How good a fix has to be before we stop waiting for a better one.
+// Tune these three numbers if the wait feels too long or the start point
+// too rough.
+const GOOD_ACCURACY_M = 20; // stop at once when a fix is this good
+const OK_ACCURACY_M = 40; // after SOFT_WAIT_MS, this is good enough
+const SOFT_WAIT_MS = 7000;
+
+// Get the current position once.
 //
-// Uses a short-lived watchPositionAsync instead of
-// getCurrentPositionAsync so we always get a real GPS fix, not the
-// OS's cached last-known position.
-export async function getPositionOnce({ timeoutMs = 15000 } = {}) {
+// The first fix a phone reports after its GPS wakes up is often a rough
+// one, 80-100 m off (it comes from Wi-Fi / mobile towers). A few seconds
+// later the GPS settles to 2-5 m. Taking the first fix, as this function
+// used to, meant routes started from a point up to 100 m away.
+//
+// Now it keeps listening and keeps the BEST fix (smallest accuracy
+// radius):
+//   - returns immediately once a fix is within GOOD_ACCURACY_M;
+//   - after SOFT_WAIT_MS, accepts a fix within OK_ACCURACY_M;
+//   - at timeoutMs, returns the best fix it saw (null if none).
+//
+// Uses watchPositionAsync rather than getCurrentPositionAsync so we get
+// live fixes, not the OS's cached last-known position.
+export async function getPositionOnce({
+  timeoutMs = 15000,
+  onProgress = null,
+} = {}) {
   return new Promise((resolve) => {
     let settled = false;
     let sub = null;
+    let best = null;
+    const startedAt = Date.now();
 
     const finish = (value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(softTimer);
       if (sub) {
         try {
           sub.remove();
@@ -61979,31 +62353,59 @@ export async function getPositionOnce({ timeoutMs = 15000 } = {}) {
       resolve(value);
     };
 
-    const timer = setTimeout(() => {
-      finish(null);
-    }, timeoutMs);
+    // Hard limit: give back the best we have.
+    const timer = setTimeout(() => finish(best), timeoutMs);
+
+    // Soft limit: an OK fix is enough once we have waited a while.
+    const softTimer = setTimeout(() => {
+      if (best && best.accuracyM != null && best.accuracyM <= OK_ACCURACY_M) {
+        finish(best);
+      }
+    }, SOFT_WAIT_MS);
 
     Location.watchPositionAsync(
       {
-        accuracy: Location.Accuracy.High,
+        accuracy: Location.Accuracy.BestForNavigation,
         distanceInterval: 0,
         // A small positive interval. Zero can behave oddly on some
         // Android versions.
         timeInterval: 500,
       },
       (loc) => {
-        // Take the first fix and stop.
-        finish({
+        const fix = {
           lat: loc.coords.latitude,
           lon: loc.coords.longitude,
           accuracyM: loc.coords.accuracy,
-        });
+        };
+        const acc = fix.accuracyM;
+        const better =
+          !best ||
+          (acc != null && (best.accuracyM == null || acc < best.accuracyM));
+        if (better) best = fix;
+
+        if (onProgress) {
+          try {
+            onProgress(best, Date.now() - startedAt);
+          } catch {
+            // The callback must never break location.
+          }
+        }
+
+        if (acc != null && acc <= GOOD_ACCURACY_M) {
+          finish(fix);
+        } else if (
+          Date.now() - startedAt >= SOFT_WAIT_MS &&
+          best.accuracyM != null &&
+          best.accuracyM <= OK_ACCURACY_M
+        ) {
+          finish(best);
+        }
       }
     )
       .then((s) => {
         sub = s;
-        // If the timeout fired before the subscription was attached,
-        // remove it now.
+        // If we finished before the subscription was attached, remove it
+        // now.
         if (settled) {
           try {
             s.remove();
@@ -62013,7 +62415,7 @@ export async function getPositionOnce({ timeoutMs = 15000 } = {}) {
         }
       })
       .catch(() => {
-        finish(null);
+        finish(best);
       });
   });
 }
@@ -62082,6 +62484,8 @@ export function stopWatching() {
     _subscription = null;
   }
 }
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\routeRequest.js ---
 
@@ -62799,6 +63203,35 @@ export function snapToRoute(point, routeGeometry, options = {}) {
   return { ...candidate, rejected: false };
 }
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\heading.js ---
+
+// Pure heading maths, kept apart from the sensors so it can be unit-tested.
+
+// Heading (0 = north, 90 = east) from a raw magnetometer reading, for a phone
+// held FLAT with its top edge pointing the way you face.
+//
+// Device axes: x points to the right edge, y to the top edge. With the top
+// edge pointing north, the magnetic field is along +y, so (x=0, y>0) must give
+// 0. Pointing east, north is to the phone's left, field along -x, so
+// (x<0, y=0) must give 90. That is atan2(-x, y).
+//
+// (The old code used atan2(y, x), which is 90 degrees off: it said "east"
+// while you faced north.)
+export function magneticHeadingFromXY(x, y) {
+  const deg = (Math.atan2(-x, y) * 180) / Math.PI;
+  return (deg + 360) % 360;
+}
+
+// Low-pass filter for a heading, correct across the 359 -> 0 wrap-around.
+export function smoothHeading(prev, next, factor = 0.25) {
+  if (prev === null || prev === undefined) return next;
+  let diff = next - prev;
+  if (diff > 180) diff -= 360;
+  if (diff < -180) diff += 360;
+  return (prev + diff * factor + 360) % 360;
+}
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\indoorRoute.js ---
 
 // Helpers for indoor routes.
@@ -63029,7 +63462,6 @@ import {
   searchPlaces,
   listPlaces,
   getPlace,
-  listAreas,
   computeRoute,
   narrateRoute,
   getHealth,
@@ -63122,14 +63554,6 @@ describe('URL construction', () => {
     expect(calledUrl).toContain('to_place_id=5');
     expect(calledUrl).toContain('lang=sw');
     expect(calledUrl).toContain('live=true');
-  });
-
-  test('listAreas with landmark_only sends the flag', async () => {
-    global.fetch.mockReturnValueOnce(mockJsonResponse([]));
-    await listAreas({ landmark_only: true });
-
-    const calledUrl = global.fetch.mock.calls[0][0];
-    expect(calledUrl).toContain('landmark_only=true');
   });
 
   test('getHealth hits the right path', async () => {
@@ -63430,6 +63854,38 @@ describe('snapToRoute', () => {
   });
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\heading.test.js ---
+
+import { magneticHeadingFromXY, smoothHeading } from '@/utils/heading';
+
+describe('magneticHeadingFromXY', () => {
+  test('top edge to north reads 0', () => {
+    expect(magneticHeadingFromXY(0, 30)).toBeCloseTo(0, 6);
+  });
+  test('top edge to east reads 90 (north is on the phone\'s left)', () => {
+    expect(magneticHeadingFromXY(-30, 0)).toBeCloseTo(90, 6);
+  });
+  test('top edge to south reads 180', () => {
+    expect(magneticHeadingFromXY(0, -30)).toBeCloseTo(180, 6);
+  });
+  test('top edge to west reads 270 (north is on the phone\'s right)', () => {
+    expect(magneticHeadingFromXY(30, 0)).toBeCloseTo(270, 6);
+  });
+});
+
+describe('smoothHeading', () => {
+  test('first value passes through', () => {
+    expect(smoothHeading(null, 123)).toBe(123);
+  });
+  test('moves part of the way', () => {
+    expect(smoothHeading(100, 120, 0.5)).toBeCloseTo(110, 6);
+  });
+  test('takes the short way round 359 -> 1', () => {
+    expect(smoothHeading(350, 10, 0.5)).toBeCloseTo(0, 6);
+  });
+});
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\i18n.test.js ---
 
 // Tests for the i18n helper.
@@ -63510,6 +63966,7 @@ import {
   progressFraction,
   OFF_ROUTE_THRESHOLD_M,
   OFF_ROUTE_CONSECUTIVE_FIXES,
+  OFF_ROUTE_WARMUP_FIXES,
 } from '@/utils/progress';
 
 const steps = [
@@ -63566,6 +64023,30 @@ describe('distanceToNextStep', () => {
   });
 });
 
+// Helpers ----------------------------------------------------------------
+//
+// The detector ignores the first OFF_ROUTE_WARMUP_FIXES fixes entirely
+// (to avoid firing during the noisy startup period of a walk), and
+// then requires OFF_ROUTE_CONSECUTIVE_FIXES consecutive off-route
+// fixes before it reports true. The tests below respect that.
+
+function feedOffRoute(detector, n) {
+  const above = OFF_ROUTE_THRESHOLD_M + 5;
+  let result = false;
+  for (let i = 0; i < n; i++) {
+    result = detector.record(above);
+  }
+  return result;
+}
+
+function feedOnRoute(detector, n) {
+  let result = false;
+  for (let i = 0; i < n; i++) {
+    result = detector.record(0);
+  }
+  return result;
+}
+
 describe('createOffRouteDetector', () => {
   test('not off-route when within threshold', () => {
     const d = createOffRouteDetector();
@@ -63574,41 +64055,48 @@ describe('createOffRouteDetector', () => {
     expect(d.record(5)).toBe(false);
   });
 
-  test('fires after three consecutive off-route fixes', () => {
+  test('does not fire during the warmup window', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(true);
+    // Even a long run of off-route fixes must not fire while we are
+    // still inside the warmup period.
+    expect(feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES)).toBe(false);
+  });
+
+  test('fires after the warmup plus the consecutive-fix requirement', () => {
+    const d = createOffRouteDetector();
+    // Consume the warmup (all ignored).
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
+    // Now the consecutive count starts. The last fix should fire.
+    expect(feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES)).toBe(true);
   });
 
   test('a single on-route fix resets the counter', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
-    d.record(above);
-    d.record(above);
-    d.record(0); // back on route
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(false);
-    expect(d.record(above)).toBe(true);
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
+    feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES - 1);
+    // One on-route fix.
+    d.record(0);
+    // We now need the full count again.
+    expect(feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES - 1)).toBe(false);
+    expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(true);
   });
 
   test('reset clears the counter', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
-    d.record(above);
-    d.record(above);
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
+    feedOffRoute(d, OFF_ROUTE_CONSECUTIVE_FIXES - 1);
     d.reset();
-    expect(d.record(above)).toBe(false);
+    // After reset, we start over, including the warmup.
+    expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(false);
   });
 
   test('consecutive-fix requirement matches the exported constant', () => {
     const d = createOffRouteDetector();
-    const above = OFF_ROUTE_THRESHOLD_M + 5;
+    feedOffRoute(d, OFF_ROUTE_WARMUP_FIXES);
     for (let i = 0; i < OFF_ROUTE_CONSECUTIVE_FIXES - 1; i++) {
-      expect(d.record(above)).toBe(false);
+      expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(false);
     }
-    expect(d.record(above)).toBe(true);
+    expect(d.record(OFF_ROUTE_THRESHOLD_M + 5)).toBe(true);
   });
 });
 
