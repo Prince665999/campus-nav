@@ -253,5 +253,22 @@
     "meet": "Kukutana",
     "toilet": "Vyoo",
     "prayer": "Kuomba"
+  },
+  "qr": {
+    "scanButton": "Changanua QR kuweka ulipo",
+    "title": "Changanua QR",
+    "hint": "Elekeza kamera kwenye msimbo wa QR ulio ukutani",
+    "cameraDenied": "Ruhusa ya kamera inahitajika kuchanganua msimbo wa QR.",
+    "grantPermission": "Ruhusu kamera",
+    "manualLabel": "Au andika msimbo ulioandikwa chini ya QR",
+    "manualPlaceholder": "Mfano: LIB-G-02",
+    "manualSubmit": "Tumia msimbo",
+    "finding": "Inatafuta ulipo…",
+    "errorUnknown": "Msimbo huu haujatambuliwa. Jaribu msimbo mwingine.",
+    "errorInvalid": "Hii si QR ya Campus Navigation.",
+    "errorNetwork": "Imeshindwa kufikia seva. Angalia mtandao wako na ujaribu tena.",
+    "notAvailable": "Kuchanganua kwa kamera hakupatikani kwenye toleo hili. Andika msimbo ulioandikwa chini ya QR.",
+    "scanAgain": "Changanua tena",
+    "goHome": "Nenda mwanzo"
   }
 }

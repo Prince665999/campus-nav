@@ -28,6 +28,7 @@ from .routers import (
     media,
     narrate,
     places,
+    qr,
     reports,
     route,
     timetable,
@@ -124,6 +125,7 @@ def create_app() -> FastAPI:
     # Public routers
     app.include_router(health.router)
     app.include_router(places.router)
+    app.include_router(qr.router)
     app.include_router(areas.router)
     app.include_router(indoor.router)          # ← new
     app.include_router(route.router)
@@ -191,3 +193,4 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+

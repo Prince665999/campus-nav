@@ -102,6 +102,14 @@ export async function getPlace(id) {
 }
 
 /**
+ * The place a QR code stands for (a spot on a corridor). Throws if the code
+ * is unknown. Used by services/qr.js.
+ */
+export async function getPlaceByQr(code) {
+  return request(`/api/qr/${encodeURIComponent(code)}`);
+}
+
+/**
  * Category and intent counts, for hiding empty chips.
  * Returns { categories: {...}, intents: {...} }.
  */
@@ -370,3 +378,4 @@ export async function listIndoorDoors({ buildingName } = {}) {
 export async function getHealth() {
   return request('/api/health');
 }
+

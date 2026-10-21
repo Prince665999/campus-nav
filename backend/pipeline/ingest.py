@@ -21,6 +21,7 @@ Uses campus_graph.py for parsing and graph building. Never edits the
 frozen file.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -213,6 +214,14 @@ def _is_entrance(tags):
     return bool(tags.get("entrance"))
 
 
+# A QR point is a plain node on a corridor with a `qr=<code>` tag. It becomes
+# a Place so a student who scans the printed code can start a route from it.
+# Codes are letters, digits, "-" and "_" only, at most 32 characters, so they
+# fit in a URL and can't be confused when typed by hand.
+_QR_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+QR_CATEGORY = "qr"
+
+
 def ingest_indoor_places(nodes, ways, session):
     """
     Write one Place row per door node, one Place row per entrance
@@ -275,6 +284,67 @@ def ingest_indoor_places(nodes, ways, session):
         existing.description_ai = tags.get("description") or existing.description_ai
 
         places_written += 1
+
+    # ---- Places: one per QR point ----
+    # A QR point is NOT a door and NOT a room. It is a spot on a corridor.
+    # It is stored as an indoor place with category "qr", so routing treats it
+    # like any indoor start, while the search screens hide it (they skip
+    # category "qr" — see place_service).
+    qr_written = 0
+    seen_codes: dict[str, str] = {}
+    for nid, node in nodes.items():
+        tags = node["tags"]
+        raw_code = (tags.get("qr") or "").strip()
+        if not raw_code:
+            continue
+
+        if not _QR_CODE_RE.match(raw_code):
+            print(f"  WARNING: node {nid} has an invalid qr code {raw_code!r} "
+                  f"(use letters, digits, - and _ only, max 32). Skipped.")
+            continue
+
+        if nid in door_node_ids or nid in entrance_node_ids:
+            print(f"  WARNING: node {nid} has qr={raw_code} but is also a "
+                  f"door or entrance. Put the QR code on a plain corridor "
+                  f"node instead. Skipped.")
+            continue
+
+        key = raw_code.lower()
+        if key in seen_codes:
+            print(f"  WARNING: qr code {raw_code!r} is used by nodes "
+                  f"{seen_codes[key]} and {nid}. Codes must be unique. "
+                  f"The second one is skipped.")
+            continue
+        seen_codes[key] = nid
+
+        name = (tags.get("name") or tags.get("loc_name") or "").strip()
+        if not name:
+            name = f"corridor point {raw_code}"
+
+        level = tags.get("level")
+        if level is not None:
+            level = str(level).split(";")[0]
+
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
+        existing = session.query(Place).filter_by(osm_id=nid).one_or_none()
+        if existing is None:
+            existing = Place(osm_type="node", osm_id=nid, kind="indoor")
+            session.add(existing)
+
+        existing.name = name
+        existing.lat = node["lat"]
+        existing.lon = node["lon"]
+        existing.kind = "indoor"
+        existing.category = QR_CATEGORY
+        existing.building_name = building_name
+        existing.level = level
+        existing.ref = raw_code
+        existing.description_ai = tags.get("description") or existing.description_ai
+
+        qr_written += 1
 
     # ---- Places: one per entrance node ----
     entrances_written = 0
@@ -429,6 +499,7 @@ def ingest_indoor_places(nodes, ways, session):
     return {
         "places": places_written,
         "entrances": entrances_written,
+        "qr_points": qr_written,
         "areas": areas_written,
         "edges": edges_written,
     }
@@ -482,6 +553,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         if not indoor_osm_path.exists():
             print(f"  indoor map not found at {indoor_osm_path} — skipping")
             n_indoor_places = n_entrances = n_indoor_areas = n_indoor_edges = 0
+            n_qr = 0
         else:
             indoor_nodes, indoor_ways = parse_osm(str(indoor_osm_path))
             counts = ingest_indoor_places(indoor_nodes, indoor_ways, session)
@@ -489,8 +561,10 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
             n_entrances = counts["entrances"]
             n_indoor_areas = counts["areas"]
             n_indoor_edges = counts["edges"]
+            n_qr = counts["qr_points"]
             print(f"  indoor door places: {n_indoor_places}")
             print(f"  indoor entrances: {n_entrances}")
+            print(f"  QR points: {n_qr}")
             print(f"  indoor rooms + corridors + floor outlines: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
@@ -503,6 +577,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         "entrances": n_entrances,
         "indoor_areas": n_indoor_areas,
         "indoor_edges": n_indoor_edges,
+        "qr_points": n_qr,
     }
 
 

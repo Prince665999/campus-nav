@@ -140,6 +140,14 @@ def search_places(
             )
         )
 
+    # QR points (category "qr") are spots on corridors, used only to start a
+    # route after scanning a printed code. They are not places a student
+    # searches for, so every search hides them unless "qr" is asked for.
+    if not category or category.strip().lower() != "qr":
+        query = query.filter(
+            func.lower(func.trim(func.coalesce(Place.category, ""))) != "qr"
+        )
+
     if category:
         # Case-insensitive, trimmed compare. The category stored in
         # the DB may have mixed case or stray whitespace; the chip
@@ -263,9 +271,11 @@ def list_building_counts(session: Session) -> dict[str, int]:
             func.count(Place.id),
         )
         .filter(Place.kind == "indoor")
+        .filter(func.lower(func.trim(func.coalesce(Place.category, ""))) != "qr")
         .filter(Place.building_name.isnot(None))
         .filter(func.trim(Place.building_name) != "")
         .group_by(Place.building_name)
         .all()
     )
     return {name: n for name, n in rows}
+

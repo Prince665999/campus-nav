@@ -115,7 +115,7 @@
     "titleDoc": "Campus Chat",
     "greetingGeneral": "Hi! Ask me where you want to go — try \"take me to the library\".",
     "greetingWalk": "Ask me anything about this walk. I can tell you what's around and what's coming up.",
-    "greetingDoc": "Hi! Ask me about the university — its rules, almanac, courses, events, or anything else.",
+    "greetingDoc": "Hi! Ask me about the university — its rules, history, opening hours, or anything else.",
     "placeholder": "Ask something…",
     "placeholderWalk": "Ask about this walk…",
     "placeholderDoc": "Ask about the university…",
@@ -253,5 +253,22 @@
     "meet": "Meet up",
     "toilet": "Toilets",
     "prayer": "Prayer"
+  },
+  "qr": {
+    "scanButton": "Scan QR code to set my location",
+    "title": "Scan QR code",
+    "hint": "Point the camera at the QR code on the wall",
+    "cameraDenied": "Camera permission is needed to scan a QR code.",
+    "grantPermission": "Allow camera",
+    "manualLabel": "Or type the code printed under the QR code",
+    "manualPlaceholder": "For example: LIB-G-02",
+    "manualSubmit": "Use code",
+    "finding": "Finding where you are…",
+    "errorUnknown": "This code isn't recognised. Try another code.",
+    "errorInvalid": "This isn't a Campus Navigation QR code.",
+    "errorNetwork": "Couldn't reach the server. Check your connection and try again.",
+    "notAvailable": "Camera scanning isn't available in this version of the app. Type the code printed under the QR code instead.",
+    "scanAgain": "Scan again",
+    "goHome": "Go to home"
   }
 }

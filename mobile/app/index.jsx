@@ -446,6 +446,20 @@ export default function HomeScreen() {
 
         <FromChip start={start} onPress={openStartSheet} />
 
+        <TouchableOpacity
+          style={styles.scanButton}
+          onPress={() => router.push('/scan')}
+          accessibilityRole="button"
+          accessibilityLabel={t('qr.scanButton')}
+        >
+          <MaterialIcons
+            name="qr-code-scanner"
+            size={20}
+            color={COLORS.primary}
+          />
+          <Text style={styles.scanButtonText}>{t('qr.scanButton')}</Text>
+        </TouchableOpacity>
+
         {nextClass ? (
           <NextClassBanner
             entry={nextClass.entry}
@@ -561,6 +575,25 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
+  scanButton: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: SPACING.md,
+    marginBottom: SPACING.sm,
+    paddingHorizontal: 14,
+    minHeight: TOUCH.minHeight - 8,
+    borderRadius: 24,
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
+    backgroundColor: COLORS.background,
+  },
+  scanButtonText: {
+    marginLeft: 8,
+    color: COLORS.primary,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+  },
   container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
   scroll: { flex: 1 },
   scrollContent: { paddingBottom: SPACING.xl },

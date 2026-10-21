@@ -33,7 +33,13 @@
     },
     "plugins": [
       "expo-router",
-      "@maplibre/maplibre-react-native"
+      "@maplibre/maplibre-react-native",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Campus Navigation uses the camera to scan QR codes that show where you are inside a building."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": false
