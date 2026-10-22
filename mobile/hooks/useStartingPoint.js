@@ -88,7 +88,7 @@ export function useStartingPoint() {
   // list — you can't start from where you're going.
   const loadOutdoorPlaces = useCallback(async ({ excludePlaceId } = {}) => {
     try {
-      const places = await listPlaces({ kind: 'outdoor', limit: 100 });
+      const places = await listPlaces({ kind: 'outdoor', limit: 2000 });
       const filtered =
         excludePlaceId != null
           ? places.filter((p) => p.id !== excludePlaceId)
@@ -221,7 +221,7 @@ export function useStartingPoint() {
       setLastError('no_fix');
       setState('needPick');
       try {
-        const places = await listPlaces({ kind: 'outdoor', limit: 100 });
+        const places = await listPlaces({ kind: 'outdoor', limit: 2000 });
         const filtered =
           destinationPlaceId != null
             ? places.filter((p) => p.id !== destinationPlaceId)
@@ -294,3 +294,4 @@ async function checkSuspicious(fix) {
 
   return null;
 }
+

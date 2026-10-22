@@ -69,6 +69,9 @@ import {
   INDOOR_INTERIOR_COLOR,
   INDOOR_BUILDING_OUTLINE_COLOR,
   INDOOR_BUILDING_OUTLINE_WIDTH,
+  INDOOR_STAIRS_COLOR,
+  INDOOR_STAIRS_OUTLINE_COLOR,
+  INDOOR_HEADING_SNAP_DEG,
 } from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
@@ -97,9 +100,14 @@ const FILL_COLOR_EXPR = [
 // Below it, GPS noise would dominate, so we fall back to 0.
 const MIN_HEADING_DISTANCE_M = 3;
 
-// Walking screen: the only four headings the map will use. No
-// intermediate angles — the building stays square to the screen.
-const CARDINALS = [0, 90, 180, 270];
+// Walking screen: the map turns so the corridor you are about to walk
+// points up the screen, but only in steps of INDOOR_HEADING_SNAP_DEG, so a
+// small bend in a corridor does not keep turning the map.
+//   90   -> N, E, S, W only (the original behaviour)
+//   45   -> also NE, SE, SW, NW (default)
+//   22.5 -> 16 directions, for buildings that sit at odd angles
+//   0    -> no snapping: the exact direction of the corridor
+// Set it in constants/config.js.
 
 function levelLabel(level) {
   if (level === '-1') return 'B';
@@ -107,20 +115,13 @@ function levelLabel(level) {
   return level;
 }
 
-// Snap a bearing to the nearest of N / E / S / W.
+// Snap a bearing to the nearest multiple of INDOOR_HEADING_SNAP_DEG.
 function snapToCardinal(bearing) {
   if (bearing == null || !Number.isFinite(bearing)) return 0;
   const h = ((bearing % 360) + 360) % 360;
-  let best = 0;
-  let bestDiff = Infinity;
-  for (const c of CARDINALS) {
-    const diff = Math.abs(((h - c + 540) % 360) - 180);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = c;
-    }
-  }
-  return best;
+  const step = INDOOR_HEADING_SNAP_DEG;
+  if (!step || step <= 0) return h; // no snapping
+  return (Math.round(h / step) * step) % 360;
 }
 
 // Snap a bearing to N or S only. Used by the preview.
@@ -132,12 +133,10 @@ function snapToNorthSouth(bearing) {
 
 // Which compass letter is at the top of the screen for a given
 // heading.
+const WIND_LETTERS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
 function topLetter(heading) {
   const h = ((heading % 360) + 360) % 360;
-  if (h >= 315 || h < 45) return 'N';
-  if (h < 135) return 'E';
-  if (h < 225) return 'S';
-  return 'W';
+  return WIND_LETTERS[Math.round(h / 45) % 8];
 }
 
 function firstLegBearing(points) {
@@ -292,6 +291,19 @@ export function IndoorMapView({
     const features = [];
     for (const area of areas) {
       if (area.type !== 'corridor') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Stairs: polygons tagged indoor=stairs. Drawn in their own colour.
+  const stairsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'stairs') continue;
       const ring = _closedRing(area.boundary);
       if (!ring) continue;
       features.push(_polygonFeature(area, ring));
@@ -651,6 +663,22 @@ export function IndoorMapView({
             <LineLayer
               id="corridorsOutline"
               style={{ lineColor: '#cbd5e1', lineWidth: 0.5 }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {stairsGeoJSON && stairsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="stairsSource" shape={stairsGeoJSON}>
+            <FillLayer
+              id="stairsFill"
+              style={{ fillColor: INDOOR_STAIRS_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="stairsOutline"
+              style={{
+                lineColor: INDOOR_STAIRS_OUTLINE_COLOR,
+                lineWidth: 1.25,
+              }}
             />
           </ShapeSource>
         ) : null}

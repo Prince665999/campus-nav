@@ -96,7 +96,8 @@
     "indoorsBodyNoName": "Fuata hatua hapa chini kufikia unakoenda. Gusa Endelea baada ya kila hatua.",
     "indoorsBadge": "Ndani — hakuna GPS",
     "nextStepButton": "Endelea",
-    "arrivedButton": "Nimefika"
+    "arrivedButton": "Nimefika",
+    "previousStepButton": "Nyuma"
   },
   "arrival": {
     "title": "Kufika",
@@ -270,5 +271,21 @@
     "notAvailable": "Kuchanganua kwa kamera hakupatikani kwenye toleo hili. Andika msimbo ulioandikwa chini ya QR.",
     "scanAgain": "Changanua tena",
     "goHome": "Nenda mwanzo"
+  },
+  "level": {
+    "basement": "Chini ya ardhi",
+    "basementN": "Chini ya ardhi {n}",
+    "ground": "Ghorofa ya chini",
+    "first": "Ghorofa ya kwanza",
+    "second": "Ghorofa ya pili",
+    "third": "Ghorofa ya tatu",
+    "fourth": "Ghorofa ya nne",
+    "fifth": "Ghorofa ya tano",
+    "sixth": "Ghorofa ya sita",
+    "seventh": "Ghorofa ya saba",
+    "eighth": "Ghorofa ya nane",
+    "ninth": "Ghorofa ya tisa",
+    "tenth": "Ghorofa ya kumi",
+    "number": "Ghorofa ya {n}"
   }
 }

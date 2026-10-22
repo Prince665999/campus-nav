@@ -96,7 +96,8 @@
     "indoorsBodyNoName": "Follow the steps below to reach the destination. Tap Next step after each one.",
     "indoorsBadge": "Indoor — no GPS",
     "nextStepButton": "Next step",
-    "arrivedButton": "I've arrived"
+    "arrivedButton": "I've arrived",
+    "previousStepButton": "Previous"
   },
   "arrival": {
     "title": "Arrival",
@@ -270,5 +271,21 @@
     "notAvailable": "Camera scanning isn't available in this version of the app. Type the code printed under the QR code instead.",
     "scanAgain": "Scan again",
     "goHome": "Go to home"
+  },
+  "level": {
+    "basement": "Basement",
+    "basementN": "Basement {n}",
+    "ground": "Ground floor",
+    "first": "First floor",
+    "second": "Second floor",
+    "third": "Third floor",
+    "fourth": "Fourth floor",
+    "fifth": "Fifth floor",
+    "sixth": "Sixth floor",
+    "seventh": "Seventh floor",
+    "eighth": "Eighth floor",
+    "ninth": "Ninth floor",
+    "tenth": "Tenth floor",
+    "number": "Floor {n}"
   }
 }

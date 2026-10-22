@@ -31,6 +31,8 @@ export function InstructionCard({
   gpsStale = false,
   mode = 'outdoor',
   onAdvanceStep = null,
+  onPreviousStep = null,
+  canGoBack = false,
   isLastStep = false,
 }) {
   const insets = useSafeAreaInsets();
@@ -120,6 +122,28 @@ export function InstructionCard({
 
       {isIndoor && onAdvanceStep ? (
         <View style={styles.advanceRow}>
+          {/* Previous takes a quarter of the row, Next three quarters. */}
+          {onPreviousStep ? (
+            <TouchableOpacity
+              style={[
+                styles.previousButton,
+                !canGoBack && styles.previousButtonDisabled,
+              ]}
+              onPress={onPreviousStep}
+              disabled={!canGoBack}
+              accessibilityRole="button"
+              accessibilityLabel={t('walking.previousStepButton')}
+              accessibilityState={{ disabled: !canGoBack }}
+            >
+              <Text
+                style={styles.previousButtonText}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+              >
+                {t('walking.previousStepButton')}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
           <TouchableOpacity
             style={[
               styles.advanceButton,
@@ -221,8 +245,30 @@ const styles = StyleSheet.create({
   advanceRow: {
     paddingHorizontal: SPACING.lg,
     paddingTop: SPACING.md,
+    flexDirection: 'row',
+    gap: SPACING.sm,
+  },
+  previousButton: {
+    flex: 1,
+    backgroundColor: COLORS.primaryTint,
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
+    borderRadius: RADIUS.md,
+    paddingHorizontal: 4,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  previousButtonDisabled: {
+    opacity: 0.4,
+  },
+  previousButtonText: {
+    color: COLORS.primaryDark,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
   },
   advanceButton: {
+    flex: 3,
     backgroundColor: COLORS.primaryDark,
     borderRadius: RADIUS.md,
     paddingVertical: 14,
@@ -239,3 +285,4 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 });
+

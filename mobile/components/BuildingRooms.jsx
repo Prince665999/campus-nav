@@ -22,6 +22,8 @@ import { MaterialIcons } from '@expo/vector-icons';
 
 import { listPlaces } from '@/services/api';
 import { t } from '@/i18n';
+import { levelLabel } from '@/utils/levelLabel';
+import { formatPlaceName, searchableText } from '@/utils/placeLabel';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 const SEARCH_THRESHOLD = 10;
@@ -45,7 +47,7 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
     listPlaces({
       kind: 'indoor',
       building_name: buildingName,
-      limit: 200,
+      limit: 2000,
     })
       .then((data) => {
         if (!cancelled) setRooms(Array.isArray(data) ? data : []);
@@ -69,10 +71,7 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
     if (!rooms) return [];
     const q = search.trim().toLowerCase();
     if (!q) return rooms;
-    return rooms.filter((r) => {
-      const haystack = [r.name || '', r.ref || ''].join(' ').toLowerCase();
-      return haystack.includes(q);
-    });
+    return rooms.filter((r) => searchableText(r).includes(q));
   }, [rooms, search]);
 
   const grouped = useMemo(() => groupByLevel(filtered), [filtered]);
@@ -129,10 +128,10 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
                     style={styles.roomRow}
                     onPress={() => onOpenRoom(room)}
                     accessibilityRole="button"
-                    accessibilityLabel={room.name}
+                    accessibilityLabel={formatPlaceName(room)}
                   >
-                    <Text style={styles.roomName} numberOfLines={1}>
-                      {room.name}
+                    <Text style={styles.roomName} numberOfLines={2}>
+                      {formatPlaceName(room)}
                     </Text>
                     <MaterialIcons
                       name="chevron-right"
@@ -179,15 +178,6 @@ function levelSortKey(level) {
   const n = Number(level);
   if (Number.isFinite(n)) return n;
   return 999;
-}
-
-function levelLabel(level) {
-  if (level === '-1') return 'Basement';
-  if (level === '0') return 'Ground floor';
-  if (level === '1') return 'First floor';
-  if (level === '2') return 'Second floor';
-  if (level === '3') return 'Third floor';
-  return `Level ${level}`;
 }
 
 const styles = StyleSheet.create({
@@ -260,3 +250,4 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 });
+

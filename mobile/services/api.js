@@ -356,7 +356,7 @@ export async function getIndoorAreas({ buildingName, level }) {
 // ---------------------------------------------------------------
 
 export async function listEntrances() {
-  return listPlaces({ kind: 'entrance', limit: 200 });
+  return listPlaces({ kind: 'entrance', limit: 2000 });
 }
 
 // ---------------------------------------------------------------
@@ -367,7 +367,7 @@ export async function listIndoorDoors({ buildingName } = {}) {
   return listPlaces({
     kind: 'indoor',
     building_name: buildingName || undefined,
-    limit: 200,
+    limit: 2000,
   });
 }
 

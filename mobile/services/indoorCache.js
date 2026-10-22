@@ -11,12 +11,12 @@
 // Every entry has a `cachedAt` timestamp. On read, entries older
 // than the TTL are discarded and refetched.
 //
-// Key format: indoor-cache-v1:<building>:<level>
+// Key format: indoor-cache-v3:<building>:<level>
 // Bumping the version prefix invalidates every old entry.
 
 import { getJSON, setJSON } from '@/services/storage';
 
-const KEY_PREFIX = 'indoor-cache-v1';
+const KEY_PREFIX = 'indoor-cache-v3';
 const TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 const _memory = new Map();
@@ -77,6 +77,7 @@ export async function clearIndoorCache() {
   // AsyncStorage doesn't have a "delete by prefix" call. To clear
   // everything we'd have to know the keys. Since we don't currently
   // expose a clear button, leave it as a stub. The version prefix
-  // (indoor-cache-v1) is the real invalidation tool: bump to v2 and
+  // (indoor-cache-v3) is the real invalidation tool: bump the version and
   // every old key becomes unreachable.
 }
+

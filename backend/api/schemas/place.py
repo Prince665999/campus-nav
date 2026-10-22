@@ -17,6 +17,8 @@ class PlaceSummary(BaseModel):
     id: int
     name: str
     name_sw: str | None = None
+    # Alternative names, as typed in the alt_name tag (separated by ;).
+    alt_names: str | None = None
     category: str | None = None
     category_icon_key: str | None = None
     intents: str | None = None
@@ -67,4 +69,5 @@ class PlaceListParams(BaseModel):
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)
-    limit: int = Field(50, gt=0, le=200)
+    limit: int = Field(50, gt=0, le=2000)
+

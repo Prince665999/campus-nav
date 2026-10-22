@@ -1,7 +1,7 @@
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.43.204:8000';
+const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -95,7 +95,24 @@ export const CAMERA_MIN_INTERVAL_MS = 700;
 export const CAMERA_MIN_MOVE_M = 1.5;
 export const CAMERA_MIN_HEADING_DEG = 10;
 
+
+// Indoor floor plan colours - used in components/IndoorMapView.jsx
+//
+// Background = outside the building (same as the home screen).
+// Interior   = floor space inside the building outline (indoor=level polygon)
+//              that is neither a room nor a corridor.
+// Stairs     = stairwell polygons (indoor=stairs).
 export const INDOOR_BACKGROUND_COLOR = "#f1f5f9";
 export const INDOOR_INTERIOR_COLOR = "#fdf3d7";
 export const INDOOR_BUILDING_OUTLINE_COLOR = "#334155";
 export const INDOOR_BUILDING_OUTLINE_WIDTH = 2.5;
+export const INDOOR_STAIRS_COLOR = "#f9c97a";
+export const INDOOR_STAIRS_OUTLINE_COLOR = "#b45309";
+
+// How far the indoor map turns, in degrees, while you walk. The map turns so
+// the corridor ahead points up the screen, in steps of this size.
+//   90   N, E, S, W only (the old behaviour)
+//   45   also NE, SE, SW, NW   <- default
+//   22.5 16 directions: for buildings built at an odd angle
+//   0    exact direction, no snapping (the map follows every bend)
+export const INDOOR_HEADING_SNAP_DEG = 45;

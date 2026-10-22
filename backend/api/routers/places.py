@@ -84,7 +84,7 @@ def search_places(
     q: str = Query(..., min_length=1),
     kind: str | None = Query(None),
     building_name: str | None = Query(None),
-    limit: int = Query(20, gt=0, le=2000),
+    limit: int = Query(20, gt=0, le=100),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
@@ -172,3 +172,4 @@ def get_place(place_id: int, session: Session = Depends(db_session)):
     if detail is None:
         raise NotFoundError(f"Place {place_id} not found")
     return detail
+

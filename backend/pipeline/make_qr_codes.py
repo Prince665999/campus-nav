@@ -37,6 +37,27 @@ CARD_W, CARD_H = 1100, 1500
 PAGE_W, PAGE_H = 2480, 3508  # A4 at 300 dpi
 
 
+_ORDINALS = ["Ground floor", "First floor", "Second floor", "Third floor",
+             "Fourth floor", "Fifth floor", "Sixth floor", "Seventh floor",
+             "Eighth floor", "Ninth floor", "Tenth floor"]
+
+
+def level_label(level):
+    """"0" -> "Ground floor", "1" -> "First floor", "-1" -> "Basement"."""
+    text = str(level if level is not None else "0").split(";")[0].strip()
+    try:
+        n = int(text)
+    except ValueError:
+        return text  # something like "M": print it as typed
+    if n == -1:
+        return "Basement"
+    if n < -1:
+        return f"Basement {-n}"
+    if n < len(_ORDINALS):
+        return _ORDINALS[n]
+    return f"Floor {n}"
+
+
 def read_qr_nodes(osm_path):
     """Return [{code, name, building, level, node_id}] for tagged nodes."""
     tree = ET.parse(str(osm_path))
@@ -145,7 +166,7 @@ def make_card(node, payload):
     for line in _wrap(draw, node["name"] or "", name_font, CARD_W - 160)[:2]:
         _centered(draw, line, y, name_font, "#222222", CARD_W)
         y += 64
-    where = ", ".join(x for x in [node["building"], f"Level {node['level']}"] if x)
+    where = ", ".join(x for x in [node["building"], level_label(node["level"])] if x)
     _centered(draw, where, y + 10, _font(42), "#555555", CARD_W)
     return card
 

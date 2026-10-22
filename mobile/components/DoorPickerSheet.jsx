@@ -27,6 +27,7 @@ import { MaterialIcons } from '@expo/vector-icons';
 
 import { listIndoorDoors } from '@/services/api';
 import { t } from '@/i18n';
+import { formatPlaceName, placeLocationLine, searchableText } from '@/utils/placeLabel';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 export function DoorPickerSheet({
@@ -69,12 +70,7 @@ export function DoorPickerSheet({
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return doors;
-    return doors.filter((d) => {
-      const haystack = [d.name || '', d.room_name || '', d.building_name || '']
-        .join(' ')
-        .toLowerCase();
-      return haystack.includes(q);
-    });
+    return doors.filter((d) => searchableText(d).includes(q));
   }, [doors, search]);
 
   const handlePick = useCallback(
@@ -143,16 +139,14 @@ export function DoorPickerSheet({
                 style={styles.row}
                 onPress={() => handlePick(item)}
                 accessibilityRole="button"
-                accessibilityLabel={item.name}
+                accessibilityLabel={formatPlaceName(item)}
               >
                 <View style={styles.rowText}>
-                  <Text style={styles.rowName} numberOfLines={1}>
-                    {item.name}
+                  <Text style={styles.rowName} numberOfLines={2}>
+                    {formatPlaceName(item)}
                   </Text>
                   <Text style={styles.rowSubtitle} numberOfLines={1}>
-                    {[item.building_name, item.level != null ? `Level ${item.level}` : null]
-                      .filter(Boolean)
-                      .join(' · ')}
+                    {placeLocationLine(item)}
                   </Text>
                 </View>
               </TouchableOpacity>
@@ -233,3 +227,4 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 });
+

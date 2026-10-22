@@ -19,7 +19,7 @@ Filters
 
 import math
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, case
 from sqlalchemy.orm import Session
 
 from ..models.media import Media
@@ -68,6 +68,7 @@ def _to_summary(session, place: Place) -> PlaceSummary:
         id=place.id,
         name=place.name,
         name_sw=place.name_sw,
+        alt_names=place.alt_names,
         category=place.category,
         category_icon_key=_icon_key_for_category(place.category),
         intents=place.intents,
@@ -181,6 +182,28 @@ def search_places(
         query = query.filter(
             Place.lat.between(lat - dlat, lat + dlat),
             Place.lon.between(lon - dlon, lon + dlon),
+        )
+
+    # ORDER BEFORE LIMIT. Without an ORDER BY the database returns rows in
+    # the order they were stored, so LIMIT kept the oldest places and cut
+    # the newest: rooms added and re-ingested later vanished from the door
+    # picker once a list passed the limit. Order so the limit keeps the
+    # rows that matter, and the result is the same every time.
+    if lat is not None and lon is not None:
+        # Nearest first (flat-earth distance is fine at campus scale).
+        cos_lat = max(math.cos(math.radians(lat)), 0.01)
+        d_lat = Place.lat - lat
+        d_lon = (Place.lon - lon) * cos_lat
+        query = query.order_by(d_lat * d_lat + d_lon * d_lon, Place.id)
+    elif q:
+        # Names that START with what was typed come first.
+        starts = case((func.lower(Place.name).like(f"{q.lower()}%"), 0), else_=1)
+        query = query.order_by(starts, func.lower(Place.name), Place.id)
+    else:
+        query = query.order_by(
+            func.lower(func.coalesce(Place.building_name, "")),
+            func.lower(Place.name),
+            Place.id,
         )
 
     rows = query.limit(limit).all()

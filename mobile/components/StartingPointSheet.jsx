@@ -21,6 +21,7 @@ import { MaterialIcons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { t } from '@/i18n';
+import { formatPlaceName } from '@/utils/placeLabel';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 export function StartingPointSheet({
@@ -111,7 +112,7 @@ export function StartingPointSheet({
                   style={styles.row}
                   onPress={() => onChoose(item)}
                   accessibilityRole="button"
-                  accessibilityLabel={item.name}
+                  accessibilityLabel={formatPlaceName(item)}
                 >
                   <MaterialIcons
                     name="place"
@@ -120,7 +121,7 @@ export function StartingPointSheet({
                     style={styles.rowIcon}
                   />
                   <View style={styles.rowText}>
-                    <Text style={styles.rowName}>{item.name}</Text>
+                    <Text style={styles.rowName}>{formatPlaceName(item)}</Text>
                     {item.name_sw ? (
                       <Text style={styles.rowNameSw}>{item.name_sw}</Text>
                     ) : null}
@@ -231,3 +232,4 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 });
+

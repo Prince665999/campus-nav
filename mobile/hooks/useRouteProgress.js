@@ -110,6 +110,22 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     });
   }, [currentStep.index, steps.length]);
 
+  // Go back one INDOOR step. Not allowed past the first step, or into an
+  // outdoor step (outdoors the route follows GPS, not the buttons).
+  const canGoBack =
+    currentStep.mode === 'indoor' &&
+    currentStep.index > 0 &&
+    steps[currentStep.index - 1]?.mode === 'indoor';
+
+  const previousStep = useCallback(() => {
+    setManualStepIndex((prev) => {
+      const from = prev === null ? currentStep.index : prev;
+      if (from <= 0) return from;
+      if (steps[from - 1]?.mode !== 'indoor') return from;
+      return from - 1;
+    });
+  }, [currentStep.index, steps]);
+
   const distanceRemainingM =
     currentStep.mode === 'indoor' ? 0 : outdoor.distanceRemainingM;
   const distanceToNextStepM =
@@ -193,6 +209,8 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     gpsStale: currentStep.mode === 'indoor' ? false : outdoor.gpsStale,
     resetOffRoute: outdoor.resetOffRoute,
     advanceStep,
+    previousStep,
+    canGoBack,
     isLastStep: currentStep.index >= steps.length - 1,
     indoorLevel,
     indoorBuildingName,

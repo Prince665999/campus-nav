@@ -136,6 +136,8 @@ export default function WalkingScreen() {
     gpsStale,
     mode,
     advanceStep,
+    previousStep,
+    canGoBack,
     isLastStep,
     indoorLevel,
     indoorBuildingName,
@@ -512,6 +514,8 @@ export default function WalkingScreen() {
             gpsStale={gpsStale}
             mode={mode}
             onAdvanceStep={handleAdvanceStep}
+            onPreviousStep={previousStep}
+            canGoBack={canGoBack}
             isLastStep={isLastStep}
           />
         </View>

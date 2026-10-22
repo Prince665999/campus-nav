@@ -203,7 +203,13 @@ _INDOOR_STAIRS_HIGHWAY = "steps"
 # building on each floor and tag it indoor=level, level=<n>, building_name=<name>).
 # The phone fills it with the interior colour and draws its outline; it is
 # never a room, so it is not searchable and gets no label.
-_INDOOR_POLYGON_TYPES = {"room", "corridor", "level"}
+#
+# "stairs" is a stairwell, drawn in its own colour. Tag a closed way
+# indoor=stairs, level=<n> (or level=0;1 for a stair that serves two floors;
+# it is then drawn on both), building_name=<name>. Like "level" it is never
+# a room: not searchable, no label. (The walkable stair LINE used for routing
+# is separate: highway=steps.)
+_INDOOR_POLYGON_TYPES = {"room", "corridor", "level", "stairs"}
 
 
 def _is_door(tags):
@@ -249,6 +255,7 @@ def ingest_indoor_places(nodes, ways, session):
                 rooms_of_door.setdefault(ref, []).append(rname)
 
     places_written = 0
+    door_places: dict[str, Place] = {}  # kept so polygons can reach their door
     for nid in door_node_ids:
         node = nodes[nid]
         tags = node["tags"]
@@ -282,7 +289,13 @@ def ingest_indoor_places(nodes, ways, session):
         existing.room_name = room_name
         existing.ref = tags.get("ref") or existing.ref
         existing.description_ai = tags.get("description") or existing.description_ai
+        # Alternative names, e.g. alt_name=Lab A;Computer lab. Shown in brackets
+        # after the room name in the app. Only set when the tag is present,
+        # so a value edited in the admin page is not wiped.
+        if (tags.get("alt_name") or "").strip():
+            existing.alt_names = tags["alt_name"].strip()
 
+        door_places[nid] = existing
         places_written += 1
 
     # ---- Places: one per QR point ----
@@ -384,10 +397,15 @@ def ingest_indoor_places(nodes, ways, session):
         existing.level = level
         existing.ref = tags.get("ref") or existing.ref
         existing.description_ai = tags.get("description") or existing.description_ai
+        # Alternative names, e.g. alt_name=Lab A;Computer lab. Shown in brackets
+        # after the room name in the app. Only set when the tag is present,
+        # so a value edited in the admin page is not wiped.
+        if (tags.get("alt_name") or "").strip():
+            existing.alt_names = tags["alt_name"].strip()
 
         entrances_written += 1
 
-    # ---- Indoor areas: rooms and corridors ----
+    # ---- Indoor areas: rooms, corridors, floor outlines and stairs ----
     areas_written = 0
     for way in ways:
         tags = way["tags"]
@@ -397,9 +415,11 @@ def ingest_indoor_places(nodes, ways, session):
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
         if not rname:
-            rname = {"corridor": "corridor", "level": "floor outline"}.get(
-                polygon_type, "unnamed"
-            )
+            rname = {
+                "corridor": "corridor",
+                "level": "floor outline",
+                "stairs": "stairs",
+            }.get(polygon_type, "unnamed")
 
         refs = [r for r in way["refs"] if r in nodes]
         if len(refs) < 3:
@@ -416,9 +436,16 @@ def ingest_indoor_places(nodes, ways, session):
             coords += f", {first_lon} {first_lat}"
         wkt = f"POLYGON(({coords}))"
 
-        level = tags.get("level")
-        if level is not None:
-            level = str(level).split(";")[0]
+        raw_level = tags.get("level")
+        if polygon_type == "stairs" and raw_level is not None:
+            # A stair can serve several floors (level=0;1): one row per floor,
+            # so it is drawn on each of them.
+            levels = [x.strip() for x in str(raw_level).split(";") if x.strip()]
+            levels = levels or [None]
+        elif raw_level is not None:
+            levels = [str(raw_level).split(";")[0]]
+        else:
+            levels = [None]
 
         building_name = tags.get("building_name")
         if building_name:
@@ -427,24 +454,39 @@ def ingest_indoor_places(nodes, ways, session):
         shared_doors = [r for r in way["refs"] if r in door_node_ids]
         door_node_id = shared_doors[0] if shared_doors else None
 
-        existing = (
-            session.query(IndoorArea)
-            .filter_by(osm_id=way["id"])
-            .one_or_none()
-        )
-        if existing is None:
-            existing = IndoorArea(osm_type="way", osm_id=way["id"])
-            session.add(existing)
+        for position, level in enumerate(levels):
+            # The first floor keeps the way's own id; extra floors get
+            # "<id>@<level>" so every row still has a unique id.
+            area_osm_id = way["id"] if position == 0 else f"{way['id']}@{level}"
 
-        existing.name = rname
-        existing.ref = tags.get("ref")
-        existing.level = level
-        existing.building_name = building_name
-        existing.type = polygon_type
-        existing.geometry_wkt = wkt
-        existing.door_node_id = door_node_id
+            existing = (
+                session.query(IndoorArea)
+                .filter_by(osm_id=area_osm_id)
+                .one_or_none()
+            )
+            if existing is None:
+                existing = IndoorArea(osm_type="way", osm_id=area_osm_id)
+                session.add(existing)
 
-        areas_written += 1
+            existing.name = rname
+            existing.ref = tags.get("ref")
+            existing.level = level
+            existing.building_name = building_name
+            existing.type = polygon_type
+            existing.geometry_wkt = wkt
+            existing.door_node_id = door_node_id
+
+            areas_written += 1
+
+        # alt_name written on the ROOM POLYGON (instead of on the door node)
+        # is passed to the room's door place, unless the door has its own.
+        if (tags.get("alt_name") or "").strip():
+            for shared_door_id in shared_doors:
+                # Not a database query: this session does not auto-flush, so
+                # the door places written above are not visible to one yet.
+                door_place = door_places.get(shared_door_id)
+                if door_place is not None and not door_place.alt_names:
+                    door_place.alt_names = tags["alt_name"].strip()
 
     # ---- Indoor path edges: one per walkable segment ----
     edges_written = 0

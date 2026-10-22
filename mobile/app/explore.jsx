@@ -43,7 +43,7 @@ export default function ExploreScreen() {
   useEffect(() => {
     let cancelled = false;
 
-    listPlaces({ kind: 'outdoor', limit: 200 })
+    listPlaces({ kind: 'outdoor', limit: 2000 })
       .then((data) => {
         if (cancelled) return;
         const landmarks = data.filter((p) => p.is_landmark);
@@ -88,7 +88,7 @@ export default function ExploreScreen() {
     listPlaces({
       kind: 'outdoor',
       intent: intent || undefined,
-      limit: 200,
+      limit: 2000,
     })
       .then((data) => {
         if (!cancelled) setPlaces(data);
@@ -214,3 +214,4 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 });
+

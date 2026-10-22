@@ -6,23 +6,27 @@ import { MaterialIcons } from '@expo/vector-icons';
 
 import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
+import { formatPlaceName, placeLocationLine } from '@/utils/placeLabel';
 
 export function PlaceCard({ place, onPress, isFavorite = false }) {
-  const subtitle = place.category ? prettifyCategory(place.category) : null;
+  // A room shows where it is (building and floor); other places show their category.
+  const displayName = formatPlaceName(place);
+  const where = placeLocationLine(place);
+  const subtitle = where || (place.category ? prettifyCategory(place.category) : null);
 
   return (
     <TouchableOpacity
       style={styles.card}
       onPress={onPress}
       accessibilityRole="button"
-      accessibilityLabel={place.name}
+      accessibilityLabel={displayName}
       accessibilityHint={
         place.name_sw ? `Also known as ${place.name_sw}` : undefined
       }
     >
       <View style={styles.body}>
-        <Text style={styles.name} numberOfLines={1}>
-          {place.name}
+        <Text style={styles.name} numberOfLines={2}>
+          {displayName}
         </Text>
         {place.name_sw ? (
           <Text style={styles.nameSw} numberOfLines={1}>
@@ -80,3 +84,4 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
 });
+
