@@ -1,7 +1,7 @@
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
+const DEFAULT_API_BASE_URL = 'http://192.168.43.204:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -101,18 +101,66 @@ export const CAMERA_MIN_HEADING_DEG = 10;
 // Background = outside the building (same as the home screen).
 // Interior   = floor space inside the building outline (indoor=level polygon)
 //              that is neither a room nor a corridor.
-// Stairs     = stairwell polygons (indoor=stairs).
-export const INDOOR_BACKGROUND_COLOR = "#f1f5f9";
-export const INDOOR_INTERIOR_COLOR = "#fdf3d7";
+
+
+
+// ---- In mobile/constants/config.js, REPLACE the whole indoor colour block
+// ---- with this one. It adds 5 new lines (corridor, room, outlines) and
+// ---- changes the colours so corridors, rooms, the building and the outside
+// ---- are all clearly different. Nothing else changes.
+
+// Indoor floor plan colours - used in components/IndoorMapView.jsx
+//
+// From the outside in:
+//   BACKGROUND  the ground outside the building
+//   INTERIOR    floor space inside the building outline that is neither a
+//               room nor a corridor (the indoor=level polygon)
+//   CORRIDOR    corridors
+//   ROOM        rooms
+//   STAIRS      stairwells (indoor=stairs)
+
+// ---- Palette A "Fresh" (default): white corridors, pale-green rooms ----
+export const INDOOR_BACKGROUND_COLOR = "#dbe3e8";
+export const INDOOR_INTERIOR_COLOR = "#f6efdd";
+export const INDOOR_CORRIDOR_COLOR = "#ffffff";
+export const INDOOR_CORRIDOR_OUTLINE_COLOR = "#c5d0d8";
+export const INDOOR_ROOM_COLOR = "#e3f1e7";
+export const INDOOR_ROOM_OUTLINE_COLOR = "#6c9a80";
+export const INDOOR_STAIRS_COLOR = "#f4b860";
+export const INDOOR_STAIRS_OUTLINE_COLOR = "#b45309";
+
+// ---- Palette B "Warm" (to try it, replace the 8 lines above with these) ----
+// export const INDOOR_BACKGROUND_COLOR = "#e3e9ee";
+// export const INDOOR_INTERIOR_COLOR = "#f8f2e2";
+// export const INDOOR_CORRIDOR_COLOR = "#efdfb9";
+// export const INDOOR_CORRIDOR_OUTLINE_COLOR = "#d2bf8c";
+// export const INDOOR_ROOM_COLOR = "#ffffff";
+// export const INDOOR_ROOM_OUTLINE_COLOR = "#7b8590";
+// export const INDOOR_STAIRS_COLOR = "#f0904a";
+// export const INDOOR_STAIRS_OUTLINE_COLOR = "#9a3412";
+
+// Line widths
+export const INDOOR_ROOM_OUTLINE_WIDTH = 1;
 export const INDOOR_BUILDING_OUTLINE_COLOR = "#334155";
 export const INDOOR_BUILDING_OUTLINE_WIDTH = 2.5;
-export const INDOOR_STAIRS_COLOR = "#f9c97a";
-export const INDOOR_STAIRS_OUTLINE_COLOR = "#b45309";
 
 // How far the indoor map turns, in degrees, while you walk. The map turns so
 // the corridor ahead points up the screen, in steps of this size.
-//   90   N, E, S, W only (the old behaviour)
-//   45   also NE, SE, SW, NW   <- default
-//   22.5 16 directions: for buildings built at an odd angle
-//   0    exact direction, no snapping (the map follows every bend)
-export const INDOOR_HEADING_SNAP_DEG = 45;
+//   90   N, E, S, W only      45   also NE, SE, SW, NW   <- default
+//   22.5 16 directions, for buildings at odd angles
+//   0    exact direction, no snapping
+export const INDOOR_HEADING_SNAP_DEG = 0;
+
+// ---- Room names ----
+// A name is shown only from the zoom at which it fits inside its room, so a
+// long name never spills over the next room. Names are smaller when zoomed
+// out and reach full size at INDOOR_LABEL_FULL_SIZE_ZOOM.
+export const INDOOR_LABEL_MIN_SIZE = 8; // text size when zoomed out
+export const INDOOR_LABEL_MAX_SIZE = 11; // text size when zoomed in
+export const INDOOR_LABEL_FULL_SIZE_ZOOM = 19; // zoom where full size is reached
+export const INDOOR_LABEL_WRAP_EM = 7; // long names wrap into lines this wide
+// How strictly a name must fit inside its room:
+//   1.0  fully inside the room (fewest names when zoomed out)
+//   1.3  may touch the walls a little   <- default
+//   1.6+ more names earlier, but they may spill over
+export const INDOOR_LABEL_FIT = 1.3;

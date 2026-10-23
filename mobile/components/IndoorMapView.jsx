@@ -26,10 +26,10 @@
 //     metres-per-pixel diagonal.
 //   - Heading is computed differently for the two modes:
 //       • Walking screen (lockHeading = false): the heading is the
-//         compass direction of the leg the student is about to walk,
-//         SNAPPED to one of N / E / S / W. Only four values, so the
-//         building outline never sits at a skew angle. Updates on a
-//         Next press, not continuously.
+//         direction of the road the student is about to walk,
+//         rounded to a multiple of INDOOR_HEADING_SNAP_DEG (90, 45,
+//         22.5, or 0 for the exact angle). Updates on a Next press,
+//         not continuously.
 //       • Preview (lockHeading = true): the heading is the start-to-
 //         end bearing of the whole route, snapped to N or S only.
 //         Unchanged from the previous version.
@@ -64,6 +64,10 @@ import { useSettings } from '@/context/SettingsContext';
 import { bearingDeg, haversineM } from '@/utils/geo';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING } from '@/constants/theme';
+import { polygonLabelInfo } from '@/utils/polygonLabel';
+import { labelMinZoom } from '@/utils/labelFit';
+import { headingAlongRoute } from '@/utils/legBearing';
+import { headingLabel } from '@/utils/headingLabel';
 import {
   INDOOR_BACKGROUND_COLOR,
   INDOOR_INTERIOR_COLOR,
@@ -71,7 +75,17 @@ import {
   INDOOR_BUILDING_OUTLINE_WIDTH,
   INDOOR_STAIRS_COLOR,
   INDOOR_STAIRS_OUTLINE_COLOR,
+  INDOOR_CORRIDOR_COLOR,
+  INDOOR_CORRIDOR_OUTLINE_COLOR,
+  INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_OUTLINE_COLOR,
+  INDOOR_ROOM_OUTLINE_WIDTH,
   INDOOR_HEADING_SNAP_DEG,
+  INDOOR_LABEL_MIN_SIZE,
+  INDOOR_LABEL_MAX_SIZE,
+  INDOOR_LABEL_FULL_SIZE_ZOOM,
+  INDOOR_LABEL_WRAP_EM,
+  INDOOR_LABEL_FIT,
 } from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
@@ -91,9 +105,9 @@ const BLANK_STYLE = JSON.stringify({
 const FILL_COLOR_EXPR = [
   'match',
   ['get', 'type'],
-  'corridor', '#e2e8f0',
-  'room', '#ffffff',
-  '#ffffff',
+  'corridor', INDOOR_CORRIDOR_COLOR,
+  'room', INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_COLOR,
 ];
 
 // A bearing needs at least this much movement to be meaningful.
@@ -133,12 +147,6 @@ function snapToNorthSouth(bearing) {
 
 // Which compass letter is at the top of the screen for a given
 // heading.
-const WIND_LETTERS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-function topLetter(heading) {
-  const h = ((heading % 360) + 360) % 360;
-  return WIND_LETTERS[Math.round(h / 45) % 8];
-}
-
 function firstLegBearing(points) {
   /**
    * Given a list of { lat, lon }, return the bearing from the first
@@ -157,6 +165,25 @@ function firstLegBearing(points) {
     }
   }
   return null;
+}
+
+// ---- Room names --------------------------------------------------------
+// A name is shown only from the zoom at which it fits inside its room, so a
+// long name never spills over the neighbouring rooms. Names are a little
+// smaller when zoomed out. All of this is set in constants/config.js; the
+// numbers after ?? are used if a setting is missing there.
+const LABEL_MIN_SIZE = INDOOR_LABEL_MIN_SIZE ?? 8;
+const LABEL_MAX_SIZE = INDOOR_LABEL_MAX_SIZE ?? 11;
+const LABEL_FULL_SIZE_ZOOM = INDOOR_LABEL_FULL_SIZE_ZOOM ?? 19;
+const LABEL_WRAP_EM = INDOOR_LABEL_WRAP_EM ?? 7;
+const LABEL_FIT = INDOOR_LABEL_FIT ?? 1.3;
+const LABEL_START_ZOOM = 16; // at or below this zoom, names use the minimum size
+const LABEL_BAND_STEP = 0.5; // names appear in half-zoom steps
+const LABEL_FROM_ZOOM = 15; // below this zoom no names are shown
+const LABEL_TO_ZOOM = 22;
+const LABEL_BANDS = [];
+for (let z = LABEL_FROM_ZOOM; z <= LABEL_TO_ZOOM; z += LABEL_BAND_STEP) {
+  LABEL_BANDS.push(z);
 }
 
 export function IndoorMapView({
@@ -286,6 +313,41 @@ export function IndoorMapView({
     return { type: 'FeatureCollection', features };
   }, [areas]);
 
+  // One point per room, at the room's visual centre, carrying its name and
+  // the zoom from which that name fits inside the room (minZoom). Labels come
+  // from these points instead of from the room polygons, so every name sits
+  // in the middle of its room (see utils/polygonLabel.js and utils/labelFit.js).
+  const roomLabelsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      const info = polygonLabelInfo(ring);
+      if (!info) continue;
+      const minZoom = labelMinZoom(area.name, info.radiusM, {
+        latDeg: info.point[1],
+        minSize: LABEL_MIN_SIZE,
+        maxSize: LABEL_MAX_SIZE,
+        fullSizeZoom: LABEL_FULL_SIZE_ZOOM,
+        startZoom: LABEL_START_ZOOM,
+        wrapEm: LABEL_WRAP_EM,
+        fit: LABEL_FIT,
+        bandStep: LABEL_BAND_STEP,
+        fromZoom: LABEL_FROM_ZOOM,
+        toZoom: LABEL_TO_ZOOM,
+      });
+      if (minZoom === null) continue; // too small to ever hold its name
+      features.push({
+        type: 'Feature',
+        properties: { name: area.name || '', minZoom },
+        geometry: { type: 'Point', coordinates: info.point },
+      });
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
   const corridorsGeoJSON = useMemo(() => {
     if (!areas || areas.length === 0) return null;
     const features = [];
@@ -380,11 +442,11 @@ export function IndoorMapView({
   // Two distinct behaviours, selected by `lockHeading`.
   //
   // Walking screen (lockHeading = false):
-  //   The heading is the compass direction of the leg the student is
-  //   about to walk, taken from `currentStepPoint` forward, SNAPPED
-  //   to the nearest of N / E / S / W. Only four values are ever
-  //   applied, so the building outline never sits at a skew angle and
-  //   the map only rotates on the four 90° axes. The heading updates
+  //   The heading is the direction of the road the student is about to
+  //   walk (see utils/legBearing.js), taken from `currentStepPoint`
+  //   forward, rounded to the nearest multiple of INDOOR_HEADING_SNAP_DEG
+  //   (90 = N/E/S/W, 45 = 8 directions, 22.5 = 16, 0 = exact angle,
+  //   no rounding). The heading updates
   //   when `currentStepPoint` changes — i.e. when the student presses
   //   Next. Between presses, the map holds still.
   //
@@ -430,7 +492,19 @@ export function IndoorMapView({
     }
 
     const slice = points.slice(startIdx);
-    const raw = firstLegBearing(slice);
+
+    // The very first step starts in a room. There the path begins with a
+    // short stub into the corridor, which must not decide the direction.
+    const isRouteStart =
+      !!currentStepPoint &&
+      all.length > 0 &&
+      all[0].lat === currentStepPoint.lat &&
+      all[0].lon === currentStepPoint.lon;
+
+    // The direction of the road ahead (see utils/legBearing.js): along the
+    // corridor at the start, along the path until it turns on the way, and
+    // towards the destination door on the last turn.
+    const raw = headingAlongRoute(slice, { isRouteStart });
     // No usable direction (last step, or the leg is under 3 m): keep the
     // previous heading instead of swinging to north.
     return raw == null ? null : snapToCardinal(raw);
@@ -662,7 +736,11 @@ export function IndoorMapView({
             />
             <LineLayer
               id="corridorsOutline"
-              style={{ lineColor: '#cbd5e1', lineWidth: 0.5 }}
+              style={{
+                lineColor: INDOOR_CORRIDOR_OUTLINE_COLOR,
+                lineWidth: 0.75,
+                lineJoin: 'round',
+              }}
             />
           </ShapeSource>
         ) : null}
@@ -678,6 +756,7 @@ export function IndoorMapView({
               style={{
                 lineColor: INDOOR_STAIRS_OUTLINE_COLOR,
                 lineWidth: 1.25,
+                lineJoin: 'round',
               }}
             />
           </ShapeSource>
@@ -691,21 +770,57 @@ export function IndoorMapView({
             />
             <LineLayer
               id="roomsOutline"
-              style={{ lineColor: '#94a3b8', lineWidth: 0.75 }}
-            />
-            <SymbolLayer
-              id="roomsLabels"
               style={{
-                textField: ['get', 'name'],
-                textFont: ['Noto Sans Regular'],
-                textSize: 11,
-                textColor: '#334155',
-                textHaloColor: '#ffffff',
-                textHaloWidth: 1.5,
-                textAllowOverlap: false,
-                textIgnorePlacement: false,
+                lineColor: INDOOR_ROOM_OUTLINE_COLOR,
+                lineWidth: INDOOR_ROOM_OUTLINE_WIDTH,
+                lineJoin: 'round',
               }}
             />
+          </ShapeSource>
+        ) : null}
+
+        {roomLabelsGeoJSON && roomLabelsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="roomLabelsSource" shape={roomLabelsGeoJSON}>
+            {/* One layer per half-zoom step. Each shows only the names that
+                already fit at that zoom, so a hidden name never blocks a
+                visible one and no name is wider than its room. */}
+            {LABEL_BANDS.map((band, index) => (
+              <SymbolLayer
+                key={`roomsLabels-${band}`}
+                id={`roomsLabels-${band}`}
+                minZoomLevel={band}
+                maxZoomLevel={
+                  index === LABEL_BANDS.length - 1 ? 24 : band + LABEL_BAND_STEP
+                }
+                filter={['<=', ['get', 'minZoom'], band]}
+                style={{
+                  textField: ['get', 'name'],
+                  textFont: ['Noto Sans Regular'],
+                  textSize: [
+                    'interpolate',
+                    ['linear'],
+                    ['zoom'],
+                    LABEL_START_ZOOM,
+                    LABEL_MIN_SIZE,
+                    LABEL_FULL_SIZE_ZOOM,
+                    LABEL_MAX_SIZE,
+                  ],
+                  textMaxWidth: LABEL_WRAP_EM,
+                  textColor: '#334155',
+                  textHaloColor: '#ffffff',
+                  textHaloWidth: 1.5,
+                  textAllowOverlap: false,
+                  textIgnorePlacement: false,
+                  // Centred on the point and always upright, whichever way
+                  // the map is turned.
+                  textAnchor: 'center',
+                  textJustify: 'center',
+                  textRotate: 0,
+                  textRotationAlignment: 'viewport',
+                  textPitchAlignment: 'viewport',
+                }}
+              />
+            ))}
           </ShapeSource>
         ) : null}
 
@@ -790,10 +905,15 @@ export function IndoorMapView({
         style={styles.northButton}
         onPress={() => setFlipped((v) => !v)}
         accessibilityRole="button"
-        accessibilityLabel={`Map top is ${topLetter(effectiveHeading)}. Turn the map around`}
+        accessibilityLabel={`Map top is ${headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG)}. Turn the map around`}
       >
-        <Text style={styles.northButtonText}>
-          {topLetter(effectiveHeading)}
+        <Text
+          style={styles.northButtonText}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={0.6}
+        >
+          {headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG)}
         </Text>
       </TouchableOpacity>
 
@@ -906,7 +1026,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   northButtonText: {
-    fontSize: 16,
+    // 16 fits "N" or "NE"; longer labels ("NNE", "137°") shrink to fit.
+    fontSize: 15,
+    paddingHorizontal: 2,
     fontWeight: '700',
     color: COLORS.primaryDark,
   },

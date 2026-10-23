@@ -17,6 +17,7 @@ import {
 } from 'react-native';
 import { Stack, router } from 'expo-router';
 import { MaterialIcons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
 import { t } from '@/i18n';
@@ -82,6 +83,9 @@ function CameraScanner({ onCode }) {
 }
 
 export default function ScanScreen() {
+  // The phone's navigation bar sits over the bottom of the screen. Keep the
+  // typed-code box and its button clear of it.
+  const insets = useSafeAreaInsets();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [typed, setTyped] = useState('');
@@ -130,7 +134,12 @@ export default function ScanScreen() {
         </View>
       )}
 
-      <View style={styles.panel}>
+      <View
+        style={[
+          styles.panel,
+          { paddingBottom: SPACING.md + Math.max(insets.bottom, 0) },
+        ]}
+      >
         {busy ? (
           <View style={styles.statusRow}>
             <ActivityIndicator color={COLORS.primary} />
