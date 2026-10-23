@@ -207,6 +207,7 @@ export function RouteMap({
   indoorGeometryByLevel = [],
   indoorDestination = null,
   currentStepPoint = null,
+  nextStepPoint = null,
   currentStepLevel = null,
   style,
 }) {
@@ -449,6 +450,7 @@ export function RouteMap({
         routeByLevel={indoorGeometryByLevel}
         destination={indoorDestination}
         currentStepPoint={currentStepPoint}
+        nextStepPoint={nextStepPoint}
         currentStepLevel={currentStepLevel}
         style={style}
         onNoRooms={() => setIndoorNoRooms(true)}

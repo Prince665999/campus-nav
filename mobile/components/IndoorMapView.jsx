@@ -86,6 +86,13 @@ import {
   INDOOR_LABEL_FULL_SIZE_ZOOM,
   INDOOR_LABEL_WRAP_EM,
   INDOOR_LABEL_FIT,
+  INDOOR_CURRENT_LEG_COLOR,
+  INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+  INDOOR_CURRENT_LEG_WIDTH,
+  INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+  INDOOR_LEG_END_DOT_RADIUS,
+  INDOOR_LEG_END_DOT_BORDER_WIDTH,
+  INDOOR_ROUTE_FADED_OPACITY,
 } from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
@@ -201,6 +208,7 @@ export function IndoorMapView({
   routeByLevel = [],
   destination = null,
   currentStepPoint = null,
+  nextStepPoint = null,
   currentStepLevel = null,
   style,
   onNoRooms,
@@ -443,6 +451,44 @@ export function IndoorMapView({
         dashed.length > 0 ? { type: 'FeatureCollection', features: dashed } : null,
     };
   }, [routeByLevel, selectedLevel]);
+
+  // The part of the route the student must walk during the current step:
+  // from the current step's point to the next step's point, on this floor only.
+  const currentLegGeoJSON = useMemo(() => {
+    if (!currentStepPoint || !nextStepPoint || !routeByLevel?.length) return null;
+    const same = (p, q) => p.lat === q.lat && p.lon === q.lon;
+
+    const startIdx = routeByLevel.findIndex((p) => same(p, currentStepPoint));
+    if (startIdx < 0) return null;
+    let endIdx = -1;
+    for (let i = startIdx + 1; i < routeByLevel.length; i++) {
+      if (same(routeByLevel[i], nextStepPoint)) { endIdx = i; break; }
+    }
+    if (endIdx < 0) return null;
+
+    const runs = [];
+    let cur = [];
+    for (let i = startIdx; i <= endIdx; i++) {
+      const p = routeByLevel[i];
+      if (p.level === selectedLevel) {
+        cur.push([p.lon, p.lat]);
+      } else {
+        if (cur.length >= 2) runs.push(cur);
+        cur = [];
+      }
+    }
+    if (cur.length >= 2) runs.push(cur);
+    if (runs.length === 0) return null;
+
+    return {
+      type: 'FeatureCollection',
+      features: runs.map((coordinates) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates },
+      })),
+    };
+  }, [routeByLevel, currentStepPoint, nextStepPoint, selectedLevel]);
 
   // -------------------------------------------------------------------------
   // Route-up heading
@@ -855,6 +901,44 @@ export function IndoorMapView({
                 lineWidth: 4,
                 lineCap: 'round',
                 lineJoin: 'round',
+                lineOpacity: currentLegGeoJSON ? INDOOR_ROUTE_FADED_OPACITY : 1,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON ? (
+          <ShapeSource id="indoorCurrentLegSource" shape={currentLegGeoJSON}>
+            <LineLayer
+              id="indoorCurrentLegCasing"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+            <LineLayer
+              id="indoorCurrentLegLine"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON && nextStepPoint ? (
+          <ShapeSource id="indoorNextStepSource" shape={pointFeature(nextStepPoint)}>
+            <CircleLayer
+              id="indoorNextStepDot"
+              style={{
+                circleRadius: INDOOR_LEG_END_DOT_RADIUS,
+                circleColor: '#ffffff',
+                circleStrokeColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                circleStrokeWidth: INDOOR_LEG_END_DOT_BORDER_WIDTH,
               }}
             />
           </ShapeSource>

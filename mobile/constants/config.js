@@ -164,3 +164,16 @@ export const INDOOR_LABEL_WRAP_EM = 7; // long names wrap into lines this wide
 //   1.3  may touch the walls a little   <- default
 //   1.6+ more names earlier, but they may spill over
 export const INDOOR_LABEL_FIT = 1.3;
+
+// ---- Indoor navigation: the leg the student is walking right now ----
+export const INDOOR_CURRENT_LEG_COLOR = "#16a34a";         // the line
+export const INDOOR_CURRENT_LEG_OUTLINE_COLOR = "#14532d"; // dark outline + ring border
+export const INDOOR_CURRENT_LEG_WIDTH = 4;                 // line thickness
+export const INDOOR_CURRENT_LEG_OUTLINE_WIDTH = 6;         // outline thickness (keep bigger than the line)
+
+// The ring that marks where the leg ends (the next step's point)
+export const INDOOR_LEG_END_DOT_RADIUS = 3;                // size of the white centre
+export const INDOOR_LEG_END_DOT_BORDER_WIDTH = 1;          // thickness of its dark border
+
+// How faint the rest of the route gets while a leg is highlighted (1 = no fade)
+export const INDOOR_ROUTE_FADED_OPACITY = 1;

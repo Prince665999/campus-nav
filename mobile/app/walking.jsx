@@ -145,6 +145,7 @@ export default function WalkingScreen() {
     indoorGeometryByLevel,
     indoorDestination,
     currentStepGeometryPoint,
+    nextStepGeometryPoint,
   } = useRouteProgress(route, {
     startedFromPlace: routeRequestRef.current?.fromId != null,
   });
@@ -318,7 +319,7 @@ export default function WalkingScreen() {
   // Recalculate: local re-snap first, server only when genuinely off
   // route.
   const handleRecalculate = useCallback(async () => {
-    if (mode !== 'outdoor') return;
+    if (mode !== 'indoor') return;
     const from = rawPosition || position;
     if (!from) return;
     if (!destinationId) return;
@@ -490,6 +491,7 @@ export default function WalkingScreen() {
             indoorGeometryByLevel={indoorGeometryByLevel}
             indoorDestination={indoorDestination}
             currentStepPoint={currentStepGeometryPoint}
+            nextStepPoint={nextStepGeometryPoint}
             currentStepLevel={indoorLevel}
             style={styles.map}
           />
@@ -569,4 +571,3 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
 });
-

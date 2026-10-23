@@ -155,6 +155,14 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     return route.geometry[step.geometry_index] || null;
   }, [currentStep.mode, currentStep.step, route?.geometry]);
 
+  const nextStepGeometryPoint = useMemo(() => {
+    if (currentStep.mode !== 'indoor') return null;
+    if (!route?.geometry) return null;
+    const next = steps[currentStep.index + 1];
+    if (!next || next.geometry_index == null) return null;
+    return route.geometry[next.geometry_index] || null;
+  }, [currentStep.mode, currentStep.index, steps, route?.geometry]);
+
   const indoorGeometryByLevel = useMemo(() => {
     if (!route?.geometry || !steps.length) return [];
     const indoorSteps = steps.filter(
@@ -218,6 +226,6 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     indoorGeometryByLevel,
     indoorDestination,
     currentStepGeometryPoint,
+    nextStepGeometryPoint,
   };
 }
-
