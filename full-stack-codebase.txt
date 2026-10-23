@@ -11719,6 +11719,7 @@ from .routers import (
     media,
     narrate,
     places,
+    qr,
     reports,
     route,
     timetable,
@@ -11815,6 +11816,7 @@ def create_app() -> FastAPI:
     # Public routers
     app.include_router(health.router)
     app.include_router(places.router)
+    app.include_router(qr.router)
     app.include_router(areas.router)
     app.include_router(indoor.router)          # ← new
     app.include_router(route.router)
@@ -11882,6 +11884,8 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\admin_user.py ---
 
@@ -14993,7 +14997,7 @@ def search_places(
     q: str = Query(..., min_length=1),
     kind: str | None = Query(None),
     building_name: str | None = Query(None),
-    limit: int = Query(20, gt=0, le=2000),
+    limit: int = Query(20, gt=0, le=100),
     session: Session = Depends(db_session),
 ):
     """Search places by name. Requires a query string."""
@@ -15081,6 +15085,59 @@ def get_place(place_id: int, session: Session = Depends(db_session)):
     if detail is None:
         raise NotFoundError(f"Place {place_id} not found")
     return detail
+
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\qr.py ---
+
+"""
+qr.py
+
+Resolves a scanned QR code to the place it stands for.
+
+A QR code printed on a corridor wall holds a short code such as "LIB-G-03".
+The phone sends that code here and gets back the place (a point on the
+corridor) to start the route from. The place is an ordinary indoor place
+with category "qr", created by the ingest from a `qr=<code>` tag in
+final.osm.
+"""
+
+import re
+
+from fastapi import APIRouter, Depends
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from ..dependencies import db_session
+from ..errors import NotFoundError
+from ..models.place import Place
+from ..schemas.place import PlaceSummary
+from ..services import place_service
+
+router = APIRouter(prefix="/api/qr", tags=["qr"])
+
+# Must match the rule in pipeline/ingest.py.
+_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+@router.get("/{code}", response_model=PlaceSummary)
+def resolve_qr(code: str, session: Session = Depends(db_session)):
+    """Return the place a QR code stands for. 404 if the code is unknown."""
+    cleaned = (code or "").strip()
+    if not _CODE_RE.match(cleaned):
+        raise NotFoundError(f"QR code {cleaned!r} not found")
+
+    row = (
+        session.query(Place)
+        .filter(func.lower(func.coalesce(Place.ref, "")) == cleaned.lower())
+        .filter(func.lower(func.trim(func.coalesce(Place.category, ""))) == "qr")
+        .first()
+    )
+    if row is None:
+        raise NotFoundError(f"QR code {cleaned!r} not found")
+
+    return place_service._to_summary(session, row)
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\reports.py ---
 
@@ -15982,6 +16039,8 @@ class PlaceSummary(BaseModel):
     id: int
     name: str
     name_sw: str | None = None
+    # Alternative names, as typed in the alt_name tag (separated by ;).
+    alt_names: str | None = None
     category: str | None = None
     category_icon_key: str | None = None
     intents: str | None = None
@@ -16032,7 +16091,9 @@ class PlaceListParams(BaseModel):
     lat: float | None = Field(None, ge=-90, le=90)
     lon: float | None = Field(None, ge=-180, le=180)
     radius_m: float = Field(500, gt=0, le=5000)
-    limit: int = Field(50, gt=0, le=200)
+    limit: int = Field(50, gt=0, le=2000)
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\report.py ---
 
@@ -16694,7 +16755,9 @@ is "ask that in Walking Mode."
 
 import logging
 
-from . import knowledge_service, llm_client
+import re
+
+from . import date_query, knowledge_service, llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -16706,6 +16769,8 @@ You will be given excerpts from university documents — the handbook, almanac, 
 Answer only from those excerpts. Never invent a fact, a date, a rule, or a place.
 
 If the answer isn't in the excerpts, say so plainly. "I don't know that one — check the official notice board" is a fine answer.
+
+The almanac lists only the dates that have an event. If a note in the excerpts says no entry was found for the date the student asked about, say plainly that you can't find anything listed for that date, so probably nothing is scheduled, and suggest checking the official notice board.
 
 For anything time-sensitive (exam dates, holidays, deadlines, term dates), always add a short reminder: "check the official notice board to confirm."
 
@@ -16735,6 +16800,61 @@ def _format_chunks(chunks: list) -> str:
     return "\n".join(lines)
 
 
+# The most day-chunks we will add for a month question ("what is in May").
+_MAX_MONTH_CHUNKS = 31
+
+_ISO_IN_TEXT = re.compile(r"\((\d{4}-\d{2}-\d{2})\)")
+
+
+def _chunk_date(chunk) -> str:
+    """The ISO date a chunk is about, e.g. "2026-05-01", for sorting."""
+    match = _ISO_IN_TEXT.search(chunk["text"])
+    return match.group(1) if match else ""
+
+
+def _date_chunks(question: str):
+    """
+    Chunks that match a date written in the question, found by exact text.
+    Returns (chunks, note). `note` is a sentence for the model when a
+    specific day was asked about but nothing is listed for it, else None.
+    """
+    day_needles, month_needles = date_query.find_date_needles(question)
+    chunks = []
+
+    try:
+        for needle in day_needles:
+            chunks.extend(knowledge_service.retrieve_containing(needle, limit=5))
+        for needle in month_needles:
+            found = knowledge_service.retrieve_containing(
+                needle, limit=_MAX_MONTH_CHUNKS
+            )
+            # Put the days in calendar order.
+            found.sort(key=_chunk_date)
+            chunks.extend(found)
+    except Exception as e:
+        logger.warning("Date lookup failed: %s", e)
+        return [], None
+
+    note = None
+    if day_needles and not chunks:
+        note = (
+            "Note: the documents were searched for the exact date the "
+            "student asked about and no entry was found for it."
+        )
+    return chunks, note
+
+
+def _merge(primary: list, secondary: list, limit: int) -> list:
+    """primary first, then secondary, without repeating a chunk."""
+    seen, merged = set(), []
+    for chunk in primary + secondary:
+        if chunk["text"] in seen:
+            continue
+        seen.add(chunk["text"])
+        merged.append(chunk)
+    return merged[:limit]
+
+
 def answer_doc_question(question: str, top_k: int = 5) -> tuple[str, bool]:
     """
     Answer a question about the university using the knowledge base.
@@ -16752,7 +16872,14 @@ def answer_doc_question(question: str, top_k: int = 5) -> tuple[str, bool]:
     except Exception as e:
         logger.warning("Knowledge retrieval failed: %s", e)
 
-    if not chunks:
+    # A date in the question is matched by exact text, because searching
+    # by meaning cannot tell one almanac day from another.
+    date_chunks, date_note = _date_chunks(question)
+    if date_chunks:
+        limit = max(top_k, len(date_chunks) + 2)
+        chunks = _merge(date_chunks, chunks, limit)
+
+    if not chunks and not date_note:
         return (
             "I don't have anything about that in the documents I've "
             "been given. Try rephrasing, or check the official notice "
@@ -16762,6 +16889,12 @@ def answer_doc_question(question: str, top_k: int = 5) -> tuple[str, bool]:
 
     # No LLM? Return the top chunk as plain text. Honest and useful.
     if not llm_client.is_available():
+        if not chunks:
+            return (
+                "I can't find an entry for that date in the documents. "
+                "Check the official notice board to confirm.",
+                False,
+            )
         top = chunks[0]
         source = top["metadata"].get("source_file", "the documents")
         return (
@@ -16770,6 +16903,8 @@ def answer_doc_question(question: str, top_k: int = 5) -> tuple[str, bool]:
         )
 
     context = _format_chunks(chunks)
+    if date_note:
+        context = f"{context}\n\n{date_note}" if context else date_note
     response = llm_client.chat(
         [
             {"role": "system", "content": _DOC_SYSTEM_PROMPT},
@@ -16786,9 +16921,17 @@ def answer_doc_question(question: str, top_k: int = 5) -> tuple[str, bool]:
         return response.strip(), True
 
     # LLM call failed. Return the top chunk as plain text.
+    if not chunks:
+        return (
+            "I can't find an entry for that date in the documents. "
+            "Check the official notice board to confirm.",
+            False,
+        )
     top = chunks[0]
     source = top["metadata"].get("source_file", "the documents")
     return (f"From {source}: {top['text']}", True)
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\chat_service.py ---
 
@@ -17079,6 +17222,162 @@ def answer_route_question(question: str, route_context: dict) -> str:
         route_context["current_step_index"],
         question,
     )
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\date_query.py ---
+
+"""
+date_query.py
+
+Finds dates in a student's question and turns them into text snippets that
+can be looked up directly in the knowledge base.
+
+Why this exists: the knowledge base is searched by meaning (embeddings).
+Embeddings are poor at exact dates, so "what is happening on Friday 1 May
+2026" used to return five unrelated almanac days and the assistant said it
+saw no event. The almanac text contains each date in ISO form, e.g.
+"(2026-05-01)", so a plain text lookup for that string finds the right day
+every time.
+
+Understands (English and Swahili):
+  "1 May 2026", "1st of May", "May 1", "friday may 1 of 2026", "1 Mei",
+  "2026-05-01", "01/05/2026" (day/month/year), "today"/"leo",
+  "tomorrow"/"kesho", "yesterday"/"jana", and month-only questions such as
+  "what is in May" / "events during Oktoba".
+
+Pure functions, no database, so they are easy to test.
+"""
+
+import re
+from datetime import date, timedelta
+
+_MONTHS = {
+    # English
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+    # Swahili
+    "januari": 1,
+    "februari": 2,
+    "machi": 3,
+    "aprili": 4,
+    "mei": 5,
+    "juni": 6,
+    "julai": 7,
+    "agosti": 8, "ago": 8,
+    "septemba": 9,
+    "oktoba": 10, "okt": 10,
+    "novemba": 11,
+    "desemba": 12, "des": 12,
+}
+
+_MONTH_RE = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_YEAR = r"(20\d{2})"
+_ORD = r"(?:st|nd|rd|th)?"
+
+_RE_ISO = re.compile(rf"\b{_YEAR}-(\d{{1,2}})-(\d{{1,2}})\b")
+_RE_DAY_MONTH = re.compile(
+    rf"\b(\d{{1,2}}){_ORD}\s*(?:of\s+|ya\s+)?({_MONTH_RE})\b"
+    rf"(?:\s*,?\s*(?:of\s+)?{_YEAR})?",
+    re.I,
+)
+_RE_MONTH_DAY = re.compile(
+    rf"\b({_MONTH_RE})\s+(\d{{1,2}}){_ORD}\b(?!\s*:)"
+    rf"(?:\s*,?\s*(?:of\s+)?{_YEAR})?",
+    re.I,
+)
+_RE_NUMERIC = re.compile(r"\b(\d{1,2})[/.](\d{1,2})[/.](20\d{2}|\d{2})\b")
+_RE_MONTH_ONLY = re.compile(
+    rf"\b(?:in|during|for|of|within|mwezi(?:\s+wa)?)\s+({_MONTH_RE})\b"
+    rf"(?!\s+\d)",
+    re.I,
+)
+
+_RELATIVE = [
+    (re.compile(r"\b(day after tomorrow|kesho kutwa)\b", re.I), 2),
+    (re.compile(r"\b(tomorrow|kesho)\b", re.I), 1),
+    (re.compile(r"\b(yesterday|jana)\b", re.I), -1),
+    (re.compile(r"\b(today|leo)\b", re.I), 0),
+]
+
+
+def _valid(year, month, day):
+    """A real calendar date? year may be None (then any leap year works)."""
+    try:
+        date(year if year else 2024, month, day)
+        return True
+    except ValueError:
+        return False
+
+
+def _needle(year, month, day):
+    # The closing bracket stops "-05-01" matching inside "-05-010" etc.
+    if year:
+        return f"{year:04d}-{month:02d}-{day:02d})"
+    return f"-{month:02d}-{day:02d})"
+
+
+def _add(found, year, month, day):
+    if 1 <= month <= 12 and _valid(year, month, day):
+        needle = _needle(year, month, day)
+        if needle not in found:
+            found.append(needle)
+
+
+def find_date_needles(question, today=None):
+    """
+    Returns (day_needles, month_needles) for the question.
+
+    day_needles   exact days, e.g. ["2026-05-01)"] or ["-05-01)"] when the
+                  question gave no year (matches that day in any year).
+    month_needles whole months, e.g. ["-05-"], for "what is in May".
+
+    Both lists are empty when the question mentions no date.
+    """
+    if not question:
+        return [], []
+    today = today or date.today()
+    days, months = [], []
+    text = question
+
+    for m in _RE_ISO.finditer(text):
+        _add(days, int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    for m in _RE_DAY_MONTH.finditer(text):
+        year = int(m.group(3)) if m.group(3) else None
+        _add(days, year, _MONTHS[m.group(2).lower()], int(m.group(1)))
+
+    for m in _RE_MONTH_DAY.finditer(text):
+        year = int(m.group(3)) if m.group(3) else None
+        _add(days, year, _MONTHS[m.group(1).lower()], int(m.group(2)))
+
+    for m in _RE_NUMERIC.finditer(text):
+        year = int(m.group(3))
+        if year < 100:
+            year += 2000
+        _add(days, year, int(m.group(2)), int(m.group(1)))  # day/month/year
+
+    for pattern, offset in _RELATIVE:
+        if pattern.search(text):
+            d = today + timedelta(days=offset)
+            _add(days, d.year, d.month, d.day)
+
+    if not days:
+        for m in _RE_MONTH_ONLY.finditer(text):
+            needle = f"-{_MONTHS[m.group(1).lower()]:02d}-"
+            if needle not in months:
+                months.append(needle)
+
+    return days, months
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\favorite_service.py ---
 
@@ -18614,6 +18913,37 @@ def retrieve(query, top_k=KNOWLEDGE_TOP_K):
 
     return out
 
+
+def retrieve_containing(substring, limit=40):
+    """
+    Find chunks whose text literally contains `substring` (case-sensitive).
+
+    Retrieval by meaning (retrieve above) is weak at exact values such as
+    dates; this is a plain text match, used for those. Returns the same
+    {text, metadata, score} shape as retrieve(). Returns [] on any problem.
+    """
+    if not substring:
+        return []
+    try:
+        collection = _get_collection()
+        result = collection.get(
+            where_document={"$contains": substring},
+            limit=limit,
+            include=["documents", "metadatas"],
+        )
+    except Exception as e:
+        logger.warning("Chroma text lookup failed for %r: %s", substring, e)
+        return []
+
+    docs = result.get("documents") or []
+    metas = result.get("metadatas") or []
+    return [
+        {"text": text, "metadata": metadata or {}, "score": 1.0}
+        for text, metadata in zip(docs, metas)
+    ]
+
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\llm_client.py ---
 
 """
@@ -20088,7 +20418,7 @@ Filters
 
 import math
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, case
 from sqlalchemy.orm import Session
 
 from ..models.media import Media
@@ -20137,6 +20467,7 @@ def _to_summary(session, place: Place) -> PlaceSummary:
         id=place.id,
         name=place.name,
         name_sw=place.name_sw,
+        alt_names=place.alt_names,
         category=place.category,
         category_icon_key=_icon_key_for_category(place.category),
         intents=place.intents,
@@ -20209,6 +20540,14 @@ def search_places(
             )
         )
 
+    # QR points (category "qr") are spots on corridors, used only to start a
+    # route after scanning a printed code. They are not places a student
+    # searches for, so every search hides them unless "qr" is asked for.
+    if not category or category.strip().lower() != "qr":
+        query = query.filter(
+            func.lower(func.trim(func.coalesce(Place.category, ""))) != "qr"
+        )
+
     if category:
         # Case-insensitive, trimmed compare. The category stored in
         # the DB may have mixed case or stray whitespace; the chip
@@ -20242,6 +20581,28 @@ def search_places(
         query = query.filter(
             Place.lat.between(lat - dlat, lat + dlat),
             Place.lon.between(lon - dlon, lon + dlon),
+        )
+
+    # ORDER BEFORE LIMIT. Without an ORDER BY the database returns rows in
+    # the order they were stored, so LIMIT kept the oldest places and cut
+    # the newest: rooms added and re-ingested later vanished from the door
+    # picker once a list passed the limit. Order so the limit keeps the
+    # rows that matter, and the result is the same every time.
+    if lat is not None and lon is not None:
+        # Nearest first (flat-earth distance is fine at campus scale).
+        cos_lat = max(math.cos(math.radians(lat)), 0.01)
+        d_lat = Place.lat - lat
+        d_lon = (Place.lon - lon) * cos_lat
+        query = query.order_by(d_lat * d_lat + d_lon * d_lon, Place.id)
+    elif q:
+        # Names that START with what was typed come first.
+        starts = case((func.lower(Place.name).like(f"{q.lower()}%"), 0), else_=1)
+        query = query.order_by(starts, func.lower(Place.name), Place.id)
+    else:
+        query = query.order_by(
+            func.lower(func.coalesce(Place.building_name, "")),
+            func.lower(Place.name),
+            Place.id,
         )
 
     rows = query.limit(limit).all()
@@ -20332,12 +20693,15 @@ def list_building_counts(session: Session) -> dict[str, int]:
             func.count(Place.id),
         )
         .filter(Place.kind == "indoor")
+        .filter(func.lower(func.trim(func.coalesce(Place.category, ""))) != "qr")
         .filter(Place.building_name.isnot(None))
         .filter(func.trim(Place.building_name) != "")
         .group_by(Place.building_name)
         .all()
     )
     return {name: n for name, n in rows}
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\reimport_service.py ---
 
@@ -27610,6 +27974,7 @@ Uses campus_graph.py for parsing and graph building. Never edits the
 frozen file.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -27791,7 +28156,13 @@ _INDOOR_STAIRS_HIGHWAY = "steps"
 # building on each floor and tag it indoor=level, level=<n>, building_name=<name>).
 # The phone fills it with the interior colour and draws its outline; it is
 # never a room, so it is not searchable and gets no label.
-_INDOOR_POLYGON_TYPES = {"room", "corridor", "level"}
+#
+# "stairs" is a stairwell, drawn in its own colour. Tag a closed way
+# indoor=stairs, level=<n> (or level=0;1 for a stair that serves two floors;
+# it is then drawn on both), building_name=<name>. Like "level" it is never
+# a room: not searchable, no label. (The walkable stair LINE used for routing
+# is separate: highway=steps.)
+_INDOOR_POLYGON_TYPES = {"room", "corridor", "level", "stairs"}
 
 
 def _is_door(tags):
@@ -27800,6 +28171,14 @@ def _is_door(tags):
 
 def _is_entrance(tags):
     return bool(tags.get("entrance"))
+
+
+# A QR point is a plain node on a corridor with a `qr=<code>` tag. It becomes
+# a Place so a student who scans the printed code can start a route from it.
+# Codes are letters, digits, "-" and "_" only, at most 32 characters, so they
+# fit in a URL and can't be confused when typed by hand.
+_QR_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+QR_CATEGORY = "qr"
 
 
 def ingest_indoor_places(nodes, ways, session):
@@ -27829,6 +28208,7 @@ def ingest_indoor_places(nodes, ways, session):
                 rooms_of_door.setdefault(ref, []).append(rname)
 
     places_written = 0
+    door_places: dict[str, Place] = {}  # kept so polygons can reach their door
     for nid in door_node_ids:
         node = nodes[nid]
         tags = node["tags"]
@@ -27862,8 +28242,75 @@ def ingest_indoor_places(nodes, ways, session):
         existing.room_name = room_name
         existing.ref = tags.get("ref") or existing.ref
         existing.description_ai = tags.get("description") or existing.description_ai
+        # Alternative names, e.g. alt_name=Lab A;Computer lab. Shown in brackets
+        # after the room name in the app. Only set when the tag is present,
+        # so a value edited in the admin page is not wiped.
+        if (tags.get("alt_name") or "").strip():
+            existing.alt_names = tags["alt_name"].strip()
 
+        door_places[nid] = existing
         places_written += 1
+
+    # ---- Places: one per QR point ----
+    # A QR point is NOT a door and NOT a room. It is a spot on a corridor.
+    # It is stored as an indoor place with category "qr", so routing treats it
+    # like any indoor start, while the search screens hide it (they skip
+    # category "qr" — see place_service).
+    qr_written = 0
+    seen_codes: dict[str, str] = {}
+    for nid, node in nodes.items():
+        tags = node["tags"]
+        raw_code = (tags.get("qr") or "").strip()
+        if not raw_code:
+            continue
+
+        if not _QR_CODE_RE.match(raw_code):
+            print(f"  WARNING: node {nid} has an invalid qr code {raw_code!r} "
+                  f"(use letters, digits, - and _ only, max 32). Skipped.")
+            continue
+
+        if nid in door_node_ids or nid in entrance_node_ids:
+            print(f"  WARNING: node {nid} has qr={raw_code} but is also a "
+                  f"door or entrance. Put the QR code on a plain corridor "
+                  f"node instead. Skipped.")
+            continue
+
+        key = raw_code.lower()
+        if key in seen_codes:
+            print(f"  WARNING: qr code {raw_code!r} is used by nodes "
+                  f"{seen_codes[key]} and {nid}. Codes must be unique. "
+                  f"The second one is skipped.")
+            continue
+        seen_codes[key] = nid
+
+        name = (tags.get("name") or tags.get("loc_name") or "").strip()
+        if not name:
+            name = f"corridor point {raw_code}"
+
+        level = tags.get("level")
+        if level is not None:
+            level = str(level).split(";")[0]
+
+        building_name = tags.get("building_name")
+        if building_name:
+            building_name = building_name.strip() or None
+
+        existing = session.query(Place).filter_by(osm_id=nid).one_or_none()
+        if existing is None:
+            existing = Place(osm_type="node", osm_id=nid, kind="indoor")
+            session.add(existing)
+
+        existing.name = name
+        existing.lat = node["lat"]
+        existing.lon = node["lon"]
+        existing.kind = "indoor"
+        existing.category = QR_CATEGORY
+        existing.building_name = building_name
+        existing.level = level
+        existing.ref = raw_code
+        existing.description_ai = tags.get("description") or existing.description_ai
+
+        qr_written += 1
 
     # ---- Places: one per entrance node ----
     entrances_written = 0
@@ -27903,10 +28350,15 @@ def ingest_indoor_places(nodes, ways, session):
         existing.level = level
         existing.ref = tags.get("ref") or existing.ref
         existing.description_ai = tags.get("description") or existing.description_ai
+        # Alternative names, e.g. alt_name=Lab A;Computer lab. Shown in brackets
+        # after the room name in the app. Only set when the tag is present,
+        # so a value edited in the admin page is not wiped.
+        if (tags.get("alt_name") or "").strip():
+            existing.alt_names = tags["alt_name"].strip()
 
         entrances_written += 1
 
-    # ---- Indoor areas: rooms and corridors ----
+    # ---- Indoor areas: rooms, corridors, floor outlines and stairs ----
     areas_written = 0
     for way in ways:
         tags = way["tags"]
@@ -27916,9 +28368,11 @@ def ingest_indoor_places(nodes, ways, session):
 
         rname = (tags.get("name") or tags.get("ref") or "").strip()
         if not rname:
-            rname = {"corridor": "corridor", "level": "floor outline"}.get(
-                polygon_type, "unnamed"
-            )
+            rname = {
+                "corridor": "corridor",
+                "level": "floor outline",
+                "stairs": "stairs",
+            }.get(polygon_type, "unnamed")
 
         refs = [r for r in way["refs"] if r in nodes]
         if len(refs) < 3:
@@ -27935,9 +28389,16 @@ def ingest_indoor_places(nodes, ways, session):
             coords += f", {first_lon} {first_lat}"
         wkt = f"POLYGON(({coords}))"
 
-        level = tags.get("level")
-        if level is not None:
-            level = str(level).split(";")[0]
+        raw_level = tags.get("level")
+        if polygon_type == "stairs" and raw_level is not None:
+            # A stair can serve several floors (level=0;1): one row per floor,
+            # so it is drawn on each of them.
+            levels = [x.strip() for x in str(raw_level).split(";") if x.strip()]
+            levels = levels or [None]
+        elif raw_level is not None:
+            levels = [str(raw_level).split(";")[0]]
+        else:
+            levels = [None]
 
         building_name = tags.get("building_name")
         if building_name:
@@ -27946,24 +28407,39 @@ def ingest_indoor_places(nodes, ways, session):
         shared_doors = [r for r in way["refs"] if r in door_node_ids]
         door_node_id = shared_doors[0] if shared_doors else None
 
-        existing = (
-            session.query(IndoorArea)
-            .filter_by(osm_id=way["id"])
-            .one_or_none()
-        )
-        if existing is None:
-            existing = IndoorArea(osm_type="way", osm_id=way["id"])
-            session.add(existing)
+        for position, level in enumerate(levels):
+            # The first floor keeps the way's own id; extra floors get
+            # "<id>@<level>" so every row still has a unique id.
+            area_osm_id = way["id"] if position == 0 else f"{way['id']}@{level}"
 
-        existing.name = rname
-        existing.ref = tags.get("ref")
-        existing.level = level
-        existing.building_name = building_name
-        existing.type = polygon_type
-        existing.geometry_wkt = wkt
-        existing.door_node_id = door_node_id
+            existing = (
+                session.query(IndoorArea)
+                .filter_by(osm_id=area_osm_id)
+                .one_or_none()
+            )
+            if existing is None:
+                existing = IndoorArea(osm_type="way", osm_id=area_osm_id)
+                session.add(existing)
 
-        areas_written += 1
+            existing.name = rname
+            existing.ref = tags.get("ref")
+            existing.level = level
+            existing.building_name = building_name
+            existing.type = polygon_type
+            existing.geometry_wkt = wkt
+            existing.door_node_id = door_node_id
+
+            areas_written += 1
+
+        # alt_name written on the ROOM POLYGON (instead of on the door node)
+        # is passed to the room's door place, unless the door has its own.
+        if (tags.get("alt_name") or "").strip():
+            for shared_door_id in shared_doors:
+                # Not a database query: this session does not auto-flush, so
+                # the door places written above are not visible to one yet.
+                door_place = door_places.get(shared_door_id)
+                if door_place is not None and not door_place.alt_names:
+                    door_place.alt_names = tags["alt_name"].strip()
 
     # ---- Indoor path edges: one per walkable segment ----
     edges_written = 0
@@ -28018,6 +28494,7 @@ def ingest_indoor_places(nodes, ways, session):
     return {
         "places": places_written,
         "entrances": entrances_written,
+        "qr_points": qr_written,
         "areas": areas_written,
         "edges": edges_written,
     }
@@ -28071,6 +28548,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         if not indoor_osm_path.exists():
             print(f"  indoor map not found at {indoor_osm_path} — skipping")
             n_indoor_places = n_entrances = n_indoor_areas = n_indoor_edges = 0
+            n_qr = 0
         else:
             indoor_nodes, indoor_ways = parse_osm(str(indoor_osm_path))
             counts = ingest_indoor_places(indoor_nodes, indoor_ways, session)
@@ -28078,8 +28556,10 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
             n_entrances = counts["entrances"]
             n_indoor_areas = counts["areas"]
             n_indoor_edges = counts["edges"]
+            n_qr = counts["qr_points"]
             print(f"  indoor door places: {n_indoor_places}")
             print(f"  indoor entrances: {n_entrances}")
+            print(f"  QR points: {n_qr}")
             print(f"  indoor rooms + corridors + floor outlines: {n_indoor_areas}")
             print(f"  indoor path edges: {n_indoor_edges}")
 
@@ -28092,6 +28572,7 @@ def run_ingest(osm_path=None, indoor_osm_path=None, replace=None):
         "entrances": n_entrances,
         "indoor_areas": n_indoor_areas,
         "indoor_edges": n_indoor_edges,
+        "qr_points": n_qr,
     }
 
 
@@ -28148,6 +28629,245 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=5)
     args = parser.parse_args()
     probe(args.path, limit=args.limit)
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\make_qr_codes.py ---
+
+"""
+make_qr_codes.py
+
+Makes the printable QR codes for every node tagged `qr=<code>` in final.osm.
+
+For each code it writes:
+  <out>/<CODE>.png     one card: the QR code, the code, and where it is
+  <out>/sheet.pdf      all cards, four to an A4 page, ready to print
+  <out>/codes.csv      code, name, building, level, and the text in the QR
+
+It reads the OSM file directly, so it works before you re-run the ingest and
+needs no database.
+
+Run from the repo root:
+
+    pip install "qrcode[pil]"
+    python -m backend.pipeline.make_qr_codes
+    python -m backend.pipeline.make_qr_codes --osm backend/data/final.osm --out qr_codes
+
+What is inside each QR code is   campusnav://qr/<CODE>   by default. The app
+accepts that and also the bare code. If you later put the app on the web,
+re-run with  --prefix https://your-domain/q/  and reprint; the codes in the
+map do not change.
+"""
+
+import argparse
+import csv
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")  # same rule as the ingest
+DEFAULT_PREFIX = "campusnav://qr/"
+
+CARD_W, CARD_H = 1100, 1500
+PAGE_W, PAGE_H = 2480, 3508  # A4 at 300 dpi
+
+
+_ORDINALS = ["Ground floor", "First floor", "Second floor", "Third floor",
+             "Fourth floor", "Fifth floor", "Sixth floor", "Seventh floor",
+             "Eighth floor", "Ninth floor", "Tenth floor"]
+
+
+def level_label(level):
+    """"0" -> "Ground floor", "1" -> "First floor", "-1" -> "Basement"."""
+    text = str(level if level is not None else "0").split(";")[0].strip()
+    try:
+        n = int(text)
+    except ValueError:
+        return text  # something like "M": print it as typed
+    if n == -1:
+        return "Basement"
+    if n < -1:
+        return f"Basement {-n}"
+    if n < len(_ORDINALS):
+        return _ORDINALS[n]
+    return f"Floor {n}"
+
+
+def read_qr_nodes(osm_path):
+    """Return [{code, name, building, level, node_id}] for tagged nodes."""
+    tree = ET.parse(str(osm_path))
+    found = []
+    for node in tree.getroot().iter("node"):
+        tags = {t.get("k"): t.get("v") for t in node.findall("tag")}
+        code = (tags.get("qr") or "").strip()
+        if not code:
+            continue
+        found.append(
+            {
+                "code": code,
+                "name": (tags.get("name") or tags.get("loc_name") or "").strip(),
+                "building": (tags.get("building_name") or "").strip(),
+                "level": (tags.get("level") or "0").split(";")[0],
+                "node_id": node.get("id"),
+            }
+        )
+    return found
+
+
+def check_codes(nodes):
+    """Split into (good, problems). Problems are human-readable strings."""
+    good, problems, seen = [], [], {}
+    for n in nodes:
+        code = n["code"]
+        if not CODE_RE.match(code):
+            problems.append(
+                f"node {n['node_id']}: invalid code {code!r} "
+                "(letters, digits, - and _ only, max 32)"
+            )
+            continue
+        key = code.lower()
+        if key in seen:
+            problems.append(
+                f"code {code!r} is used by nodes {seen[key]} and {n['node_id']}"
+            )
+            continue
+        seen[key] = n["node_id"]
+        good.append(n)
+    return good, problems
+
+
+def _font(size, bold=False):
+    from PIL import ImageFont
+
+    names = (
+        ["arialbd.ttf", "DejaVuSans-Bold.ttf"]
+        if bold
+        else ["arial.ttf", "DejaVuSans.ttf"]
+    )
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default(size=size)
+
+
+def _centered(draw, text, y, font, fill, width):
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text(((width - (box[2] - box[0])) / 2, y), text, font=font, fill=fill)
+
+
+def _wrap(draw, text, font, max_width):
+    words, lines, line = text.split(), [], ""
+    for w in words:
+        trial = (line + " " + w).strip()
+        if draw.textbbox((0, 0), trial, font=font)[2] <= max_width or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = w
+    if line:
+        lines.append(line)
+    return lines
+
+
+def make_card(node, payload):
+    import qrcode
+    from PIL import Image, ImageDraw
+
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_Q,  # survives scuffs
+        box_size=14,
+        border=3,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    side = 860
+    qr_img = qr_img.resize((side, side), Image.NEAREST)
+
+    card = Image.new("RGB", (CARD_W, CARD_H), "white")
+    draw = ImageDraw.Draw(card)
+    draw.rectangle([4, 4, CARD_W - 5, CARD_H - 5], outline="#046c2f", width=8)
+
+    _centered(draw, "SCAN TO START NAVIGATION", 70, _font(58, True), "#046c2f", CARD_W)
+    _centered(draw, "Campus Navigation", 150, _font(44), "#444444", CARD_W)
+    card.paste(qr_img, ((CARD_W - side) // 2, 260))
+
+    y = 260 + side + 40
+    _centered(draw, node["code"], y, _font(96, True), "black", CARD_W)
+    y += 130
+    name_font = _font(50)
+    for line in _wrap(draw, node["name"] or "", name_font, CARD_W - 160)[:2]:
+        _centered(draw, line, y, name_font, "#222222", CARD_W)
+        y += 64
+    where = ", ".join(x for x in [node["building"], level_label(node["level"])] if x)
+    _centered(draw, where, y + 10, _font(42), "#555555", CARD_W)
+    return card
+
+
+def make_sheet(cards, path):
+    """Four cards per A4 page -> multi-page PDF."""
+    from PIL import Image
+
+    pages = []
+    scale = 0.98 * (PAGE_W / 2) / CARD_W
+    cw, ch = int(CARD_W * scale), int(CARD_H * scale)
+    for i in range(0, len(cards), 4):
+        page = Image.new("RGB", (PAGE_W, PAGE_H), "white")
+        for j, card in enumerate(cards[i : i + 4]):
+            col, row = j % 2, j // 2
+            small = card.resize((cw, ch), Image.LANCZOS)
+            page.paste(small, (col * (PAGE_W // 2) + 20, row * (PAGE_H // 2) + 20))
+        pages.append(page)
+    if pages:
+        pages[0].save(str(path), "PDF", resolution=300, save_all=True,
+                      append_images=pages[1:])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Make printable QR codes.")
+    parser.add_argument("--osm", default="backend/data/final.osm")
+    parser.add_argument("--out", default="backend/data/qr_codes")
+    parser.add_argument("--prefix", default=DEFAULT_PREFIX)
+    args = parser.parse_args(argv)
+
+    osm = Path(args.osm)
+    if not osm.exists():
+        print(f"Cannot find {osm}. Use --osm to point at final.osm.")
+        return 1
+
+    nodes, problems = check_codes(read_qr_nodes(osm))
+    for p in problems:
+        print("  WARNING:", p)
+    if not nodes:
+        print("No nodes tagged qr=<code> found. Nothing to do.")
+        return 1
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    cards, rows = [], []
+    for n in sorted(nodes, key=lambda n: n["code"].lower()):
+        payload = f"{args.prefix}{n['code']}"
+        card = make_card(n, payload)
+        card.save(out / f"{n['code']}.png")
+        cards.append(card)
+        rows.append([n["code"], n["name"], n["building"], n["level"], payload])
+        print(f"  {n['code']:<14} {n['name']}")
+
+    with open(out / "codes.csv", "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["code", "name", "building", "level", "qr_text"])
+        w.writerows(rows)
+
+    make_sheet(cards, out / "sheet.pdf")
+    print(f"\n{len(cards)} codes written to {out}/  (print sheet.pdf)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\migrate_sqlite_to_postgres.py ---
 
@@ -30945,6 +31665,140 @@ class TestDurableRouteCache:
                     assert r2.status_code == 200
                     return
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_date_query.py ---
+
+"""Tests for date_query (finding dates in a question) and the date path of
+the document chat."""
+
+from datetime import date
+from unittest.mock import patch
+
+from backend.api.services import chat_doc_service, date_query
+
+TODAY = date(2026, 10, 19)
+
+
+def needles(q):
+    return date_query.find_date_needles(q, today=TODAY)
+
+
+def test_full_date_with_weekday_and_year():
+    assert needles("what is happening on friday may 1 of 2026") == (
+        ["2026-05-01)"], []
+    )
+
+
+def test_day_month_year():
+    assert needles("What is happening on Friday, 1 May 2026?")[0] == ["2026-05-01)"]
+
+
+def test_no_year_matches_any_year():
+    assert needles("events on may 1")[0] == ["-05-01)"]
+    assert needles("1st of May")[0] == ["-05-01)"]
+
+
+def test_swahili_month():
+    assert needles("nini kinatokea 1 Mei 2026")[0] == ["2026-05-01)"]
+    assert needles("tarehe 15 Oktoba")[0] == ["-10-15)"]
+
+
+def test_iso_and_numeric_day_first():
+    assert needles("what about 2026-12-25")[0] == ["2026-12-25)"]
+    assert needles("exam on 05/03/2026")[0] == ["2026-03-05)"]
+
+
+def test_relative_days():
+    assert needles("what is on tomorrow")[0] == ["2026-10-20)"]
+    assert needles("leo kuna nini")[0] == ["2026-10-19)"]
+    assert needles("what happened yesterday")[0] == ["2026-10-18)"]
+
+
+def test_month_only():
+    assert needles("what happens in May") == ([], ["-05-"])
+    assert needles("mwezi wa Novemba") == ([], ["-11-"])
+
+
+def test_two_dates():
+    assert needles("what is on 30 April and 1 May")[0] == ["-04-30)", "-05-01)"]
+
+
+def test_no_false_positives():
+    assert needles("when is college board appeal") == ([], [])
+    assert needles("what may happen next") == ([], [])
+    assert needles("Room 12 on the 3rd floor") == ([], [])
+    assert needles("31 February 2026") == ([], [])
+
+
+# ---- the chat path ----------------------------------------------------
+
+LABOUR = {
+    "text": "On Friday, 1 May 2026 (2026-05-01), there is one event: Labour Day.",
+    "metadata": {"source_file": "almanac.md", "page_number": 1},
+    "score": 1.0,
+}
+RANDOM = {
+    "text": "On Monday, 5 January 2026 (2026-01-05), there are 2 events: ...",
+    "metadata": {"source_file": "almanac.md", "page_number": 1},
+    "score": 0.4,
+}
+
+
+def test_date_chunk_goes_first_and_reaches_the_model():
+    seen = {}
+
+    def fake_chat(messages, **kwargs):
+        seen["prompt"] = messages[-1]["content"]
+        return "Labour Day."
+
+    with patch.object(chat_doc_service.knowledge_service, "retrieve",
+                      return_value=[RANDOM]), \
+         patch.object(chat_doc_service.knowledge_service, "retrieve_containing",
+                      return_value=[LABOUR]), \
+         patch.object(chat_doc_service.llm_client, "is_available",
+                      return_value=True), \
+         patch.object(chat_doc_service.llm_client, "chat", side_effect=fake_chat):
+        reply, used = chat_doc_service.answer_doc_question(
+            "what is happening on friday may 1 of 2026"
+        )
+
+    assert used is True
+    assert reply == "Labour Day."
+    assert seen["prompt"].index("Labour Day") < seen["prompt"].index("5 January")
+
+
+def test_date_with_no_entry_gives_the_model_a_note():
+    seen = {}
+
+    def fake_chat(messages, **kwargs):
+        seen["prompt"] = messages[-1]["content"]
+        return "Nothing listed."
+
+    with patch.object(chat_doc_service.knowledge_service, "retrieve",
+                      return_value=[RANDOM]), \
+         patch.object(chat_doc_service.knowledge_service, "retrieve_containing",
+                      return_value=[]), \
+         patch.object(chat_doc_service.llm_client, "is_available",
+                      return_value=True), \
+         patch.object(chat_doc_service.llm_client, "chat", side_effect=fake_chat):
+        chat_doc_service.answer_doc_question("what is on 2 May 2026")
+
+    assert "no entry was found" in seen["prompt"]
+
+
+def test_question_without_a_date_is_unchanged():
+    with patch.object(chat_doc_service.knowledge_service, "retrieve",
+                      return_value=[RANDOM]) as retrieve, \
+         patch.object(chat_doc_service.knowledge_service, "retrieve_containing",
+                      return_value=[LABOUR]) as lookup, \
+         patch.object(chat_doc_service.llm_client, "is_available",
+                      return_value=False):
+        reply, used = chat_doc_service.answer_doc_question("when is college board")
+
+    lookup.assert_not_called()
+    assert used is True
+    assert "5 January" in reply
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_import_timetable.py ---
 
 """
@@ -31927,6 +32781,149 @@ class TestMixedRouteInvariants:
                 f"(geometry has {len(geometry)} points)"
             )
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_qr.py ---
+
+"""
+Tests for QR start points.
+
+A node tagged qr=<code> in final.osm becomes an indoor place with category
+"qr". It must (a) be found by /api/qr/<code>, (b) be usable as a route start,
+and (c) never show up in searches or room counts.
+"""
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from backend.api.dependencies import db_session
+from backend.api.errors import http_exception_handler
+from backend.api.models.place import Place
+from backend.api.routers import qr as qr_router
+from backend.api.services import place_service
+from backend.pipeline.ingest import ingest_indoor_places
+
+
+def _node(lat, lon, **tags):
+    return {"lat": lat, "lon": lon, "tags": tags}
+
+
+def _osm(extra=None):
+    nodes = {
+        "-1": _node(-8.94, 33.41, name="Room 1 door", door="yes",
+                    level="0", building_name="Library"),
+        "-2": _node(-8.9401, 33.4101, name="the corridor near Room 1",
+                    qr="LIB-G-01", level="0", building_name="Library"),
+        "-3": _node(-8.9402, 33.4102, name="the corridor by the stairs",
+                    qr="LIB-G-02", level="1", building_name="Library"),
+    }
+    nodes.update(extra or {})
+    return nodes, []
+
+
+@pytest.fixture
+def session(temp_db):
+    from backend.api.db.session import session_scope
+    with session_scope() as s:
+        yield s
+
+
+def test_ingest_creates_qr_places(session):
+    nodes, ways = _osm()
+    counts = ingest_indoor_places(nodes, ways, session)
+    session.flush()
+
+    assert counts["qr_points"] == 2
+    row = session.query(Place).filter_by(ref="LIB-G-01").one()
+    assert row.kind == "indoor"          # so routing treats it as an indoor start
+    assert row.category == "qr"
+    assert row.name == "the corridor near Room 1"
+    assert row.building_name == "Library"
+    assert row.level == "0"
+    assert session.query(Place).filter_by(ref="LIB-G-02").one().level == "1"
+
+
+def test_ingest_skips_bad_duplicate_and_door_qr_tags(session, capsys):
+    nodes, ways = _osm(
+        {
+            "-4": _node(0, 0, name="bad", qr="has space"),
+            "-5": _node(0, 0, name="dupe", qr="lib-g-01"),   # same as -2, any case
+            "-6": _node(0, 0, name="a door", door="yes", qr="DOOR-1"),
+            "-7": _node(0, 0, qr="NONAME-1"),            # no name tag
+        }
+    )
+    counts = ingest_indoor_places(nodes, ways, session)
+    session.flush()
+
+    assert counts["qr_points"] == 3            # LIB-G-01, LIB-G-02, NONAME-1
+    out = capsys.readouterr().out
+    assert "invalid qr code" in out
+    assert "must be unique" in out
+    assert "also a door" in out
+    noname = session.query(Place).filter_by(ref="NONAME-1").one()
+    assert noname.name == "corridor point NONAME-1"
+
+
+def test_qr_points_are_hidden_from_search_and_counts(session):
+    nodes, ways = _osm()
+    ingest_indoor_places(nodes, ways, session)
+    session.flush()
+
+    names = [p.name for p in place_service.search_places(session)]
+    assert "Room 1 door" in names
+    assert "the corridor near Room 1" not in names
+    assert place_service.search_places(session, q="corridor") == []
+    assert place_service.search_places(session, kind="indoor", building_name="Library")[0].name == "Room 1 door"
+
+    # Only the door counts as a room, not the two QR points.
+    assert place_service.list_building_counts(session) == {"Library": 1}
+
+    # Asking for them explicitly still works (admin/debug).
+    qr_only = place_service.search_places(session, category="qr")
+    assert {p.name for p in qr_only} == {
+        "the corridor near Room 1", "the corridor by the stairs"
+    }
+
+
+@pytest.fixture
+def client(session):
+    app = FastAPI()
+    app.include_router(qr_router.router)
+    app.add_exception_handler(Exception, http_exception_handler)
+    from fastapi import HTTPException
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.dependency_overrides[db_session] = lambda: session
+    nodes, ways = _osm()
+    ingest_indoor_places(nodes, ways, session)
+    session.flush()
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_resolve_known_code(client):
+    r = client.get("/api/qr/LIB-G-01")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "the corridor near Room 1"
+    assert body["kind"] == "indoor"
+    assert body["building_name"] == "Library"
+    assert body["level"] == "0"
+    assert body["location"] == {"lat": -8.9401, "lon": 33.4101}
+
+
+def test_resolve_is_case_insensitive(client):
+    assert client.get("/api/qr/lib-g-02").status_code == 200
+
+
+def test_unknown_and_malformed_codes_are_404(client):
+    assert client.get("/api/qr/NOPE-1").status_code == 404
+    assert client.get("/api/qr/%20%20").status_code == 404
+    assert client.get("/api/qr/" + "A" * 40).status_code == 404
+
+
+def test_an_ordinary_door_is_not_a_qr_code(client):
+    # "Room 1 door" has no qr tag, and its ref is empty.
+    assert client.get("/api/qr/Room1door").status_code == 404
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_rate_limit.py ---
 
 """
@@ -32148,6 +33145,167 @@ class TestReimportNeverDeletes:
         with session_scope() as session:
             count = session.query(Place).count()
         assert count == 2
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_rooms_alt_stairs.py ---
+
+"""
+Tests for: rooms added later still being listed, alternative names, and
+stairs polygons.
+"""
+
+import pytest
+
+from backend.api.models.indoor_area import IndoorArea
+from backend.api.models.place import Place
+from backend.api.schemas.place import PlaceListParams
+from backend.api.services import place_service
+from backend.pipeline.ingest import ingest_indoor_places
+
+
+@pytest.fixture
+def session(temp_db):
+    from backend.api.db.session import session_scope
+    with session_scope() as s:
+        yield s
+
+
+def _add_rooms(session, count, building="Library"):
+    for i in range(count):
+        session.add(
+            Place(
+                osm_type="node", osm_id=f"-{1000 + i}", kind="indoor",
+                name=f"Room {i:03d}", lat=-8.94, lon=33.41,
+                building_name=building, level="0",
+            )
+        )
+    session.flush()
+
+
+def test_limit_cap_is_raised_to_2000():
+    assert PlaceListParams(limit=2000).limit == 2000
+    with pytest.raises(Exception):
+        PlaceListParams(limit=2001)
+
+
+def test_a_long_list_keeps_the_newest_rooms_too(session):
+    # 300 rooms. Under the old code (no ORDER BY) LIMIT 200 kept only the
+    # first 200 stored and the newest 100 never appeared.
+    _add_rooms(session, 300)
+    got = place_service.search_places(session, kind="indoor", limit=2000)
+    assert len(got) == 300
+    assert got[-1].name == "Room 299"
+
+    # And when a limit does cut the list, it cuts in a stable order
+    # (by building, then name), not by when the row was stored.
+    names = [p.name for p in place_service.search_places(session, kind="indoor", limit=5)]
+    assert names == ["Room 000", "Room 001", "Room 002", "Room 003", "Room 004"]
+
+
+def test_search_puts_names_that_start_with_the_text_first(session):
+    for i, name in enumerate(["Old Lab 1", "Lab 2", "Lab 1"]):
+        session.add(Place(osm_type="node", osm_id=f"-{i}", kind="indoor",
+                          name=name, lat=0, lon=0))
+    session.flush()
+    names = [p.name for p in place_service.search_places(session, q="lab")]
+    assert names == ["Lab 1", "Lab 2", "Old Lab 1"]
+
+
+def test_nearest_first_when_a_position_is_given(session):
+    for i, (name, lat) in enumerate([("far", -8.95), ("near", -8.9401), ("mid", -8.942)]):
+        session.add(Place(osm_type="node", osm_id=f"-{i}", kind="indoor",
+                          name=name, lat=lat, lon=33.41))
+    session.flush()
+    got = place_service.search_places(session, lat=-8.94, lon=33.41, radius_m=5000)
+    assert [p.name for p in got] == ["near", "mid", "far"]
+    assert [p.name for p in place_service.search_places(session, lat=-8.94, lon=33.41, radius_m=5000, limit=1)] == ["near"]
+
+
+def _node(lat, lon, **tags):
+    return {"lat": lat, "lon": lon, "tags": tags}
+
+
+def test_alt_name_reaches_the_summary_for_a_door_node(session):
+    nodes = {"-1": _node(-8.94, 33.41, name="Room 12", door="yes", level="1",
+                         building_name="Library", alt_name="Computer Lab;ICT Lab")}
+    ingest_indoor_places(nodes, [], session)
+    session.flush()
+    got = place_service.search_places(session, kind="indoor")[0]
+    assert got.alt_names == "Computer Lab;ICT Lab"
+    # ...and searching by the alternative name finds the room.
+    assert [p.name for p in place_service.search_places(session, q="ict lab")] == ["Room 12"]
+
+
+def test_alt_name_on_the_room_polygon_is_passed_to_its_door(session):
+    nodes = {
+        "-1": _node(-8.94, 33.41, name="Room 12", door="yes", level="1", building_name="Library"),
+        "-2": _node(-8.9401, 33.41),
+        "-3": _node(-8.9401, 33.4101),
+        "-4": _node(-8.94, 33.4101),
+    }
+    ways = [{"id": "-50", "tags": {"indoor": "room", "name": "Room 12", "level": "1",
+                                   "building_name": "Library", "alt_name": "Dean's Office"},
+             "refs": ["-1", "-2", "-3", "-4", "-1"]}]
+    ingest_indoor_places(nodes, ways, session)
+    session.flush()
+    assert session.query(Place).filter_by(osm_id="-1").one().alt_names == "Dean's Office"
+
+
+def test_door_own_alt_name_wins_over_the_polygon(session):
+    nodes = {
+        "-1": _node(-8.94, 33.41, name="Room 12", door="yes", level="1",
+                    building_name="Library", alt_name="Door value"),
+        "-2": _node(-8.9401, 33.41), "-3": _node(-8.9401, 33.4101), "-4": _node(-8.94, 33.4101),
+    }
+    ways = [{"id": "-50", "tags": {"indoor": "room", "level": "1", "alt_name": "Polygon value"},
+             "refs": ["-1", "-2", "-3", "-4", "-1"]}]
+    ingest_indoor_places(nodes, ways, session)
+    session.flush()
+    assert session.query(Place).filter_by(osm_id="-1").one().alt_names == "Door value"
+
+
+def _square(i):
+    base = i * 0.0001
+    return {f"-{i}1": _node(-8.94, 33.41 + base), f"-{i}2": _node(-8.9401, 33.41 + base),
+            f"-{i}3": _node(-8.9401, 33.4101 + base)}
+
+
+def test_stairs_polygon_is_stored_and_not_searchable(session):
+    nodes = _square(1)
+    ways = [{"id": "-70", "tags": {"indoor": "stairs", "level": "0", "building_name": "Library"},
+             "refs": ["-11", "-12", "-13", "-11"]}]
+    counts = ingest_indoor_places(nodes, ways, session)
+    session.flush()
+    assert counts["areas"] == 1
+    row = session.query(IndoorArea).one()
+    assert (row.type, row.level, row.name, row.building_name) == ("stairs", "0", "stairs", "Library")
+    assert place_service.search_places(session) == []   # areas are never places
+
+
+def test_a_stair_serving_two_floors_is_drawn_on_both(session):
+    nodes = _square(1)
+    ways = [{"id": "-70", "tags": {"indoor": "stairs", "level": "0;1", "building_name": "Library"},
+             "refs": ["-11", "-12", "-13", "-11"]}]
+    counts = ingest_indoor_places(nodes, ways, session)
+    session.flush()
+    assert counts["areas"] == 2
+    rows = {r.level: r.osm_id for r in session.query(IndoorArea).all()}
+    assert rows == {"0": "-70", "1": "-70@1"}
+
+    # Running the ingest again does not duplicate them.
+    ingest_indoor_places(nodes, ways, session)
+    session.flush()
+    assert session.query(IndoorArea).count() == 2
+
+
+def test_a_room_with_two_levels_still_uses_the_first_only(session):
+    nodes = _square(1)
+    ways = [{"id": "-71", "tags": {"indoor": "room", "name": "Hall", "level": "0;1"},
+             "refs": ["-11", "-12", "-13", "-11"]}]
+    counts = ingest_indoor_places(nodes, ways, session)
+    session.flush()
+    assert counts["areas"] == 1
+    assert session.query(IndoorArea).one().level == "0"
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_route_composer.py ---
 
@@ -33130,9 +34288,9 @@ import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
 // with that question and sends it.
 const DOC_QUICK_PROMPTS = [
   'When does the semester end?',
-  'What are the library hours?',
-  'How do I contact the dean?',
   'What are the exam rules?',
+  'What does MUSTSO cabinet comprise of?',
+  'Who is the head of the Computer Science department?',
 ];
 
 export default function ChatScreen() {
@@ -33521,7 +34679,7 @@ export default function ExploreScreen() {
   useEffect(() => {
     let cancelled = false;
 
-    listPlaces({ kind: 'outdoor', limit: 200 })
+    listPlaces({ kind: 'outdoor', limit: 2000 })
       .then((data) => {
         if (cancelled) return;
         const landmarks = data.filter((p) => p.is_landmark);
@@ -33566,7 +34724,7 @@ export default function ExploreScreen() {
     listPlaces({
       kind: 'outdoor',
       intent: intent || undefined,
-      limit: 200,
+      limit: 2000,
     })
       .then((data) => {
         if (!cancelled) setPlaces(data);
@@ -33692,6 +34850,8 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\index.jsx ---
 
@@ -34143,6 +35303,20 @@ export default function HomeScreen() {
 
         <FromChip start={start} onPress={openStartSheet} />
 
+        <TouchableOpacity
+          style={styles.scanButton}
+          onPress={() => router.push('/scan')}
+          accessibilityRole="button"
+          accessibilityLabel={t('qr.scanButton')}
+        >
+          <MaterialIcons
+            name="qr-code-scanner"
+            size={20}
+            color={COLORS.primary}
+          />
+          <Text style={styles.scanButtonText}>{t('qr.scanButton')}</Text>
+        </TouchableOpacity>
+
         {nextClass ? (
           <NextClassBanner
             entry={nextClass.entry}
@@ -34258,6 +35432,25 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
+  scanButton: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: SPACING.md,
+    marginBottom: SPACING.sm,
+    paddingHorizontal: 14,
+    minHeight: TOUCH.minHeight - 8,
+    borderRadius: 24,
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
+    backgroundColor: COLORS.background,
+  },
+  scanButtonText: {
+    marginLeft: 8,
+    color: COLORS.primary,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+  },
   container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
   scroll: { flex: 1 },
   scrollContent: { paddingBottom: SPACING.xl },
@@ -35628,6 +36821,296 @@ const styles = StyleSheet.create({
   primaryButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\scan.jsx ---
+
+// Scan a QR code to say where you are.
+//
+// The camera reads the code printed on the wall. Typing the code printed
+// under the QR also works, for a damaged sticker, a denied camera
+// permission, or a build made before the camera package was added.
+
+import { useCallback, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { Stack, router } from 'expo-router';
+import { MaterialIcons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
+import { t } from '@/i18n';
+import { startFromQr } from '@/services/qr';
+
+// expo-camera is a native module. It exists only in an app build made after
+// it was installed. Load it defensively so that an older build still opens
+// this screen and the typed-code box still works.
+let CameraModule = null;
+try {
+  CameraModule = require('expo-camera');
+} catch {
+  CameraModule = null;
+}
+
+// Wait this long after a failed scan before reading another code, so the
+// camera doesn't hammer the server while it is still pointed at the same QR.
+const RETRY_DELAY_MS = 2000;
+
+function CameraScanner({ onCode }) {
+  const { CameraView, useCameraPermissions } = CameraModule;
+  const [permission, requestPermission] = useCameraPermissions();
+
+  if (!permission) {
+    return (
+      <View style={styles.cameraFallback}>
+        <ActivityIndicator color={COLORS.headerText} />
+      </View>
+    );
+  }
+
+  if (!permission.granted) {
+    return (
+      <View style={styles.cameraFallback}>
+        <Text style={styles.cameraFallbackText}>{t('qr.cameraDenied')}</Text>
+        <TouchableOpacity
+          style={styles.permissionButton}
+          onPress={requestPermission}
+          accessibilityRole="button"
+        >
+          <Text style={styles.permissionButtonText}>
+            {t('qr.grantPermission')}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.camera}>
+      <CameraView
+        style={StyleSheet.absoluteFill}
+        facing="back"
+        barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+        onBarcodeScanned={({ data }) => onCode(data)}
+      />
+      <View style={styles.frameWrap} pointerEvents="none">
+        <View style={styles.frame} />
+        <Text style={styles.hint}>{t('qr.hint')}</Text>
+      </View>
+    </View>
+  );
+}
+
+export default function ScanScreen() {
+  // The phone's navigation bar sits over the bottom of the screen. Keep the
+  // typed-code box and its button clear of it.
+  const insets = useSafeAreaInsets();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [typed, setTyped] = useState('');
+  const busyRef = useRef(false);
+
+  const handleCode = useCallback(async (raw) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      await startFromQr(raw);
+      router.replace('/');
+    } catch (e) {
+      const message =
+        e.reason === 'unknown'
+          ? t('qr.errorUnknown')
+          : e.reason === 'invalid'
+            ? t('qr.errorInvalid')
+            : t('qr.errorNetwork');
+      setError(message);
+      setBusy(false);
+      setTimeout(() => {
+        busyRef.current = false;
+      }, RETRY_DELAY_MS);
+    }
+  }, []);
+
+  return (
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
+      <Stack.Screen options={{ title: t('qr.title') }} />
+
+      {CameraModule ? (
+        <CameraScanner onCode={handleCode} />
+      ) : (
+        <View style={styles.cameraFallback}>
+          <MaterialIcons
+            name="qr-code-scanner"
+            size={48}
+            color={COLORS.headerText}
+          />
+          <Text style={styles.cameraFallbackText}>{t('qr.notAvailable')}</Text>
+        </View>
+      )}
+
+      <View
+        style={[
+          styles.panel,
+          { paddingBottom: SPACING.md + Math.max(insets.bottom, 0) },
+        ]}
+      >
+        {busy ? (
+          <View style={styles.statusRow}>
+            <ActivityIndicator color={COLORS.primary} />
+            <Text style={styles.statusText}>{t('qr.finding')}</Text>
+          </View>
+        ) : error ? (
+          <Text style={styles.errorText} accessibilityLiveRegion="polite">
+            {error}
+          </Text>
+        ) : null}
+
+        <Text style={styles.label}>{t('qr.manualLabel')}</Text>
+        <View style={styles.inputRow}>
+          <TextInput
+            style={styles.input}
+            value={typed}
+            onChangeText={setTyped}
+            placeholder={t('qr.manualPlaceholder')}
+            placeholderTextColor={COLORS.textFaint}
+            autoCapitalize="characters"
+            autoCorrect={false}
+            returnKeyType="go"
+            onSubmitEditing={() => handleCode(typed)}
+          />
+          <TouchableOpacity
+            style={[styles.go, !typed.trim() && styles.goDisabled]}
+            onPress={() => handleCode(typed)}
+            disabled={!typed.trim() || busy}
+            accessibilityRole="button"
+          >
+            <Text style={styles.goText}>{t('qr.manualSubmit')}</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </KeyboardAvoidingView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: COLORS.backgroundSubtle },
+  camera: { flex: 1, backgroundColor: '#000' },
+  cameraFallback: {
+    flex: 1,
+    backgroundColor: COLORS.primaryDark,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: SPACING.lg,
+  },
+  cameraFallbackText: {
+    color: COLORS.headerText,
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
+    marginTop: SPACING.md,
+  },
+  permissionButton: {
+    marginTop: SPACING.md,
+    backgroundColor: COLORS.background,
+    borderRadius: 24,
+    paddingHorizontal: SPACING.lg,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  permissionButtonText: {
+    color: COLORS.primaryDark,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+  },
+  frameWrap: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  frame: {
+    width: 240,
+    height: 240,
+    borderRadius: 20,
+    borderWidth: 4,
+    borderColor: '#ffffff',
+    opacity: 0.9,
+  },
+  hint: {
+    marginTop: SPACING.md,
+    color: '#ffffff',
+    fontSize: FONT_SIZE.body,
+    textAlign: 'center',
+    paddingHorizontal: SPACING.lg,
+    textShadowColor: 'rgba(0,0,0,0.6)',
+    textShadowRadius: 4,
+  },
+  panel: {
+    backgroundColor: COLORS.background,
+    padding: SPACING.md,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.border,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: SPACING.sm,
+  },
+  statusText: {
+    marginLeft: SPACING.sm,
+    color: COLORS.text,
+    fontSize: FONT_SIZE.body,
+  },
+  errorText: {
+    color: COLORS.danger,
+    fontSize: FONT_SIZE.body,
+    marginBottom: SPACING.sm,
+  },
+  label: {
+    color: COLORS.textMuted,
+    fontSize: FONT_SIZE.small,
+    marginBottom: SPACING.xs,
+  },
+  inputRow: { flexDirection: 'row', alignItems: 'center' },
+  input: {
+    flex: 1,
+    minHeight: TOUCH.minHeight,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 12,
+    paddingHorizontal: SPACING.md,
+    fontSize: FONT_SIZE.body,
+    color: COLORS.text,
+    backgroundColor: COLORS.background,
+  },
+  go: {
+    marginLeft: SPACING.sm,
+    minHeight: TOUCH.minHeight,
+    paddingHorizontal: SPACING.md,
+    borderRadius: 12,
+    backgroundColor: COLORS.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  goDisabled: { opacity: 0.45 },
+  goText: {
+    color: COLORS.headerText,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+  },
+});
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\settings.jsx ---
 
 // Settings screen.
@@ -36252,6 +37735,8 @@ export default function WalkingScreen() {
     gpsStale,
     mode,
     advanceStep,
+    previousStep,
+    canGoBack,
     isLastStep,
     indoorLevel,
     indoorBuildingName,
@@ -36628,6 +38113,8 @@ export default function WalkingScreen() {
             gpsStale={gpsStale}
             mode={mode}
             onAdvanceStep={handleAdvanceStep}
+            onPreviousStep={previousStep}
+            canGoBack={canGoBack}
             isLastStep={isLastStep}
           />
         </View>
@@ -36682,6 +38169,128 @@ const styles = StyleSheet.create({
   },
 });
 
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\[code].jsx ---
+
+// Landing screen for the link inside a QR code: campusnav://qr/<CODE>.
+//
+// Opens when a student scans the code with the phone's own camera (if the
+// phone offers to open it in the app) or taps the link. It does the same
+// thing as scanning inside the app: sets the starting point, then goes home.
+
+import { useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { Stack, router, useLocalSearchParams } from 'expo-router';
+
+import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
+import { t } from '@/i18n';
+import { startFromQr } from '@/services/qr';
+
+export default function QrLanding() {
+  const { code } = useLocalSearchParams();
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        await startFromQr(String(code || ''));
+        if (!cancelled) router.replace('/');
+      } catch (e) {
+        if (cancelled) return;
+        setError(
+          e.reason === 'unknown'
+            ? t('qr.errorUnknown')
+            : e.reason === 'invalid'
+              ? t('qr.errorInvalid')
+              : t('qr.errorNetwork')
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [code]);
+
+  return (
+    <View style={styles.container}>
+      <Stack.Screen options={{ title: t('qr.title') }} />
+      {error ? (
+        <>
+          <Text style={styles.error}>{error}</Text>
+          <TouchableOpacity
+            style={styles.primary}
+            onPress={() => router.replace('/scan')}
+            accessibilityRole="button"
+          >
+            <Text style={styles.primaryText}>{t('qr.scanAgain')}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.secondary}
+            onPress={() => router.replace('/')}
+            accessibilityRole="button"
+          >
+            <Text style={styles.secondaryText}>{t('qr.goHome')}</Text>
+          </TouchableOpacity>
+        </>
+      ) : (
+        <>
+          <ActivityIndicator size="large" color={COLORS.primary} />
+          <Text style={styles.status}>{t('qr.finding')}</Text>
+        </>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: COLORS.backgroundSubtle,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: SPACING.lg,
+  },
+  status: {
+    marginTop: SPACING.md,
+    color: COLORS.text,
+    fontSize: FONT_SIZE.body,
+  },
+  error: {
+    color: COLORS.danger,
+    fontSize: FONT_SIZE.large,
+    textAlign: 'center',
+    marginBottom: SPACING.lg,
+  },
+  primary: {
+    minHeight: TOUCH.minHeight,
+    minWidth: 200,
+    borderRadius: 24,
+    backgroundColor: COLORS.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: SPACING.lg,
+  },
+  primaryText: {
+    color: COLORS.headerText,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
+  },
+  secondary: {
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: SPACING.sm,
+  },
+  secondaryText: { color: COLORS.primary, fontSize: FONT_SIZE.body },
+});
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\_layout.jsx ---
@@ -36813,7 +38422,13 @@ export default function RootLayout() {
     },
     "plugins": [
       "expo-router",
-      "@maplibre/maplibre-react-native"
+      "@maplibre/maplibre-react-native",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Campus Navigation uses the camera to scan QR codes that show where you are inside a building."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": false
@@ -37108,6 +38723,8 @@ import { MaterialIcons } from '@expo/vector-icons';
 
 import { listPlaces } from '@/services/api';
 import { t } from '@/i18n';
+import { levelLabel } from '@/utils/levelLabel';
+import { formatPlaceName, searchableText } from '@/utils/placeLabel';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 const SEARCH_THRESHOLD = 10;
@@ -37131,7 +38748,7 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
     listPlaces({
       kind: 'indoor',
       building_name: buildingName,
-      limit: 200,
+      limit: 2000,
     })
       .then((data) => {
         if (!cancelled) setRooms(Array.isArray(data) ? data : []);
@@ -37155,10 +38772,7 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
     if (!rooms) return [];
     const q = search.trim().toLowerCase();
     if (!q) return rooms;
-    return rooms.filter((r) => {
-      const haystack = [r.name || '', r.ref || ''].join(' ').toLowerCase();
-      return haystack.includes(q);
-    });
+    return rooms.filter((r) => searchableText(r).includes(q));
   }, [rooms, search]);
 
   const grouped = useMemo(() => groupByLevel(filtered), [filtered]);
@@ -37215,10 +38829,10 @@ export function BuildingRooms({ buildingName, onOpenRoom }) {
                     style={styles.roomRow}
                     onPress={() => onOpenRoom(room)}
                     accessibilityRole="button"
-                    accessibilityLabel={room.name}
+                    accessibilityLabel={formatPlaceName(room)}
                   >
-                    <Text style={styles.roomName} numberOfLines={1}>
-                      {room.name}
+                    <Text style={styles.roomName} numberOfLines={2}>
+                      {formatPlaceName(room)}
                     </Text>
                     <MaterialIcons
                       name="chevron-right"
@@ -37265,15 +38879,6 @@ function levelSortKey(level) {
   const n = Number(level);
   if (Number.isFinite(n)) return n;
   return 999;
-}
-
-function levelLabel(level) {
-  if (level === '-1') return 'Basement';
-  if (level === '0') return 'Ground floor';
-  if (level === '1') return 'First floor';
-  if (level === '2') return 'Second floor';
-  if (level === '3') return 'Third floor';
-  return `Level ${level}`;
 }
 
 const styles = StyleSheet.create({
@@ -37346,6 +38951,8 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\CategoryChips.jsx ---
 
@@ -37731,6 +39338,7 @@ import { MaterialIcons } from '@expo/vector-icons';
 
 import { listIndoorDoors } from '@/services/api';
 import { t } from '@/i18n';
+import { formatPlaceName, placeLocationLine, searchableText } from '@/utils/placeLabel';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 export function DoorPickerSheet({
@@ -37773,12 +39381,7 @@ export function DoorPickerSheet({
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return doors;
-    return doors.filter((d) => {
-      const haystack = [d.name || '', d.room_name || '', d.building_name || '']
-        .join(' ')
-        .toLowerCase();
-      return haystack.includes(q);
-    });
+    return doors.filter((d) => searchableText(d).includes(q));
   }, [doors, search]);
 
   const handlePick = useCallback(
@@ -37847,16 +39450,14 @@ export function DoorPickerSheet({
                 style={styles.row}
                 onPress={() => handlePick(item)}
                 accessibilityRole="button"
-                accessibilityLabel={item.name}
+                accessibilityLabel={formatPlaceName(item)}
               >
                 <View style={styles.rowText}>
-                  <Text style={styles.rowName} numberOfLines={1}>
-                    {item.name}
+                  <Text style={styles.rowName} numberOfLines={2}>
+                    {formatPlaceName(item)}
                   </Text>
                   <Text style={styles.rowSubtitle} numberOfLines={1}>
-                    {[item.building_name, item.level != null ? `Level ${item.level}` : null]
-                      .filter(Boolean)
-                      .join(' · ')}
+                    {placeLocationLine(item)}
                   </Text>
                 </View>
               </TouchableOpacity>
@@ -37937,6 +39538,8 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\ErrorBoundary.jsx ---
 
@@ -38544,10 +40147,10 @@ const styles = StyleSheet.create({
 //     metres-per-pixel diagonal.
 //   - Heading is computed differently for the two modes:
 //       • Walking screen (lockHeading = false): the heading is the
-//         compass direction of the leg the student is about to walk,
-//         SNAPPED to one of N / E / S / W. Only four values, so the
-//         building outline never sits at a skew angle. Updates on a
-//         Next press, not continuously.
+//         direction of the road the student is about to walk,
+//         rounded to a multiple of INDOOR_HEADING_SNAP_DEG (90, 45,
+//         22.5, or 0 for the exact angle). Updates on a Next press,
+//         not continuously.
 //       • Preview (lockHeading = true): the heading is the start-to-
 //         end bearing of the whole route, snapped to N or S only.
 //         Unchanged from the previous version.
@@ -38582,11 +40185,28 @@ import { useSettings } from '@/context/SettingsContext';
 import { bearingDeg, haversineM } from '@/utils/geo';
 import { t } from '@/i18n';
 import { COLORS, RADIUS, SPACING } from '@/constants/theme';
+import { polygonLabelInfo } from '@/utils/polygonLabel';
+import { labelMinZoom } from '@/utils/labelFit';
+import { headingAlongRoute } from '@/utils/legBearing';
+import { headingLabel } from '@/utils/headingLabel';
 import {
   INDOOR_BACKGROUND_COLOR,
   INDOOR_INTERIOR_COLOR,
   INDOOR_BUILDING_OUTLINE_COLOR,
   INDOOR_BUILDING_OUTLINE_WIDTH,
+  INDOOR_STAIRS_COLOR,
+  INDOOR_STAIRS_OUTLINE_COLOR,
+  INDOOR_CORRIDOR_COLOR,
+  INDOOR_CORRIDOR_OUTLINE_COLOR,
+  INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_OUTLINE_COLOR,
+  INDOOR_ROOM_OUTLINE_WIDTH,
+  INDOOR_HEADING_SNAP_DEG,
+  INDOOR_LABEL_MIN_SIZE,
+  INDOOR_LABEL_MAX_SIZE,
+  INDOOR_LABEL_FULL_SIZE_ZOOM,
+  INDOOR_LABEL_WRAP_EM,
+  INDOOR_LABEL_FIT,
 } from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
@@ -38606,18 +40226,23 @@ const BLANK_STYLE = JSON.stringify({
 const FILL_COLOR_EXPR = [
   'match',
   ['get', 'type'],
-  'corridor', '#e2e8f0',
-  'room', '#ffffff',
-  '#ffffff',
+  'corridor', INDOOR_CORRIDOR_COLOR,
+  'room', INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_COLOR,
 ];
 
 // A bearing needs at least this much movement to be meaningful.
 // Below it, GPS noise would dominate, so we fall back to 0.
 const MIN_HEADING_DISTANCE_M = 3;
 
-// Walking screen: the only four headings the map will use. No
-// intermediate angles — the building stays square to the screen.
-const CARDINALS = [0, 90, 180, 270];
+// Walking screen: the map turns so the corridor you are about to walk
+// points up the screen, but only in steps of INDOOR_HEADING_SNAP_DEG, so a
+// small bend in a corridor does not keep turning the map.
+//   90   -> N, E, S, W only (the original behaviour)
+//   45   -> also NE, SE, SW, NW (default)
+//   22.5 -> 16 directions, for buildings that sit at odd angles
+//   0    -> no snapping: the exact direction of the corridor
+// Set it in constants/config.js.
 
 function levelLabel(level) {
   if (level === '-1') return 'B';
@@ -38625,20 +40250,13 @@ function levelLabel(level) {
   return level;
 }
 
-// Snap a bearing to the nearest of N / E / S / W.
+// Snap a bearing to the nearest multiple of INDOOR_HEADING_SNAP_DEG.
 function snapToCardinal(bearing) {
   if (bearing == null || !Number.isFinite(bearing)) return 0;
   const h = ((bearing % 360) + 360) % 360;
-  let best = 0;
-  let bestDiff = Infinity;
-  for (const c of CARDINALS) {
-    const diff = Math.abs(((h - c + 540) % 360) - 180);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = c;
-    }
-  }
-  return best;
+  const step = INDOOR_HEADING_SNAP_DEG;
+  if (!step || step <= 0) return h; // no snapping
+  return (Math.round(h / step) * step) % 360;
 }
 
 // Snap a bearing to N or S only. Used by the preview.
@@ -38650,14 +40268,6 @@ function snapToNorthSouth(bearing) {
 
 // Which compass letter is at the top of the screen for a given
 // heading.
-function topLetter(heading) {
-  const h = ((heading % 360) + 360) % 360;
-  if (h >= 315 || h < 45) return 'N';
-  if (h < 135) return 'E';
-  if (h < 225) return 'S';
-  return 'W';
-}
-
 function firstLegBearing(points) {
   /**
    * Given a list of { lat, lon }, return the bearing from the first
@@ -38676,6 +40286,25 @@ function firstLegBearing(points) {
     }
   }
   return null;
+}
+
+// ---- Room names --------------------------------------------------------
+// A name is shown only from the zoom at which it fits inside its room, so a
+// long name never spills over the neighbouring rooms. Names are a little
+// smaller when zoomed out. All of this is set in constants/config.js; the
+// numbers after ?? are used if a setting is missing there.
+const LABEL_MIN_SIZE = INDOOR_LABEL_MIN_SIZE ?? 8;
+const LABEL_MAX_SIZE = INDOOR_LABEL_MAX_SIZE ?? 11;
+const LABEL_FULL_SIZE_ZOOM = INDOOR_LABEL_FULL_SIZE_ZOOM ?? 19;
+const LABEL_WRAP_EM = INDOOR_LABEL_WRAP_EM ?? 7;
+const LABEL_FIT = INDOOR_LABEL_FIT ?? 1.3;
+const LABEL_START_ZOOM = 16; // at or below this zoom, names use the minimum size
+const LABEL_BAND_STEP = 0.5; // names appear in half-zoom steps
+const LABEL_FROM_ZOOM = 15; // below this zoom no names are shown
+const LABEL_TO_ZOOM = 22;
+const LABEL_BANDS = [];
+for (let z = LABEL_FROM_ZOOM; z <= LABEL_TO_ZOOM; z += LABEL_BAND_STEP) {
+  LABEL_BANDS.push(z);
 }
 
 export function IndoorMapView({
@@ -38805,11 +40434,59 @@ export function IndoorMapView({
     return { type: 'FeatureCollection', features };
   }, [areas]);
 
+  // One point per room, at the room's visual centre, carrying its name and
+  // the zoom from which that name fits inside the room (minZoom). Labels come
+  // from these points instead of from the room polygons, so every name sits
+  // in the middle of its room (see utils/polygonLabel.js and utils/labelFit.js).
+  const roomLabelsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      const info = polygonLabelInfo(ring);
+      if (!info) continue;
+      const minZoom = labelMinZoom(area.name, info.radiusM, {
+        latDeg: info.point[1],
+        minSize: LABEL_MIN_SIZE,
+        maxSize: LABEL_MAX_SIZE,
+        fullSizeZoom: LABEL_FULL_SIZE_ZOOM,
+        startZoom: LABEL_START_ZOOM,
+        wrapEm: LABEL_WRAP_EM,
+        fit: LABEL_FIT,
+        bandStep: LABEL_BAND_STEP,
+        fromZoom: LABEL_FROM_ZOOM,
+        toZoom: LABEL_TO_ZOOM,
+      });
+      if (minZoom === null) continue; // too small to ever hold its name
+      features.push({
+        type: 'Feature',
+        properties: { name: area.name || '', minZoom },
+        geometry: { type: 'Point', coordinates: info.point },
+      });
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
   const corridorsGeoJSON = useMemo(() => {
     if (!areas || areas.length === 0) return null;
     const features = [];
     for (const area of areas) {
       if (area.type !== 'corridor') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Stairs: polygons tagged indoor=stairs. Drawn in their own colour.
+  const stairsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'stairs') continue;
       const ring = _closedRing(area.boundary);
       if (!ring) continue;
       features.push(_polygonFeature(area, ring));
@@ -38886,11 +40563,11 @@ export function IndoorMapView({
   // Two distinct behaviours, selected by `lockHeading`.
   //
   // Walking screen (lockHeading = false):
-  //   The heading is the compass direction of the leg the student is
-  //   about to walk, taken from `currentStepPoint` forward, SNAPPED
-  //   to the nearest of N / E / S / W. Only four values are ever
-  //   applied, so the building outline never sits at a skew angle and
-  //   the map only rotates on the four 90° axes. The heading updates
+  //   The heading is the direction of the road the student is about to
+  //   walk (see utils/legBearing.js), taken from `currentStepPoint`
+  //   forward, rounded to the nearest multiple of INDOOR_HEADING_SNAP_DEG
+  //   (90 = N/E/S/W, 45 = 8 directions, 22.5 = 16, 0 = exact angle,
+  //   no rounding). The heading updates
   //   when `currentStepPoint` changes — i.e. when the student presses
   //   Next. Between presses, the map holds still.
   //
@@ -38936,7 +40613,19 @@ export function IndoorMapView({
     }
 
     const slice = points.slice(startIdx);
-    const raw = firstLegBearing(slice);
+
+    // The very first step starts in a room. There the path begins with a
+    // short stub into the corridor, which must not decide the direction.
+    const isRouteStart =
+      !!currentStepPoint &&
+      all.length > 0 &&
+      all[0].lat === currentStepPoint.lat &&
+      all[0].lon === currentStepPoint.lon;
+
+    // The direction of the road ahead (see utils/legBearing.js): along the
+    // corridor at the start, along the path until it turns on the way, and
+    // towards the destination door on the last turn.
+    const raw = headingAlongRoute(slice, { isRouteStart });
     // No usable direction (last step, or the leg is under 3 m): keep the
     // previous heading instead of swinging to north.
     return raw == null ? null : snapToCardinal(raw);
@@ -39168,7 +40857,28 @@ export function IndoorMapView({
             />
             <LineLayer
               id="corridorsOutline"
-              style={{ lineColor: '#cbd5e1', lineWidth: 0.5 }}
+              style={{
+                lineColor: INDOOR_CORRIDOR_OUTLINE_COLOR,
+                lineWidth: 0.75,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {stairsGeoJSON && stairsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="stairsSource" shape={stairsGeoJSON}>
+            <FillLayer
+              id="stairsFill"
+              style={{ fillColor: INDOOR_STAIRS_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="stairsOutline"
+              style={{
+                lineColor: INDOOR_STAIRS_OUTLINE_COLOR,
+                lineWidth: 1.25,
+                lineJoin: 'round',
+              }}
             />
           </ShapeSource>
         ) : null}
@@ -39181,21 +40891,57 @@ export function IndoorMapView({
             />
             <LineLayer
               id="roomsOutline"
-              style={{ lineColor: '#94a3b8', lineWidth: 0.75 }}
-            />
-            <SymbolLayer
-              id="roomsLabels"
               style={{
-                textField: ['get', 'name'],
-                textFont: ['Noto Sans Regular'],
-                textSize: 11,
-                textColor: '#334155',
-                textHaloColor: '#ffffff',
-                textHaloWidth: 1.5,
-                textAllowOverlap: false,
-                textIgnorePlacement: false,
+                lineColor: INDOOR_ROOM_OUTLINE_COLOR,
+                lineWidth: INDOOR_ROOM_OUTLINE_WIDTH,
+                lineJoin: 'round',
               }}
             />
+          </ShapeSource>
+        ) : null}
+
+        {roomLabelsGeoJSON && roomLabelsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="roomLabelsSource" shape={roomLabelsGeoJSON}>
+            {/* One layer per half-zoom step. Each shows only the names that
+                already fit at that zoom, so a hidden name never blocks a
+                visible one and no name is wider than its room. */}
+            {LABEL_BANDS.map((band, index) => (
+              <SymbolLayer
+                key={`roomsLabels-${band}`}
+                id={`roomsLabels-${band}`}
+                minZoomLevel={band}
+                maxZoomLevel={
+                  index === LABEL_BANDS.length - 1 ? 24 : band + LABEL_BAND_STEP
+                }
+                filter={['<=', ['get', 'minZoom'], band]}
+                style={{
+                  textField: ['get', 'name'],
+                  textFont: ['Noto Sans Regular'],
+                  textSize: [
+                    'interpolate',
+                    ['linear'],
+                    ['zoom'],
+                    LABEL_START_ZOOM,
+                    LABEL_MIN_SIZE,
+                    LABEL_FULL_SIZE_ZOOM,
+                    LABEL_MAX_SIZE,
+                  ],
+                  textMaxWidth: LABEL_WRAP_EM,
+                  textColor: '#334155',
+                  textHaloColor: '#ffffff',
+                  textHaloWidth: 1.5,
+                  textAllowOverlap: false,
+                  textIgnorePlacement: false,
+                  // Centred on the point and always upright, whichever way
+                  // the map is turned.
+                  textAnchor: 'center',
+                  textJustify: 'center',
+                  textRotate: 0,
+                  textRotationAlignment: 'viewport',
+                  textPitchAlignment: 'viewport',
+                }}
+              />
+            ))}
           </ShapeSource>
         ) : null}
 
@@ -39280,10 +41026,15 @@ export function IndoorMapView({
         style={styles.northButton}
         onPress={() => setFlipped((v) => !v)}
         accessibilityRole="button"
-        accessibilityLabel={`Map top is ${topLetter(effectiveHeading)}. Turn the map around`}
+        accessibilityLabel={`Map top is ${headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG)}. Turn the map around`}
       >
-        <Text style={styles.northButtonText}>
-          {topLetter(effectiveHeading)}
+        <Text
+          style={styles.northButtonText}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={0.6}
+        >
+          {headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG)}
         </Text>
       </TouchableOpacity>
 
@@ -39396,7 +41147,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   northButtonText: {
-    fontSize: 16,
+    // 16 fits "N" or "NE"; longer labels ("NNE", "137°") shrink to fit.
+    fontSize: 15,
+    paddingHorizontal: 2,
     fontWeight: '700',
     color: COLORS.primaryDark,
   },
@@ -39500,6 +41253,8 @@ export function InstructionCard({
   gpsStale = false,
   mode = 'outdoor',
   onAdvanceStep = null,
+  onPreviousStep = null,
+  canGoBack = false,
   isLastStep = false,
 }) {
   const insets = useSafeAreaInsets();
@@ -39589,6 +41344,28 @@ export function InstructionCard({
 
       {isIndoor && onAdvanceStep ? (
         <View style={styles.advanceRow}>
+          {/* Previous takes a quarter of the row, Next three quarters. */}
+          {onPreviousStep ? (
+            <TouchableOpacity
+              style={[
+                styles.previousButton,
+                !canGoBack && styles.previousButtonDisabled,
+              ]}
+              onPress={onPreviousStep}
+              disabled={!canGoBack}
+              accessibilityRole="button"
+              accessibilityLabel={t('walking.previousStepButton')}
+              accessibilityState={{ disabled: !canGoBack }}
+            >
+              <Text
+                style={styles.previousButtonText}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+              >
+                {t('walking.previousStepButton')}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
           <TouchableOpacity
             style={[
               styles.advanceButton,
@@ -39690,8 +41467,30 @@ const styles = StyleSheet.create({
   advanceRow: {
     paddingHorizontal: SPACING.lg,
     paddingTop: SPACING.md,
+    flexDirection: 'row',
+    gap: SPACING.sm,
+  },
+  previousButton: {
+    flex: 1,
+    backgroundColor: COLORS.primaryTint,
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
+    borderRadius: RADIUS.md,
+    paddingHorizontal: 4,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  previousButtonDisabled: {
+    opacity: 0.4,
+  },
+  previousButtonText: {
+    color: COLORS.primaryDark,
+    fontSize: FONT_SIZE.body,
+    fontWeight: '600',
   },
   advanceButton: {
+    flex: 3,
     backgroundColor: COLORS.primaryDark,
     borderRadius: RADIUS.md,
     paddingVertical: 14,
@@ -39708,6 +41507,8 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\IntentChips.jsx ---
 
@@ -40833,23 +42634,27 @@ import { MaterialIcons } from '@expo/vector-icons';
 
 import { COLORS, FONT_SIZE, SPACING, TOUCH } from '@/constants/theme';
 import { ICONS } from '@/constants/icons';
+import { formatPlaceName, placeLocationLine } from '@/utils/placeLabel';
 
 export function PlaceCard({ place, onPress, isFavorite = false }) {
-  const subtitle = place.category ? prettifyCategory(place.category) : null;
+  // A room shows where it is (building and floor); other places show their category.
+  const displayName = formatPlaceName(place);
+  const where = placeLocationLine(place);
+  const subtitle = where || (place.category ? prettifyCategory(place.category) : null);
 
   return (
     <TouchableOpacity
       style={styles.card}
       onPress={onPress}
       accessibilityRole="button"
-      accessibilityLabel={place.name}
+      accessibilityLabel={displayName}
       accessibilityHint={
         place.name_sw ? `Also known as ${place.name_sw}` : undefined
       }
     >
       <View style={styles.body}>
-        <Text style={styles.name} numberOfLines={1}>
-          {place.name}
+        <Text style={styles.name} numberOfLines={2}>
+          {displayName}
         </Text>
         {place.name_sw ? (
           <Text style={styles.nameSw} numberOfLines={1}>
@@ -40907,6 +42712,8 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\ProgramYearPicker.jsx ---
 
@@ -41783,6 +43590,7 @@ import { MaterialIcons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { t } from '@/i18n';
+import { formatPlaceName } from '@/utils/placeLabel';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 export function StartingPointSheet({
@@ -41873,7 +43681,7 @@ export function StartingPointSheet({
                   style={styles.row}
                   onPress={() => onChoose(item)}
                   accessibilityRole="button"
-                  accessibilityLabel={item.name}
+                  accessibilityLabel={formatPlaceName(item)}
                 >
                   <MaterialIcons
                     name="place"
@@ -41882,7 +43690,7 @@ export function StartingPointSheet({
                     style={styles.rowIcon}
                   />
                   <View style={styles.rowText}>
-                    <Text style={styles.rowName}>{item.name}</Text>
+                    <Text style={styles.rowName}>{formatPlaceName(item)}</Text>
                     {item.name_sw ? (
                       <Text style={styles.rowNameSw}>{item.name_sw}</Text>
                     ) : null}
@@ -41993,6 +43801,8 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\TimetableRow.jsx ---
 
@@ -42317,7 +44127,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
+const DEFAULT_API_BASE_URL = 'http://192.168.43.204:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -42411,10 +44221,75 @@ export const CAMERA_MIN_INTERVAL_MS = 700;
 export const CAMERA_MIN_MOVE_M = 1.5;
 export const CAMERA_MIN_HEADING_DEG = 10;
 
-export const INDOOR_BACKGROUND_COLOR = "#f1f5f9";
-export const INDOOR_INTERIOR_COLOR = "#fdf3d7";
+
+// Indoor floor plan colours - used in components/IndoorMapView.jsx
+//
+// Background = outside the building (same as the home screen).
+// Interior   = floor space inside the building outline (indoor=level polygon)
+//              that is neither a room nor a corridor.
+
+
+
+// ---- In mobile/constants/config.js, REPLACE the whole indoor colour block
+// ---- with this one. It adds 5 new lines (corridor, room, outlines) and
+// ---- changes the colours so corridors, rooms, the building and the outside
+// ---- are all clearly different. Nothing else changes.
+
+// Indoor floor plan colours - used in components/IndoorMapView.jsx
+//
+// From the outside in:
+//   BACKGROUND  the ground outside the building
+//   INTERIOR    floor space inside the building outline that is neither a
+//               room nor a corridor (the indoor=level polygon)
+//   CORRIDOR    corridors
+//   ROOM        rooms
+//   STAIRS      stairwells (indoor=stairs)
+
+// ---- Palette A "Fresh" (default): white corridors, pale-green rooms ----
+export const INDOOR_BACKGROUND_COLOR = "#dbe3e8";
+export const INDOOR_INTERIOR_COLOR = "#f6efdd";
+export const INDOOR_CORRIDOR_COLOR = "#ffffff";
+export const INDOOR_CORRIDOR_OUTLINE_COLOR = "#c5d0d8";
+export const INDOOR_ROOM_COLOR = "#e3f1e7";
+export const INDOOR_ROOM_OUTLINE_COLOR = "#6c9a80";
+export const INDOOR_STAIRS_COLOR = "#f4b860";
+export const INDOOR_STAIRS_OUTLINE_COLOR = "#b45309";
+
+// ---- Palette B "Warm" (to try it, replace the 8 lines above with these) ----
+// export const INDOOR_BACKGROUND_COLOR = "#e3e9ee";
+// export const INDOOR_INTERIOR_COLOR = "#f8f2e2";
+// export const INDOOR_CORRIDOR_COLOR = "#efdfb9";
+// export const INDOOR_CORRIDOR_OUTLINE_COLOR = "#d2bf8c";
+// export const INDOOR_ROOM_COLOR = "#ffffff";
+// export const INDOOR_ROOM_OUTLINE_COLOR = "#7b8590";
+// export const INDOOR_STAIRS_COLOR = "#f0904a";
+// export const INDOOR_STAIRS_OUTLINE_COLOR = "#9a3412";
+
+// Line widths
+export const INDOOR_ROOM_OUTLINE_WIDTH = 1;
 export const INDOOR_BUILDING_OUTLINE_COLOR = "#334155";
 export const INDOOR_BUILDING_OUTLINE_WIDTH = 2.5;
+
+// How far the indoor map turns, in degrees, while you walk. The map turns so
+// the corridor ahead points up the screen, in steps of this size.
+//   90   N, E, S, W only      45   also NE, SE, SW, NW   <- default
+//   22.5 16 directions, for buildings at odd angles
+//   0    exact direction, no snapping
+export const INDOOR_HEADING_SNAP_DEG = 0;
+
+// ---- Room names ----
+// A name is shown only from the zoom at which it fits inside its room, so a
+// long name never spills over the next room. Names are smaller when zoomed
+// out and reach full size at INDOOR_LABEL_FULL_SIZE_ZOOM.
+export const INDOOR_LABEL_MIN_SIZE = 8; // text size when zoomed out
+export const INDOOR_LABEL_MAX_SIZE = 11; // text size when zoomed in
+export const INDOOR_LABEL_FULL_SIZE_ZOOM = 19; // zoom where full size is reached
+export const INDOOR_LABEL_WRAP_EM = 7; // long names wrap into lines this wide
+// How strictly a name must fit inside its room:
+//   1.0  fully inside the room (fewest names when zoomed out)
+//   1.3  may touch the walls a little   <- default
+//   1.6+ more names earlier, but they may spill over
+export const INDOOR_LABEL_FIT = 1.3;
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\icons.js ---
@@ -43359,6 +45234,22 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     });
   }, [currentStep.index, steps.length]);
 
+  // Go back one INDOOR step. Not allowed past the first step, or into an
+  // outdoor step (outdoors the route follows GPS, not the buttons).
+  const canGoBack =
+    currentStep.mode === 'indoor' &&
+    currentStep.index > 0 &&
+    steps[currentStep.index - 1]?.mode === 'indoor';
+
+  const previousStep = useCallback(() => {
+    setManualStepIndex((prev) => {
+      const from = prev === null ? currentStep.index : prev;
+      if (from <= 0) return from;
+      if (steps[from - 1]?.mode !== 'indoor') return from;
+      return from - 1;
+    });
+  }, [currentStep.index, steps]);
+
   const distanceRemainingM =
     currentStep.mode === 'indoor' ? 0 : outdoor.distanceRemainingM;
   const distanceToNextStepM =
@@ -43442,6 +45333,8 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     gpsStale: currentStep.mode === 'indoor' ? false : outdoor.gpsStale,
     resetOffRoute: outdoor.resetOffRoute,
     advanceStep,
+    previousStep,
+    canGoBack,
     isLastStep: currentStep.index >= steps.length - 1,
     indoorLevel,
     indoorBuildingName,
@@ -43546,7 +45439,7 @@ export function useStartingPoint() {
   // list — you can't start from where you're going.
   const loadOutdoorPlaces = useCallback(async ({ excludePlaceId } = {}) => {
     try {
-      const places = await listPlaces({ kind: 'outdoor', limit: 100 });
+      const places = await listPlaces({ kind: 'outdoor', limit: 2000 });
       const filtered =
         excludePlaceId != null
           ? places.filter((p) => p.id !== excludePlaceId)
@@ -43679,7 +45572,7 @@ export function useStartingPoint() {
       setLastError('no_fix');
       setState('needPick');
       try {
-        const places = await listPlaces({ kind: 'outdoor', limit: 100 });
+        const places = await listPlaces({ kind: 'outdoor', limit: 2000 });
         const filtered =
           destinationPlaceId != null
             ? places.filter((p) => p.id !== destinationPlaceId)
@@ -43752,6 +45645,8 @@ async function checkSuspicious(fix) {
 
   return null;
 }
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\hooks\useTimetableSelection.js ---
 
@@ -44232,7 +46127,8 @@ export function useWalkingProgress(route) {
     "indoorsBodyNoName": "Follow the steps below to reach the destination. Tap Next step after each one.",
     "indoorsBadge": "Indoor — no GPS",
     "nextStepButton": "Next step",
-    "arrivedButton": "I've arrived"
+    "arrivedButton": "I've arrived",
+    "previousStepButton": "Previous"
   },
   "arrival": {
     "title": "Arrival",
@@ -44389,8 +46285,42 @@ export function useWalkingProgress(route) {
     "meet": "Meet up",
     "toilet": "Toilets",
     "prayer": "Prayer"
+  },
+  "qr": {
+    "scanButton": "Scan QR code to set my location",
+    "title": "Scan QR code",
+    "hint": "Point the camera at the QR code on the wall",
+    "cameraDenied": "Camera permission is needed to scan a QR code.",
+    "grantPermission": "Allow camera",
+    "manualLabel": "Or type the code printed under the QR code",
+    "manualPlaceholder": "For example: LIB-G-02",
+    "manualSubmit": "Use code",
+    "finding": "Finding where you are…",
+    "errorUnknown": "This code isn't recognised. Try another code.",
+    "errorInvalid": "This isn't a Campus Navigation QR code.",
+    "errorNetwork": "Couldn't reach the server. Check your connection and try again.",
+    "notAvailable": "Camera scanning isn't available in this version of the app. Type the code printed under the QR code instead.",
+    "scanAgain": "Scan again",
+    "goHome": "Go to home"
+  },
+  "level": {
+    "basement": "Basement",
+    "basementN": "Basement {n}",
+    "ground": "Ground floor",
+    "first": "First floor",
+    "second": "Second floor",
+    "third": "Third floor",
+    "fourth": "Fourth floor",
+    "fifth": "Fifth floor",
+    "sixth": "Sixth floor",
+    "seventh": "Seventh floor",
+    "eighth": "Eighth floor",
+    "ninth": "Ninth floor",
+    "tenth": "Tenth floor",
+    "number": "Floor {n}"
   }
 }
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\i18n\index.js ---
 
@@ -44574,7 +46504,8 @@ export function ttsLanguageForCurrentLang() {
     "indoorsBodyNoName": "Fuata hatua hapa chini kufikia unakoenda. Gusa Endelea baada ya kila hatua.",
     "indoorsBadge": "Ndani — hakuna GPS",
     "nextStepButton": "Endelea",
-    "arrivedButton": "Nimefika"
+    "arrivedButton": "Nimefika",
+    "previousStepButton": "Nyuma"
   },
   "arrival": {
     "title": "Kufika",
@@ -44731,8 +46662,42 @@ export function ttsLanguageForCurrentLang() {
     "meet": "Kukutana",
     "toilet": "Vyoo",
     "prayer": "Kuomba"
+  },
+  "qr": {
+    "scanButton": "Changanua QR kuweka ulipo",
+    "title": "Changanua QR",
+    "hint": "Elekeza kamera kwenye msimbo wa QR ulio ukutani",
+    "cameraDenied": "Ruhusa ya kamera inahitajika kuchanganua msimbo wa QR.",
+    "grantPermission": "Ruhusu kamera",
+    "manualLabel": "Au andika msimbo ulioandikwa chini ya QR",
+    "manualPlaceholder": "Mfano: LIB-G-02",
+    "manualSubmit": "Tumia msimbo",
+    "finding": "Inatafuta ulipo…",
+    "errorUnknown": "Msimbo huu haujatambuliwa. Jaribu msimbo mwingine.",
+    "errorInvalid": "Hii si QR ya Campus Navigation.",
+    "errorNetwork": "Imeshindwa kufikia seva. Angalia mtandao wako na ujaribu tena.",
+    "notAvailable": "Kuchanganua kwa kamera hakupatikani kwenye toleo hili. Andika msimbo ulioandikwa chini ya QR.",
+    "scanAgain": "Changanua tena",
+    "goHome": "Nenda mwanzo"
+  },
+  "level": {
+    "basement": "Chini ya ardhi",
+    "basementN": "Chini ya ardhi {n}",
+    "ground": "Ghorofa ya chini",
+    "first": "Ghorofa ya kwanza",
+    "second": "Ghorofa ya pili",
+    "third": "Ghorofa ya tatu",
+    "fourth": "Ghorofa ya nne",
+    "fifth": "Ghorofa ya tano",
+    "sixth": "Ghorofa ya sita",
+    "seventh": "Ghorofa ya saba",
+    "eighth": "Ghorofa ya nane",
+    "ninth": "Ghorofa ya tisa",
+    "tenth": "Ghorofa ya kumi",
+    "number": "Ghorofa ya {n}"
   }
 }
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\jest.setup.js ---
 
@@ -44807,6 +46772,7 @@ global.fetch = jest.fn(() =>
         "@maplibre/maplibre-react-native": "10",
         "@react-native-async-storage/async-storage": "2.2.0",
         "expo": "~57.0.24",
+        "expo-camera": "~57.0.6",
         "expo-clipboard": "~57.0.2",
         "expo-constants": "~57.0.19",
         "expo-dev-client": "~57.0.19",
@@ -49003,6 +50969,12 @@ global.fetch = jest.fn(() =>
         "@types/responselike": "^1.0.0"
       }
     },
+    "node_modules/@types/emscripten": {
+      "version": "1.41.6",
+      "resolved": "https://registry.npmjs.org/@types/emscripten/-/emscripten-1.41.6.tgz",
+      "integrity": "sha512-uN+9i8bFT5CUcZfyIEYDrSueACEyKGbUs5kC/72DGlZZoinh84sJfVV0i8UOJD1asdzkvLPBRrKs41kZ8MdEXg==",
+      "license": "MIT"
+    },
     "node_modules/@types/estree": {
       "version": "1.0.9",
       "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz",
@@ -50463,6 +52435,15 @@ global.fetch = jest.fn(() =>
       "license": "MIT",
       "engines": {
         "node": "18 || 20 || >=22"
+      }
+    },
+    "node_modules/barcode-detector": {
+      "version": "3.2.3",
+      "resolved": "https://registry.npmjs.org/barcode-detector/-/barcode-detector-3.2.3.tgz",
+      "integrity": "sha512-PLinpWGiOQoQH4X+YObWZ6iXeffXKDM3d4vnOD86481SvukIfvkf7jEE/tud9oI4HTDxtDdlHaFilA5Kn7Xa7A==",
+      "license": "MIT",
+      "dependencies": {
+        "zxing-wasm": "3.1.6"
       }
     },
     "node_modules/base64-js": {
@@ -52725,6 +54706,26 @@ global.fetch = jest.fn(() =>
         "expo": "*",
         "react": "*",
         "react-native": "*"
+      }
+    },
+    "node_modules/expo-camera": {
+      "version": "57.0.6",
+      "resolved": "https://registry.npmjs.org/expo-camera/-/expo-camera-57.0.6.tgz",
+      "integrity": "sha512-eswB77bOzQ2OEvll/hV5VnzywaICFnYF21HIwcyokebFcSTSMfGQk8+VW06DRec9JnWuRExs0QXlfxyMPjS6KQ==",
+      "license": "MIT",
+      "dependencies": {
+        "barcode-detector": "^3.0.0"
+      },
+      "peerDependencies": {
+        "expo": "*",
+        "react": "*",
+        "react-native": "*",
+        "react-native-web": "*"
+      },
+      "peerDependenciesMeta": {
+        "react-native-web": {
+          "optional": true
+        }
       }
     },
     "node_modules/expo-clipboard": {
@@ -60367,6 +62368,18 @@ global.fetch = jest.fn(() =>
       "dev": true,
       "license": "MIT"
     },
+    "node_modules/tagged-tag": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/tagged-tag/-/tagged-tag-1.0.0.tgz",
+      "integrity": "sha512-yEFYrVhod+hdNyx7g5Bnkkb0G6si8HJurOoOEgC8B/O0uXLHlaey/65KRv6cuWBNhBgHKAROVpc7QyYqE5gFng==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=20"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
+    },
     "node_modules/terminal-link": {
       "version": "2.1.1",
       "resolved": "https://registry.npmjs.org/terminal-link/-/terminal-link-2.1.1.tgz",
@@ -61510,6 +63523,34 @@ global.fetch = jest.fn(() =>
       "peerDependencies": {
         "zod": "^3.25.0 || ^4.0.0"
       }
+    },
+    "node_modules/zxing-wasm": {
+      "version": "3.1.6",
+      "resolved": "https://registry.npmjs.org/zxing-wasm/-/zxing-wasm-3.1.6.tgz",
+      "integrity": "sha512-mU7UNuvl+hOT+nlSOQTMHZ2tM8lRMsbjDIp5IO/+HmBl/FOq77q0OSZPJ3cm42A9c1MKU6Uve67FiGdkhsrT9g==",
+      "license": "MIT",
+      "dependencies": {
+        "@types/emscripten": "^1.41.6",
+        "type-fest": "^5.10.0"
+      },
+      "peerDependencies": {
+        "@types/emscripten": ">=1.39.6"
+      }
+    },
+    "node_modules/zxing-wasm/node_modules/type-fest": {
+      "version": "5.10.0",
+      "resolved": "https://registry.npmjs.org/type-fest/-/type-fest-5.10.0.tgz",
+      "integrity": "sha512-NoSdpq/WEiAg5sjmBkmV/hfxv6HJH4NqPNrqjtSO5CwRmpsDfaf4begxW34KdJykH/l1yHtwBWQkCRdoXO8mPA==",
+      "license": "(MIT OR CC0-1.0)",
+      "dependencies": {
+        "tagged-tag": "^1.0.0"
+      },
+      "engines": {
+        "node": ">=20"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/sindresorhus"
+      }
     }
   }
 }
@@ -61526,6 +63567,7 @@ global.fetch = jest.fn(() =>
     "@maplibre/maplibre-react-native": "10",
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "~57.0.24",
+    "expo-camera": "~57.0.6",
     "expo-clipboard": "~57.0.2",
     "expo-constants": "~57.0.19",
     "expo-dev-client": "~57.0.19",
@@ -61684,6 +63726,14 @@ export async function listPlaces({
 
 export async function getPlace(id) {
   return request(`/api/places/${id}`);
+}
+
+/**
+ * The place a QR code stands for (a spot on a corridor). Throws if the code
+ * is unknown. Used by services/qr.js.
+ */
+export async function getPlaceByQr(code) {
+  return request(`/api/qr/${encodeURIComponent(code)}`);
 }
 
 /**
@@ -61933,7 +63983,7 @@ export async function getIndoorAreas({ buildingName, level }) {
 // ---------------------------------------------------------------
 
 export async function listEntrances() {
-  return listPlaces({ kind: 'entrance', limit: 200 });
+  return listPlaces({ kind: 'entrance', limit: 2000 });
 }
 
 // ---------------------------------------------------------------
@@ -61944,7 +63994,7 @@ export async function listIndoorDoors({ buildingName } = {}) {
   return listPlaces({
     kind: 'indoor',
     building_name: buildingName || undefined,
-    limit: 200,
+    limit: 2000,
   });
 }
 
@@ -61955,6 +64005,8 @@ export async function listIndoorDoors({ buildingName } = {}) {
 export async function getHealth() {
   return request('/api/health');
 }
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\compass.js ---
 
@@ -62208,12 +64260,12 @@ export async function offRoutePulse() {
 // Every entry has a `cachedAt` timestamp. On read, entries older
 // than the TTL are discarded and refetched.
 //
-// Key format: indoor-cache-v1:<building>:<level>
+// Key format: indoor-cache-v3:<building>:<level>
 // Bumping the version prefix invalidates every old entry.
 
 import { getJSON, setJSON } from '@/services/storage';
 
-const KEY_PREFIX = 'indoor-cache-v1';
+const KEY_PREFIX = 'indoor-cache-v3';
 const TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 const _memory = new Map();
@@ -62274,9 +64326,11 @@ export async function clearIndoorCache() {
   // AsyncStorage doesn't have a "delete by prefix" call. To clear
   // everything we'd have to know the keys. Since we don't currently
   // expose a clear button, leave it as a stub. The version prefix
-  // (indoor-cache-v1) is the real invalidation tool: bump to v2 and
+  // (indoor-cache-v3) is the real invalidation tool: bump the version and
   // every old key becomes unreachable.
 }
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\location.js ---
 
@@ -62485,6 +64539,56 @@ export function stopWatching() {
   }
 }
 
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\qr.js ---
+
+// Starting a route from a scanned QR code.
+//
+// A QR code stands for a spot on a corridor. This looks the code up on the
+// server and stores that spot as the shared starting point, exactly as if the
+// student had chosen it from the "From:" picker. Everything after that is the
+// normal flow: pick a destination, tap Directions, and the route starts there.
+
+import { getPlaceByQr } from '@/services/api';
+import { setStart } from '@/services/startStore';
+import { parseQrCode } from '@/utils/qrCode';
+
+/**
+ * Resolve a scanned/typed code and make it the starting point.
+ * Returns the chosen start. On failure throws an Error whose `reason` is
+ * 'invalid' (not one of our codes), 'unknown' (the server has no such
+ * code) or 'network'.
+ */
+export async function startFromQr(raw) {
+  const code = parseQrCode(raw);
+  if (!code) {
+    const err = new Error('Not a valid code');
+    err.reason = 'invalid';
+    throw err;
+  }
+
+  let place;
+  try {
+    place = await getPlaceByQr(code);
+  } catch (e) {
+    const err = new Error(e?.message || 'Lookup failed');
+    err.reason = /not found/i.test(err.message) ? 'unknown' : 'network';
+    throw err;
+  }
+
+  const chosen = {
+    placeId: place.id,
+    placeName: place.name,
+    buildingName: place.building_name || null,
+    level: place.level || null,
+    lat: place.location?.lat ?? null,
+    lon: place.location?.lon ?? null,
+    fromQr: code,
+  };
+  setStart(chosen);
+  return chosen;
+}
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\routeRequest.js ---
@@ -63232,6 +65336,28 @@ export function smoothHeading(prev, next, factor = 0.25) {
 }
 
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\headingLabel.js ---
+
+// The text on the map's turn-around button: which way is up the screen.
+//
+// It matches the snapping step, so the label is always true:
+//   snap 90 or 45  -> N, NE, E, SE, S, SW, W, NW
+//   snap 22.5      -> 16 directions (NNE, ENE, ...)
+//   anything finer -> the angle itself, e.g. "137°"
+
+const WIND_8 = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+const WIND_16 = [
+  'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+  'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW',
+];
+
+export function headingLabel(heading, snapDeg) {
+  const h = ((heading % 360) + 360) % 360;
+  if (snapDeg >= 45) return WIND_8[Math.round(h / 45) % 8];
+  if (snapDeg === 22.5) return WIND_16[Math.round(h / 22.5) % 16];
+  return `${Math.round(h) % 360}°`;
+}
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\indoorRoute.js ---
 
 // Helpers for indoor routes.
@@ -63347,6 +65473,271 @@ export function singleBuildingStartLevel(route) {
   return String(first.level ?? '0');
 }
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\labelFit.js ---
+
+// Decides from which zoom a room's name should be shown, so that a name never
+// spills outside its room.
+//
+// The text is drawn at a size that grows a little as you zoom in (smaller
+// when zoomed out). A room grows on screen much faster than that, so a name
+// that fits at one zoom keeps fitting at every higher zoom. This finds the
+// first zoom where it fits, for each room, once.
+
+const AVG_CHAR_EM = 0.6; // average width of one character, in text-size units
+const SPACE_EM = 0.3;
+const LINE_HEIGHT_EM = 1.2;
+
+/** The text size used at a zoom level (also used by the map layer). */
+export function sizeAtZoom(zoom, { minSize, maxSize, fullSizeZoom, startZoom }) {
+  if (zoom <= startZoom) return minSize;
+  if (zoom >= fullSizeZoom) return maxSize;
+  return minSize + ((zoom - startZoom) / (fullSizeZoom - startZoom)) * (maxSize - minSize);
+}
+
+/** Width and height of a name, in text-size units, once wrapped at wrapEm. */
+export function textBlockEm(text, wrapEm) {
+  const words = String(text || '').trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return { width: 0, height: 0 };
+
+  let widest = 0;
+  let line = 0;
+  let lines = 1;
+  for (const word of words) {
+    const w = word.length * AVG_CHAR_EM;
+    if (line === 0) {
+      line = w;
+    } else if (line + SPACE_EM + w <= wrapEm) {
+      line += SPACE_EM + w;
+    } else {
+      widest = Math.max(widest, line);
+      line = w;
+      lines += 1;
+    }
+  }
+  widest = Math.max(widest, line);
+  return { width: widest, height: lines * LINE_HEIGHT_EM };
+}
+
+/**
+ * The zoom from which `text` fits inside a room whose biggest inside circle
+ * has radius `radiusM`, rounded UP to a multiple of `bandStep`.
+ * Returns null when it never fits, or there is no name.
+ *
+ * options: { latDeg, minSize, maxSize, fullSizeZoom, startZoom, wrapEm,
+ *            fit, bandStep, fromZoom, toZoom }
+ *   fit > 1 lets names overflow a little (more names shown); < 1 hides more.
+ */
+export function labelMinZoom(text, radiusM, options) {
+  const {
+    latDeg,
+    wrapEm,
+    fit = 1,
+    bandStep = 0.5,
+    fromZoom = 15,
+    toZoom = 22,
+  } = options;
+
+  const block = textBlockEm(text, wrapEm);
+  if (block.width === 0 || !(radiusM > 0)) return null;
+
+  // Half the diagonal of the text block, per unit of text size.
+  const halfDiagonalEm = Math.hypot(block.width, block.height) / 2;
+  const cosLat = Math.cos((latDeg * Math.PI) / 180);
+
+  for (let z = fromZoom; z <= toZoom + 1e-9; z += 0.25) {
+    const metresPerPixel = (40075016.686 * cosLat) / (512 * Math.pow(2, z));
+    const radiusPx = (radiusM * fit) / metresPerPixel;
+    const size = sizeAtZoom(z, options);
+    if (halfDiagonalEm * size <= radiusPx) {
+      return Math.ceil(z / bandStep - 1e-9) * bandStep;
+    }
+  }
+  return null;
+}
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\legBearing.js ---
+
+// Which way the road ahead points, for turning the indoor map.
+//
+// legBearing(points) -> degrees (0 = north) or null
+//   points: [{ lat, lon }, ...] starting at the walker's position, in order
+//           along the route.
+//
+// The old version took the direction to the first path point that was 3 m
+// away. On a corridor drawn with small bends or a few extra nodes, that is
+// not the direction of the road. This version follows the path for as long as
+// it keeps going the same way and returns the straight-line direction from
+// the walker to the END of that stretch. It stops at the first real turn
+// (more than LEG_TURN_TOLERANCE_DEG), so a corner never drags the answer
+// round, and it follows a gentle curve for a while.
+//
+// Returns null when there is no usable direction (the walker is almost at the
+// end of the route), so the caller can keep the previous heading.
+
+import { bearingDeg, haversineM } from '@/utils/geo';
+
+const MIN_FIRST_CHORD_M = 3; // ignore moves smaller than this at the start
+const CHORD_M = 2; // after that, look at the path in 2 m pieces
+export const LEG_TURN_TOLERANCE_DEG = 25;
+export const LEG_MAX_LENGTH_M = 60;
+
+function angleDiff(a, b) {
+  return Math.abs(((a - b + 540) % 360) - 180);
+}
+
+export function legBearing(points) {
+  if (!points || points.length < 2) return null;
+
+  const from = points[0];
+  let anchor = from;
+  let end = null;
+  let reference = null;
+
+  for (let i = 1; i < points.length; i++) {
+    const to = points[i];
+    if (haversineM(from.lat, from.lon, to.lat, to.lon) > LEG_MAX_LENGTH_M) break;
+
+    const needed = end === null ? MIN_FIRST_CHORD_M : CHORD_M;
+    if (haversineM(anchor.lat, anchor.lon, to.lat, to.lon) < needed) continue;
+
+    const piece = bearingDeg(anchor.lat, anchor.lon, to.lat, to.lon);
+    if (reference !== null && angleDiff(piece, reference) > LEG_TURN_TOLERANCE_DEG) {
+      break; // the path has turned: the road ahead ends here
+    }
+
+    end = to;
+    anchor = to;
+    reference = bearingDeg(from.lat, from.lon, end.lat, end.lon);
+  }
+
+  return end ? bearingDeg(from.lat, from.lon, end.lat, end.lon) : null;
+}
+
+// ---------------------------------------------------------------------------
+// The start and the end of a route
+// ---------------------------------------------------------------------------
+//
+// START. A route that begins in a room starts with a short stub from the
+// door into the corridor, then turns onto the corridor. Aiming the map at
+// the stub, or at a line across both, shows the corridor at a slant. For the
+// first step we skip that stub and aim along the corridor.
+//
+// END. The last stretch into the destination door is only a metre or two, too
+// short to be a "road". There we turn the map to face the destination.
+
+const STUB_MAX_M = 5; // a first stretch shorter than this, ending in a corner, is a door stub
+const STUB_CORNER_DEG = 40; // how sharp the corner must be
+const MICRO_SEGMENT_M = 0.3; // shorter pieces have no reliable direction
+const FACE_TARGET_MIN_M = 0.8; // nearer than this there is no direction to face
+
+function pathLength(points) {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    total += haversineM(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+  }
+  return total;
+}
+
+/** Index of the corner that ends a door stub, or -1 when the path has none. */
+function stubEndIndex(points) {
+  let travelled = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const before = haversineM(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+    travelled += before;
+    if (travelled > STUB_MAX_M) return -1;
+    const after = haversineM(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon);
+    if (before < MICRO_SEGMENT_M || after < MICRO_SEGMENT_M) continue;
+    const incoming = bearingDeg(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+    const outgoing = bearingDeg(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon);
+    if (angleDiff(incoming, outgoing) >= STUB_CORNER_DEG) return i;
+  }
+  return -1;
+}
+
+/**
+ * The direction the map should face for a step.
+ *   points        the route from the walker's position onward, on this floor
+ *   isRouteStart  true on the very first step, where the walker stands in a room
+ * Returns degrees, or null when there is no direction (the walker is already
+ * at the destination), so the caller keeps the previous heading.
+ */
+export function headingAlongRoute(points, { isRouteStart = false } = {}) {
+  if (!points || points.length < 2) return null;
+
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  // Last few metres: face the destination.
+  if (pathLength(points) < MIN_FIRST_CHORD_M) {
+    return haversineM(first.lat, first.lon, last.lat, last.lon) >= FACE_TARGET_MIN_M
+      ? bearingDeg(first.lat, first.lon, last.lat, last.lon)
+      : null;
+  }
+
+  // First step: aim along the corridor, not along the door stub.
+  if (isRouteStart) {
+    const corner = stubEndIndex(points);
+    if (corner > 0) {
+      const alongCorridor = legBearing(points.slice(corner));
+      if (alongCorridor !== null) return alongCorridor;
+    }
+  }
+
+  return legBearing(points);
+}
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\levelLabel.js ---
+
+// Turns the floor number stored in the map ("0", "1", "-1") into the words a
+// student understands: Ground floor, First floor, Basement.
+//
+// Used everywhere a floor is shown in text: the door picker, search results,
+// the rooms-in-a-building list. (The little floor buttons on the map keep
+// their compact G / 1 / 2 labels.)
+
+import { t } from '@/i18n';
+
+const ORDINAL_KEYS = [
+  'ground', // 0
+  'first',
+  'second',
+  'third',
+  'fourth',
+  'fifth',
+  'sixth',
+  'seventh',
+  'eighth',
+  'ninth',
+  'tenth',
+];
+
+/**
+ * levelLabel("0")  -> "Ground floor"
+ * levelLabel("1")  -> "First floor"
+ * levelLabel("-1") -> "Basement"
+ * levelLabel("-2") -> "Basement 2"
+ * levelLabel("11") -> "Floor 11"
+ * levelLabel("M")  -> "M"            (anything that is not a number is shown as typed)
+ * levelLabel(null) -> null
+ */
+export function levelLabel(level) {
+  if (level === null || level === undefined) return null;
+
+  // A stair or room on two floors is stored as "0;1". Show the first.
+  const text = String(level).split(';')[0].trim();
+  if (!text) return null;
+
+  if (!/^-?\d+$/.test(text)) return text;
+  const n = Number(text);
+
+  if (n === -1) return t('level.basement');
+  if (n < -1) return t('level.basementN', { n: -n });
+  if (n < ORDINAL_KEYS.length) return t(`level.${ORDINAL_KEYS[n]}`);
+  return t('level.number', { n });
+}
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\media.js ---
 
 // Media selection helpers.
@@ -63376,6 +65767,213 @@ export function closestApproachPhoto(photos, approachBearing) {
     return currentDist < bestDist ? current : best;
   });
 }
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\placeLabel.js ---
+
+// How a place is written in lists.
+//
+//   formatPlaceName(room)  -> "Room 12 (Computer Lab, ICT Lab)"
+//   placeLocationLine(room) -> "Dr. Magufuli Library · First floor"
+
+import { levelLabel } from '@/utils/levelLabel';
+
+/** "Lab A;Computer lab" -> ["Lab A", "Computer lab"] (trimmed, no blanks, no repeats). */
+export function parseAltNames(raw) {
+  if (!raw) return [];
+  const seen = new Set();
+  const out = [];
+  for (const part of String(raw).split(';')) {
+    const name = part.trim();
+    const key = name.toLowerCase();
+    if (name && !seen.has(key)) {
+      seen.add(key);
+      out.push(name);
+    }
+  }
+  return out;
+}
+
+/** The place's name, with its alternative names in brackets when it has any. */
+export function formatPlaceName(place) {
+  const name = (place?.name || '').trim();
+  const mainKey = name.toLowerCase();
+  const alts = parseAltNames(place?.alt_names).filter(
+    (a) => a.toLowerCase() !== mainKey
+  );
+  return alts.length > 0 ? `${name} (${alts.join(', ')})` : name;
+}
+
+/** "Building · Floor", or null when the place has neither (an outdoor place). */
+export function placeLocationLine(place) {
+  const parts = [
+    place?.building_name ? String(place.building_name).trim() : null,
+    levelLabel(place?.level),
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/** Everything a student might type to find this place, lower-cased. */
+export function searchableText(place) {
+  return [
+    place?.name,
+    place?.alt_names,
+    place?.name_sw,
+    place?.room_name,
+    place?.ref,
+    place?.building_name,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\polygonLabel.js ---
+
+// Where to put a room's name: the visual centre of the room.
+//
+// The map used to let MapLibre choose, and it chose differently for rooms at
+// an angle, long thin rooms, and rooms cut by a map-tile edge, so names sat
+// off-centre. This works out one point per room, the same way every time.
+//
+// polygonLabelPoint(ring) -> [lon, lat]
+//   ring: [[lon, lat], ...] (closed or not)
+//
+// It returns the centre of mass of the shape. If that falls outside the room
+// (an L or U shaped room), it returns the point inside the room that is
+// furthest from every wall instead.
+
+/** Drop a repeated closing point. */
+function open(ring) {
+  const pts = ring.slice();
+  if (
+    pts.length > 1 &&
+    pts[0][0] === pts[pts.length - 1][0] &&
+    pts[0][1] === pts[pts.length - 1][1]
+  ) {
+    pts.pop();
+  }
+  return pts;
+}
+
+function pointInPolygon(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i];
+    const [xj, yj] = poly[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function distanceToEdges(x, y, poly) {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [ax, ay] = poly[j];
+    const [bx, by] = poly[i];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 === 0 ? 0 : ((x - ax) * dx + (y - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    best = Math.min(best, Math.hypot(x - (ax + t * dx), y - (ay + t * dy)));
+  }
+  return best;
+}
+
+/** The point inside `poly` furthest from its walls (grid search, refined). */
+function innermostPoint(poly) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of poly) {
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+  }
+  let best = null;
+  let bestDist = -1;
+  let cell = Math.max(maxX - minX, maxY - minY) / 24;
+  let x0 = minX, x1 = maxX, y0 = minY, y1 = maxY;
+
+  for (let round = 0; round < 4 && cell > 0; round++) {
+    for (let x = x0; x <= x1; x += cell) {
+      for (let y = y0; y <= y1; y += cell) {
+        if (!pointInPolygon(x, y, poly)) continue;
+        const d = distanceToEdges(x, y, poly);
+        if (d > bestDist) {
+          bestDist = d;
+          best = [x, y];
+        }
+      }
+    }
+    if (!best) break;
+    // Look again, more finely, around the best point so far.
+    x0 = best[0] - cell; x1 = best[0] + cell;
+    y0 = best[1] - cell; y1 = best[1] + cell;
+    cell /= 5;
+  }
+  return best;
+}
+
+export function polygonLabelPoint(ring) {
+  if (!ring || ring.length === 0) return null;
+  const pts = open(ring);
+  if (pts.length === 0) return null;
+
+  // Flatten lat/lon to a local x/y so distances and angles are right.
+  const meanLat = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+  const kx = Math.cos((meanLat * Math.PI) / 180);
+  const poly = pts.map(([lon, lat]) => [lon * kx, lat]);
+  const back = ([x, y]) => [x / kx, y];
+
+  const average = () =>
+    back([
+      poly.reduce((s, p) => s + p[0], 0) / poly.length,
+      poly.reduce((s, p) => s + p[1], 0) / poly.length,
+    ]);
+
+  if (poly.length < 3) return average();
+
+  // Centre of mass (shoelace formula).
+  let area2 = 0, cx = 0, cy = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xj, yj] = poly[j];
+    const [xi, yi] = poly[i];
+    const cross = xj * yi - xi * yj;
+    area2 += cross;
+    cx += (xj + xi) * cross;
+    cy += (yj + yi) * cross;
+  }
+  if (Math.abs(area2) < 1e-18) return average(); // a flat sliver
+
+  const centroid = [cx / (3 * area2), cy / (3 * area2)];
+  if (pointInPolygon(centroid[0], centroid[1], poly)) return back(centroid);
+
+  const inner = innermostPoint(poly);
+  return inner ? back(inner) : average();
+}
+
+/**
+ * polygonLabelInfo(ring) -> { point: [lon, lat], radiusM }
+ *
+ * Same point as polygonLabelPoint, plus the radius in metres of the biggest
+ * circle that fits inside the room around that point (the distance to the
+ * nearest wall). A name fits in a room only if it fits inside that circle,
+ * which does not change when the map turns.
+ */
+export function polygonLabelInfo(ring) {
+  const point = polygonLabelPoint(ring);
+  if (!point) return null;
+
+  const pts = open(ring);
+  if (pts.length < 3) return { point, radiusM: 0 };
+
+  const kx = 111320 * Math.cos((point[1] * Math.PI) / 180); // metres per degree of longitude here
+  const ky = 110540; // metres per degree of latitude
+  const poly = pts.map(([lon, lat]) => [(lon - point[0]) * kx, (lat - point[1]) * ky]);
+  return { point, radiusM: distanceToEdges(0, 0, poly) };
+}
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\progress.js ---
 
@@ -63449,6 +66047,35 @@ export function progressFraction(totalDistanceM, distanceFromStartM) {
   if (totalDistanceM <= 0) return 0;
   return Math.max(0, Math.min(1, distanceFromStartM / totalDistanceM));
 }
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\qrCode.js ---
+
+// Reads the text from a scanned QR code and returns the code inside it.
+//
+// Accepts:
+//   campusnav://qr/LIB-G-02          (what the printed codes contain)
+//   https://any-domain/q/LIB-G-02    (if the app goes on the web later)
+//   LIB-G-02                         (typed by hand)
+// Returns the code, or null if the text is not a valid code.
+//
+// Codes are letters, digits, "-" and "_", at most 32 characters. The same
+// rule is used by the backend ingest and the print script.
+
+const CODE_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
+export function parseQrCode(raw) {
+  if (raw === null || raw === undefined) return null;
+
+  const text = String(raw)
+    .trim()
+    .split(/[?#]/)[0] // drop any ?query or #fragment
+    .replace(/\/+$/, ''); // drop trailing slashes
+  if (!text) return null;
+
+  const last = text.split('/').pop();
+  return CODE_RE.test(last) ? last : null;
+}
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\api.test.js ---
 
@@ -63954,6 +66581,250 @@ describe('i18n', () => {
   });
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\labelFit.test.js ---
+
+import { labelMinZoom, sizeAtZoom, textBlockEm } from '@/utils/labelFit';
+import { polygonLabelInfo } from '@/utils/polygonLabel';
+
+const opts = {
+  latDeg: -8.94,
+  minSize: 8,
+  maxSize: 11,
+  startZoom: 16,
+  fullSizeZoom: 19,
+  wrapEm: 7,
+  fit: 1,
+  bandStep: 0.5,
+  fromZoom: 15,
+  toZoom: 22,
+};
+
+describe('sizeAtZoom', () => {
+  test('small when zoomed out, full size when zoomed in', () => {
+    expect(sizeAtZoom(14, opts)).toBe(8);
+    expect(sizeAtZoom(16, opts)).toBe(8);
+    expect(sizeAtZoom(17.5, opts)).toBe(9.5);
+    expect(sizeAtZoom(19, opts)).toBe(11);
+    expect(sizeAtZoom(21, opts)).toBe(11);
+  });
+});
+
+describe('textBlockEm', () => {
+  test('a short name is one line', () => {
+    const b = textBlockEm('C-215', 7);
+    expect(b.height).toBe(1.2);
+  });
+  test('a long name wraps onto more lines, and is never wider than the wrap width allows for a word', () => {
+    const one = textBlockEm('Computer Laboratory Block', 100);
+    const wrapped = textBlockEm('Computer Laboratory Block', 7);
+    expect(one.height).toBe(1.2);
+    expect(wrapped.height > one.height).toBe(true);
+    expect(wrapped.width < one.width).toBe(true);
+  });
+  test('empty text has no size', () => {
+    expect(textBlockEm('   ', 7).width).toBe(0);
+  });
+});
+
+describe('labelMinZoom', () => {
+  test('a bigger room shows its name at a lower zoom than a small one', () => {
+    const big = labelMinZoom('C-215', 6, opts);
+    const small = labelMinZoom('C-215', 1.5, opts);
+    expect(big < small).toBe(true);
+  });
+
+  test('a long name needs a higher zoom than a short name in the same room', () => {
+    const short = labelMinZoom('C-215', 3, opts);
+    const long = labelMinZoom('Postgraduate Computer Laboratory', 3, opts);
+    expect(long > short).toBe(true);
+  });
+
+  test('the result is a multiple of the band step', () => {
+    const z = labelMinZoom('Room 12', 2.2, opts);
+    expect((z * 2) % 1).toBe(0);
+  });
+
+  test('a name that fits at one zoom fits at every higher zoom', () => {
+    const z = labelMinZoom('Staff Common Room', 2, opts);
+    expect(z !== null).toBe(true);
+    // asking again with a larger room can only lower the zoom, never raise it
+    expect(labelMinZoom('Staff Common Room', 2.5, opts) <= z).toBe(true);
+  });
+
+  test('a speck of a room, or no name, never shows a name', () => {
+    expect(labelMinZoom('X', 0.01, opts)).toBeNull();
+    expect(labelMinZoom('', 5, opts)).toBeNull();
+    expect(labelMinZoom('Hall', 0, opts)).toBeNull();
+  });
+
+  test('fit above 1 shows names sooner, below 1 later', () => {
+    const base = labelMinZoom('Lecture Hall 2', 2, opts);
+    expect(labelMinZoom('Lecture Hall 2', 2, { ...opts, fit: 1.5 }) <= base).toBe(true);
+    expect(labelMinZoom('Lecture Hall 2', 2, { ...opts, fit: 0.6 }) >= base).toBe(true);
+  });
+});
+
+describe('polygonLabelInfo', () => {
+  // A 6 m x 4 m room near the equator: about 0.0000539 deg wide, 0.0000362 deg tall.
+  const w = 6 / 111320, h = 4 / 110540;
+  const ring = [[0, 0], [w, 0], [w, h], [0, h], [0, 0]];
+  test('radius is half the short side, in metres', () => {
+    const info = polygonLabelInfo(ring);
+    expect(Math.abs(info.radiusM - 2) < 0.02).toBe(true);
+    expect(Math.abs(info.point[0] - w / 2) < 1e-9).toBe(true);
+  });
+  test('nothing for no polygon', () => {
+    expect(polygonLabelInfo([])).toBeNull();
+  });
+});
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\placeLabel.test.js ---
+
+// The i18n module is replaced by a tiny stand-in so these tests check only
+// the logic in levelLabel and placeLabel.
+jest.mock('@/i18n', () => ({
+  t: (key, params) =>
+    params ? `${key}:${Object.values(params).join(',')}` : key,
+}));
+
+import { levelLabel } from '@/utils/levelLabel';
+import {
+  formatPlaceName,
+  parseAltNames,
+  placeLocationLine,
+  searchableText,
+} from '@/utils/placeLabel';
+
+describe('levelLabel', () => {
+  test('names the common floors', () => {
+    expect(levelLabel('-1')).toBe('level.basement');
+    expect(levelLabel('0')).toBe('level.ground');
+    expect(levelLabel('1')).toBe('level.first');
+    expect(levelLabel('2')).toBe('level.second');
+    expect(levelLabel(3)).toBe('level.third');
+    expect(levelLabel('10')).toBe('level.tenth');
+  });
+
+  test('deeper basements and very tall buildings', () => {
+    expect(levelLabel('-2')).toBe('level.basementN:2');
+    expect(levelLabel('11')).toBe('level.number:11');
+  });
+
+  test('a stair on two floors shows the first', () => {
+    expect(levelLabel('0;1')).toBe('level.ground');
+  });
+
+  test('anything else is shown as typed, and nothing gives null', () => {
+    expect(levelLabel('M')).toBe('M');
+    expect(levelLabel(null)).toBeNull();
+    expect(levelLabel(undefined)).toBeNull();
+    expect(levelLabel('  ')).toBeNull();
+  });
+});
+
+describe('formatPlaceName', () => {
+  test('puts the alternative names in brackets', () => {
+    expect(formatPlaceName({ name: 'Room 12', alt_names: 'Computer Lab;ICT Lab' })).toBe(
+      'Room 12 (Computer Lab, ICT Lab)'
+    );
+  });
+
+  test('plain name when there is none', () => {
+    expect(formatPlaceName({ name: 'Room 12' })).toBe('Room 12');
+    expect(formatPlaceName({ name: 'Room 12', alt_names: '' })).toBe('Room 12');
+    expect(formatPlaceName({ name: 'Room 12', alt_names: ' ; ' })).toBe('Room 12');
+  });
+
+  test('ignores a repeat of the main name and duplicates', () => {
+    expect(formatPlaceName({ name: 'Library', alt_names: 'library; Reading Room; reading room' })).toBe(
+      'Library (Reading Room)'
+    );
+  });
+
+  test('copes with a missing place', () => {
+    expect(formatPlaceName(null)).toBe('');
+  });
+});
+
+describe('placeLocationLine', () => {
+  test('building and floor', () => {
+    expect(placeLocationLine({ building_name: 'Library', level: '1' })).toBe(
+      'Library · level.first'
+    );
+  });
+  test('either one alone, or none', () => {
+    expect(placeLocationLine({ building_name: 'Library' })).toBe('Library');
+    expect(placeLocationLine({ level: '0' })).toBe('level.ground');
+    expect(placeLocationLine({})).toBeNull();
+  });
+});
+
+test('searchableText includes alternative names', () => {
+  expect(searchableText({ name: 'Room 12', alt_names: 'ICT Lab', building_name: 'Library' })).toContain('ict lab');
+});
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\polygonLabel.test.js ---
+
+import { polygonLabelPoint } from '@/utils/polygonLabel';
+
+const near = (a, b, tol = 1e-9) => Math.abs(a - b) < tol;
+
+describe('polygonLabelPoint', () => {
+  test('the middle of a square', () => {
+    const p = polygonLabelPoint([[0, 0], [2, 0], [2, 2], [0, 2], [0, 0]]);
+    expect(near(p[0], 2 / 2) && near(p[1], 1)).toBe(true);
+  });
+
+  test('works with or without the closing point', () => {
+    const open = polygonLabelPoint([[0, 0], [4, 0], [4, 2], [0, 2]]);
+    const closed = polygonLabelPoint([[0, 0], [4, 0], [4, 2], [0, 2], [0, 0]]);
+    expect(near(open[0], closed[0]) && near(open[1], closed[1])).toBe(true);
+    expect(near(open[0], 2) && near(open[1], 1)).toBe(true);
+  });
+
+  test('a slanted room is centred on the room, not on its bounding box', () => {
+    // A parallelogram: its centre of mass is (3, 1), the middle of its diagonals.
+    const p = polygonLabelPoint([[0, 0], [4, 0], [6, 2], [2, 2]]);
+    expect(near(p[0], 3) && near(p[1], 1)).toBe(true);
+  });
+
+  test('the same shape rotated gives the same place', () => {
+    const rot = (pts, deg) => {
+      const r = (deg * Math.PI) / 180;
+      return pts.map(([x, y]) => [x * Math.cos(r) - y * Math.sin(r), x * Math.sin(r) + y * Math.cos(r)]);
+    };
+    const base = [[0, 0], [6, 0], [6, 2], [0, 2]];
+    const a = polygonLabelPoint(rot(base, 0));
+    const b = polygonLabelPoint(rot(base, 37));
+    const centre = rot([[3, 1]], 37)[0];
+    expect(near(a[0], 3, 1e-6) && near(a[1], 1, 1e-6)).toBe(true);
+    // a tiny flattening difference is allowed because lat/lon are scaled
+    expect(Math.abs(b[0] - centre[0]) < 0.02 && Math.abs(b[1] - centre[1]) < 0.02).toBe(true);
+  });
+
+  test('a U-shaped room: the point is inside the room, not in the notch', () => {
+    // U opening upwards; its centre of mass lies in the empty notch.
+    const u = [[0, 0], [9, 0], [9, 9], [6, 9], [6, 3], [3, 3], [3, 9], [0, 9]];
+    const p = polygonLabelPoint(u);
+    // inside the base (y < 3) or one of the arms (x < 3 or x > 6), never in the notch
+    const inBase = p[1] > 0 && p[1] < 3;
+    const inLeftArm = p[0] > 0 && p[0] < 3 && p[1] < 9;
+    const inRightArm = p[0] > 6 && p[0] < 9 && p[1] < 9;
+    expect(inBase || inLeftArm || inRightArm).toBe(true);
+  });
+
+  test('degenerate input does not crash', () => {
+    expect(polygonLabelPoint([])).toBeNull();
+    expect(polygonLabelPoint(null)).toBeNull();
+    expect(polygonLabelPoint([[1, 1]])).toEqual([1, 1]);
+    const line = polygonLabelPoint([[0, 0], [2, 0], [4, 0]]);
+    expect(near(line[0], 2) && near(line[1], 0)).toBe(true);
+  });
+});
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\progress.test.js ---
 
 // Tests for utils/progress.js.
@@ -64115,5 +66986,35 @@ describe('progressFraction', () => {
 
   test('zero total gives 0', () => {
     expect(progressFraction(0, 50)).toBe(0);
+  });
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\qrCode.test.js ---
+
+import { parseQrCode } from '@/utils/qrCode';
+
+describe('parseQrCode', () => {
+  test('reads the app link', () => {
+    expect(parseQrCode('campusnav://qr/LIB-G-02')).toBe('LIB-G-02');
+  });
+
+  test('reads a web link, ignoring query and fragment', () => {
+    expect(parseQrCode('https://campus.example.ac.tz/q/LIB-G-02?x=1#top')).toBe(
+      'LIB-G-02'
+    );
+  });
+
+  test('reads a bare code and trims spaces and slashes', () => {
+    expect(parseQrCode('  LIB-G-02  ')).toBe('LIB-G-02');
+    expect(parseQrCode('campusnav://qr/LIB_G_02/')).toBe('LIB_G_02');
+  });
+
+  test('rejects things that are not codes', () => {
+    expect(parseQrCode('')).toBeNull();
+    expect(parseQrCode(null)).toBeNull();
+    expect(parseQrCode(undefined)).toBeNull();
+    expect(parseQrCode('two words')).toBeNull();
+    expect(parseQrCode('A'.repeat(33))).toBeNull();
+    expect(parseQrCode('hello world!')).toBeNull();
   });
 });

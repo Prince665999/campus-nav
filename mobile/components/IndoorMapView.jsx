@@ -129,13 +129,22 @@ function levelLabel(level) {
   return level;
 }
 
-// Snap a bearing to the nearest multiple of INDOOR_HEADING_SNAP_DEG.
+// Snap a bearing to the nearest axis when it is close to one.
+//
+// A corridor surveyed at 86° or 93° is, on the ground, a corridor running
+// due east-west. Showing 86° tilts the whole floor plan for no reason. So a
+// bearing within AXIS_SNAP_TOLERANCE_DEG of a multiple of 90 is shown as
+// that multiple; a bearing further from an axis (a genuinely diagonal
+// corridor) is shown exactly as it is, so a real wrong angle still shows.
+const AXIS_SNAP_TOLERANCE_DEG = 15;
+
 function snapToCardinal(bearing) {
   if (bearing == null || !Number.isFinite(bearing)) return 0;
   const h = ((bearing % 360) + 360) % 360;
-  const step = INDOOR_HEADING_SNAP_DEG;
-  if (!step || step <= 0) return h; // no snapping
-  return (Math.round(h / step) * step) % 360;
+  const nearest = (Math.round(h / 90) * 90) % 360;
+  const diff = Math.abs(((h - nearest + 540) % 360) - 180);
+  const off = Math.abs(180 - diff);
+  return off <= AXIS_SNAP_TOLERANCE_DEG ? nearest : h;
 }
 
 // Snap a bearing to N or S only. Used by the preview.
@@ -495,11 +504,7 @@ export function IndoorMapView({
 
     // The very first step starts in a room. There the path begins with a
     // short stub into the corridor, which must not decide the direction.
-    const isRouteStart =
-      !!currentStepPoint &&
-      all.length > 0 &&
-      all[0].lat === currentStepPoint.lat &&
-      all[0].lon === currentStepPoint.lon;
+    const isRouteStart = startIdx === 0;
 
     // The direction of the road ahead (see utils/legBearing.js): along the
     // corridor at the start, along the path until it turns on the way, and
@@ -507,6 +512,7 @@ export function IndoorMapView({
     const raw = headingAlongRoute(slice, { isRouteStart });
     // No usable direction (last step, or the leg is under 3 m): keep the
     // previous heading instead of swinging to north.
+    console.log('HEADING', { isRouteStart, startIdx, n: slice.length, first4: slice.slice(0, 4), raw });
     return raw == null ? null : snapToCardinal(raw);
   }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
 
@@ -1094,4 +1100,3 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
 });
-

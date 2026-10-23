@@ -59,9 +59,9 @@ export function legBearing(points) {
 // ---------------------------------------------------------------------------
 //
 // START. A route that begins in a room starts with a short stub from the
-// door into the corridor, then turns onto the corridor. Aiming the map at
-// the stub, or at a line across both, shows the corridor at a slant. For the
-// first step we skip that stub and aim along the corridor.
+// door into the corridor, then turns onto the corridor. For the first step
+// we want the direction of the stub itself, which is the first leg the
+// walker actually takes. See firstLegBearing().
 //
 // END. The last stretch into the destination door is only a metre or two, too
 // short to be a "road". There we turn the map to face the destination.
@@ -95,6 +95,36 @@ function stubEndIndex(points) {
   return -1;
 }
 
+// ---------------------------------------------------------------------------
+// The first real leg, used for the start of a route
+// ---------------------------------------------------------------------------
+
+const FIRST_LEG_TURN_DEG = 25;
+
+// Direction of the first real leg: skip zero-length duplicate points, then
+// follow the path until it turns. A door stub ends at its corner, so a
+// 2 m stub north gives ~0, not the corridor beyond it.
+function firstLegBearing(points) {
+  let i = 0;
+  while (
+    i < points.length - 1 &&
+    haversineM(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon) < MICRO_SEGMENT_M
+  ) i++;
+  if (i >= points.length - 1) return null;
+
+  const ref = bearingDeg(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon);
+  let j = i + 1;
+  while (j < points.length - 1) {
+    const seg = haversineM(points[j].lat, points[j].lon, points[j + 1].lat, points[j + 1].lon);
+    if (seg >= MICRO_SEGMENT_M) {
+      const b = bearingDeg(points[j].lat, points[j].lon, points[j + 1].lat, points[j + 1].lon);
+      if (angleDiff(b, ref) > FIRST_LEG_TURN_DEG) break;
+    }
+    j++;
+  }
+  return bearingDeg(points[i].lat, points[i].lon, points[j].lat, points[j].lon);
+}
+
 /**
  * The direction the map should face for a step.
  *   points        the route from the walker's position onward, on this floor
@@ -115,13 +145,11 @@ export function headingAlongRoute(points, { isRouteStart = false } = {}) {
       : null;
   }
 
-  // First step: aim along the corridor, not along the door stub.
+  // First step: aim along the leg you actually walk first, which is the
+  // door stub when the route starts in a room.
   if (isRouteStart) {
-    const corner = stubEndIndex(points);
-    if (corner > 0) {
-      const alongCorridor = legBearing(points.slice(corner));
-      if (alongCorridor !== null) return alongCorridor;
-    }
+    const h = firstLegBearing(points);
+    if (h !== null) return h;
   }
 
   return legBearing(points);
