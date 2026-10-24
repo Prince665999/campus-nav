@@ -5,9 +5,11 @@ const path = require('path');
 // Use a plain file name to match it anywhere in the project: 'App.jsx'
 // Use a partial path if several files share a name: 'src/screens/Home.jsx'
 const selectedFiles = [
-  'FILE_NAME_1.js',
-  'FILE_NAME_2.jsx',
-  'FILE_NAME_3.py',
+  'IndoorMapView.jsx',
+  'legBearing.js',
+  'useRouteProgress.js',
+  'walking.jsx',
+  'MapView.jsx',
 ];
 // ============================
 

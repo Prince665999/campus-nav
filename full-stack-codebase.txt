@@ -33771,9 +33771,11 @@ const path = require('path');
 // Use a plain file name to match it anywhere in the project: 'App.jsx'
 // Use a partial path if several files share a name: 'src/screens/Home.jsx'
 const selectedFiles = [
-  'FILE_NAME_1.js',
-  'FILE_NAME_2.jsx',
-  'FILE_NAME_3.py',
+  'IndoorMapView.jsx',
+  'legBearing.js',
+  'useRouteProgress.js',
+  'walking.jsx',
+  'MapView.jsx',
 ];
 // ============================
 
@@ -37744,6 +37746,7 @@ export default function WalkingScreen() {
     indoorGeometryByLevel,
     indoorDestination,
     currentStepGeometryPoint,
+    nextStepGeometryPoint,
   } = useRouteProgress(route, {
     startedFromPlace: routeRequestRef.current?.fromId != null,
   });
@@ -37917,7 +37920,7 @@ export default function WalkingScreen() {
   // Recalculate: local re-snap first, server only when genuinely off
   // route.
   const handleRecalculate = useCallback(async () => {
-    if (mode !== 'outdoor') return;
+    if (mode !== 'indoor') return;
     const from = rawPosition || position;
     if (!from) return;
     if (!destinationId) return;
@@ -38089,6 +38092,7 @@ export default function WalkingScreen() {
             indoorGeometryByLevel={indoorGeometryByLevel}
             indoorDestination={indoorDestination}
             currentStepPoint={currentStepGeometryPoint}
+            nextStepPoint={nextStepGeometryPoint}
             currentStepLevel={indoorLevel}
             style={styles.map}
           />
@@ -38168,8 +38172,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
 });
-
-
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\[code].jsx ---
 
@@ -40207,6 +40209,13 @@ import {
   INDOOR_LABEL_FULL_SIZE_ZOOM,
   INDOOR_LABEL_WRAP_EM,
   INDOOR_LABEL_FIT,
+  INDOOR_CURRENT_LEG_COLOR,
+  INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+  INDOOR_CURRENT_LEG_WIDTH,
+  INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+  INDOOR_LEG_END_DOT_RADIUS,
+  INDOOR_LEG_END_DOT_BORDER_WIDTH,
+  INDOOR_ROUTE_FADED_OPACITY,
 } from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
@@ -40250,13 +40259,22 @@ function levelLabel(level) {
   return level;
 }
 
-// Snap a bearing to the nearest multiple of INDOOR_HEADING_SNAP_DEG.
+// Snap a bearing to the nearest axis when it is close to one.
+//
+// A corridor surveyed at 86° or 93° is, on the ground, a corridor running
+// due east-west. Showing 86° tilts the whole floor plan for no reason. So a
+// bearing within AXIS_SNAP_TOLERANCE_DEG of a multiple of 90 is shown as
+// that multiple; a bearing further from an axis (a genuinely diagonal
+// corridor) is shown exactly as it is, so a real wrong angle still shows.
+const AXIS_SNAP_TOLERANCE_DEG = 15;
+
 function snapToCardinal(bearing) {
   if (bearing == null || !Number.isFinite(bearing)) return 0;
   const h = ((bearing % 360) + 360) % 360;
-  const step = INDOOR_HEADING_SNAP_DEG;
-  if (!step || step <= 0) return h; // no snapping
-  return (Math.round(h / step) * step) % 360;
+  const nearest = (Math.round(h / 90) * 90) % 360;
+  const diff = Math.abs(((h - nearest + 540) % 360) - 180);
+  const off = Math.abs(180 - diff);
+  return off <= AXIS_SNAP_TOLERANCE_DEG ? nearest : h;
 }
 
 // Snap a bearing to N or S only. Used by the preview.
@@ -40313,6 +40331,7 @@ export function IndoorMapView({
   routeByLevel = [],
   destination = null,
   currentStepPoint = null,
+  nextStepPoint = null,
   currentStepLevel = null,
   style,
   onNoRooms,
@@ -40556,6 +40575,44 @@ export function IndoorMapView({
     };
   }, [routeByLevel, selectedLevel]);
 
+  // The part of the route the student must walk during the current step:
+  // from the current step's point to the next step's point, on this floor only.
+  const currentLegGeoJSON = useMemo(() => {
+    if (!currentStepPoint || !nextStepPoint || !routeByLevel?.length) return null;
+    const same = (p, q) => p.lat === q.lat && p.lon === q.lon;
+
+    const startIdx = routeByLevel.findIndex((p) => same(p, currentStepPoint));
+    if (startIdx < 0) return null;
+    let endIdx = -1;
+    for (let i = startIdx + 1; i < routeByLevel.length; i++) {
+      if (same(routeByLevel[i], nextStepPoint)) { endIdx = i; break; }
+    }
+    if (endIdx < 0) return null;
+
+    const runs = [];
+    let cur = [];
+    for (let i = startIdx; i <= endIdx; i++) {
+      const p = routeByLevel[i];
+      if (p.level === selectedLevel) {
+        cur.push([p.lon, p.lat]);
+      } else {
+        if (cur.length >= 2) runs.push(cur);
+        cur = [];
+      }
+    }
+    if (cur.length >= 2) runs.push(cur);
+    if (runs.length === 0) return null;
+
+    return {
+      type: 'FeatureCollection',
+      features: runs.map((coordinates) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates },
+      })),
+    };
+  }, [routeByLevel, currentStepPoint, nextStepPoint, selectedLevel]);
+
   // -------------------------------------------------------------------------
   // Route-up heading
   // -------------------------------------------------------------------------
@@ -40616,11 +40673,7 @@ export function IndoorMapView({
 
     // The very first step starts in a room. There the path begins with a
     // short stub into the corridor, which must not decide the direction.
-    const isRouteStart =
-      !!currentStepPoint &&
-      all.length > 0 &&
-      all[0].lat === currentStepPoint.lat &&
-      all[0].lon === currentStepPoint.lon;
+    const isRouteStart = startIdx === 0;
 
     // The direction of the road ahead (see utils/legBearing.js): along the
     // corridor at the start, along the path until it turns on the way, and
@@ -40628,6 +40681,7 @@ export function IndoorMapView({
     const raw = headingAlongRoute(slice, { isRouteStart });
     // No usable direction (last step, or the leg is under 3 m): keep the
     // previous heading instead of swinging to north.
+    console.log('HEADING', { isRouteStart, startIdx, n: slice.length, first4: slice.slice(0, 4), raw });
     return raw == null ? null : snapToCardinal(raw);
   }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
 
@@ -40970,6 +41024,44 @@ export function IndoorMapView({
                 lineWidth: 4,
                 lineCap: 'round',
                 lineJoin: 'round',
+                lineOpacity: currentLegGeoJSON ? INDOOR_ROUTE_FADED_OPACITY : 1,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON ? (
+          <ShapeSource id="indoorCurrentLegSource" shape={currentLegGeoJSON}>
+            <LineLayer
+              id="indoorCurrentLegCasing"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+            <LineLayer
+              id="indoorCurrentLegLine"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON && nextStepPoint ? (
+          <ShapeSource id="indoorNextStepSource" shape={pointFeature(nextStepPoint)}>
+            <CircleLayer
+              id="indoorNextStepDot"
+              style={{
+                circleRadius: INDOOR_LEG_END_DOT_RADIUS,
+                circleColor: '#ffffff',
+                circleStrokeColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                circleStrokeWidth: INDOOR_LEG_END_DOT_BORDER_WIDTH,
               }}
             />
           </ShapeSource>
@@ -41215,8 +41307,6 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
 });
-
-
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\InstructionCard.jsx ---
 
@@ -41823,6 +41913,7 @@ export function RouteMap({
   indoorGeometryByLevel = [],
   indoorDestination = null,
   currentStepPoint = null,
+  nextStepPoint = null,
   currentStepLevel = null,
   style,
 }) {
@@ -42065,6 +42156,7 @@ export function RouteMap({
         routeByLevel={indoorGeometryByLevel}
         destination={indoorDestination}
         currentStepPoint={currentStepPoint}
+        nextStepPoint={nextStepPoint}
         currentStepLevel={currentStepLevel}
         style={style}
         onNoRooms={() => setIndoorNoRooms(true)}
@@ -44127,7 +44219,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.43.204:8000';
+const DEFAULT_API_BASE_URL = 'http://192.168.100.149:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -44290,6 +44382,19 @@ export const INDOOR_LABEL_WRAP_EM = 7; // long names wrap into lines this wide
 //   1.3  may touch the walls a little   <- default
 //   1.6+ more names earlier, but they may spill over
 export const INDOOR_LABEL_FIT = 1.3;
+
+// ---- Indoor navigation: the leg the student is walking right now ----
+export const INDOOR_CURRENT_LEG_COLOR = "#16a34a";         // the line
+export const INDOOR_CURRENT_LEG_OUTLINE_COLOR = "#14532d"; // dark outline + ring border
+export const INDOOR_CURRENT_LEG_WIDTH = 4;                 // line thickness
+export const INDOOR_CURRENT_LEG_OUTLINE_WIDTH = 6;         // outline thickness (keep bigger than the line)
+
+// The ring that marks where the leg ends (the next step's point)
+export const INDOOR_LEG_END_DOT_RADIUS = 3;                // size of the white centre
+export const INDOOR_LEG_END_DOT_BORDER_WIDTH = 1;          // thickness of its dark border
+
+// How faint the rest of the route gets while a leg is highlighted (1 = no fade)
+export const INDOOR_ROUTE_FADED_OPACITY = 1;
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\icons.js ---
@@ -45279,6 +45384,14 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     return route.geometry[step.geometry_index] || null;
   }, [currentStep.mode, currentStep.step, route?.geometry]);
 
+  const nextStepGeometryPoint = useMemo(() => {
+    if (currentStep.mode !== 'indoor') return null;
+    if (!route?.geometry) return null;
+    const next = steps[currentStep.index + 1];
+    if (!next || next.geometry_index == null) return null;
+    return route.geometry[next.geometry_index] || null;
+  }, [currentStep.mode, currentStep.index, steps, route?.geometry]);
+
   const indoorGeometryByLevel = useMemo(() => {
     if (!route?.geometry || !steps.length) return [];
     const indoorSteps = steps.filter(
@@ -45342,10 +45455,9 @@ export function useRouteProgress(route, { startedFromPlace = false } = {}) {
     indoorGeometryByLevel,
     indoorDestination,
     currentStepGeometryPoint,
+    nextStepGeometryPoint,
   };
 }
-
-
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\hooks\useStartingPoint.js ---
 
@@ -65619,9 +65731,9 @@ export function legBearing(points) {
 // ---------------------------------------------------------------------------
 //
 // START. A route that begins in a room starts with a short stub from the
-// door into the corridor, then turns onto the corridor. Aiming the map at
-// the stub, or at a line across both, shows the corridor at a slant. For the
-// first step we skip that stub and aim along the corridor.
+// door into the corridor, then turns onto the corridor. For the first step
+// we want the direction of the stub itself, which is the first leg the
+// walker actually takes. See firstLegBearing().
 //
 // END. The last stretch into the destination door is only a metre or two, too
 // short to be a "road". There we turn the map to face the destination.
@@ -65655,6 +65767,36 @@ function stubEndIndex(points) {
   return -1;
 }
 
+// ---------------------------------------------------------------------------
+// The first real leg, used for the start of a route
+// ---------------------------------------------------------------------------
+
+const FIRST_LEG_TURN_DEG = 25;
+
+// Direction of the first real leg: skip zero-length duplicate points, then
+// follow the path until it turns. A door stub ends at its corner, so a
+// 2 m stub north gives ~0, not the corridor beyond it.
+function firstLegBearing(points) {
+  let i = 0;
+  while (
+    i < points.length - 1 &&
+    haversineM(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon) < MICRO_SEGMENT_M
+  ) i++;
+  if (i >= points.length - 1) return null;
+
+  const ref = bearingDeg(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon);
+  let j = i + 1;
+  while (j < points.length - 1) {
+    const seg = haversineM(points[j].lat, points[j].lon, points[j + 1].lat, points[j + 1].lon);
+    if (seg >= MICRO_SEGMENT_M) {
+      const b = bearingDeg(points[j].lat, points[j].lon, points[j + 1].lat, points[j + 1].lon);
+      if (angleDiff(b, ref) > FIRST_LEG_TURN_DEG) break;
+    }
+    j++;
+  }
+  return bearingDeg(points[i].lat, points[i].lon, points[j].lat, points[j].lon);
+}
+
 /**
  * The direction the map should face for a step.
  *   points        the route from the walker's position onward, on this floor
@@ -65675,13 +65817,11 @@ export function headingAlongRoute(points, { isRouteStart = false } = {}) {
       : null;
   }
 
-  // First step: aim along the corridor, not along the door stub.
+  // First step: aim along the leg you actually walk first, which is the
+  // door stub when the route starts in a room.
   if (isRouteStart) {
-    const corner = stubEndIndex(points);
-    if (corner > 0) {
-      const alongCorridor = legBearing(points.slice(corner));
-      if (alongCorridor !== null) return alongCorridor;
-    }
+    const h = firstLegBearing(points);
+    if (h !== null) return h;
   }
 
   return legBearing(points);

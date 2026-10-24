@@ -1,0 +1,2780 @@
+--- FILE: mobile/app/walking.jsx ---
+
+// Walking Mode screen.
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { MaterialIcons } from '@expo/vector-icons';
+
+import { RouteMap } from '@/components/MapView';
+import { InstructionCard } from '@/components/InstructionCard';
+import { OffRouteBanner } from '@/components/OffRouteBanner';
+import { ApproachPhoto } from '@/components/ApproachPhoto';
+import { ReportSheet } from '@/components/ReportSheet';
+import { WifiBanner } from '@/components/WifiBanner';
+import { useRouteProgress } from '@/hooks/useRouteProgress';
+import { useCompass } from '@/hooks/useCompass';
+import { useNearbyWifi } from '@/hooks/useNearbyWifi';
+import { useSettings } from '@/context/SettingsContext';
+import { takeRouteRequest } from '@/services/routeRequest';
+import { computeRoute, listMediaForPlace, recordRecent } from '@/services/api';
+import { closestApproachPhoto } from '@/utils/media';
+import * as tts from '@/services/tts';
+import * as haptics from '@/services/haptics';
+import { bearingDeg, snapToRoute } from '@/utils/geo';
+import { t, ttsLanguageForCurrentLang } from '@/i18n';
+import { COLORS, TOUCH } from '@/constants/theme';
+import { ICONS } from '@/constants/icons';
+import {
+  RECOMPUTE_AFTER_MS,
+  RECOMPUTE_MAX_ACCURACY_M,
+  LOCAL_RESNAP_MAX_M,
+} from '@/constants/config';
+
+const APPROACH_PHOTO_DISTANCE_M = 60;
+const ARRIVAL_DISTANCE_M = 15;
+
+export default function WalkingScreen() {
+  const { routeJson } = useLocalSearchParams();
+
+  const routeRequestRef = useRef(takeRouteRequest());
+
+  const [route, setRoute] = useState(() => {
+    if (routeJson) {
+      try {
+        return JSON.parse(routeJson);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  });
+
+  const [loading, setLoading] = useState(!route);
+  const [error, setError] = useState(null);
+  const [bannerDismissed, setBannerDismissed] = useState(false);
+  const [approachPhotos, setApproachPhotos] = useState([]);
+  const [photoDismissed, setPhotoDismissed] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+
+  const arrivedRef = useRef(false);
+  const recomputeAttemptsRef = useRef(0);
+
+  const { settings } = useSettings();
+
+  const destinationId = routeRequestRef.current?.toId ?? null;
+
+  useEffect(() => {
+    if (route) return;
+    if (!destinationId) {
+      setError('No destination');
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    async function load() {
+      try {
+        const req = routeRequestRef.current;
+        const data = await computeRoute({
+          fromPlaceId: req?.fromId ?? null,
+          fromLat: req?.fromLat ?? null,
+          fromLon: req?.fromLon ?? null,
+          fromAccuracyM: req?.fromAccuracyM ?? null,
+          toPlaceId: destinationId,
+        });
+        if (!cancelled) setRoute(data);
+      } catch (err) {
+        if (!cancelled) setError(err.message || t('common.error'));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!destinationId) return;
+    let cancelled = false;
+    listMediaForPlace(destinationId)
+      .then((items) => {
+        if (!cancelled) setApproachPhotos(items);
+      })
+      .catch(() => {
+        if (!cancelled) setApproachPhotos([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [destinationId]);
+
+  useEffect(() => {
+    if (!destinationId) return;
+    recordRecent(destinationId).catch(() => {});
+  }, [destinationId]);
+
+  const {
+    permissionGranted,
+    position,
+    rawPosition,
+    accuracyM,
+    currentStep,
+    currentStepIndex,
+    distanceRemainingM,
+    distanceToNextStepM,
+    offRoute,
+    progress,
+    resetOffRoute,
+    gpsStale,
+    mode,
+    advanceStep,
+    previousStep,
+    canGoBack,
+    isLastStep,
+    indoorLevel,
+    indoorBuildingName,
+    indoorGeometry,
+    indoorGeometryByLevel,
+    indoorDestination,
+    currentStepGeometryPoint,
+    nextStepGeometryPoint,
+  } = useRouteProgress(route, {
+    startedFromPlace: routeRequestRef.current?.fromId != null,
+  });
+
+  const { heading } = useCompass({ position: rawPosition });
+
+  useEffect(() => {
+    if (mode !== 'outdoor') return;
+    if (!destinationId) return;
+    if (!offRoute) return;
+    if (recomputeAttemptsRef.current >= 3) return;
+    if (!rawPosition) return;
+    if (
+      !rawPosition.accuracyM ||
+      rawPosition.accuracyM > RECOMPUTE_MAX_ACCURACY_M
+    ) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (!rawPosition) return;
+      recomputeAttemptsRef.current += 1;
+
+      computeRoute({
+        fromLat: rawPosition.lat,
+        fromLon: rawPosition.lon,
+        fromAccuracyM: rawPosition.accuracyM,
+        toPlaceId: destinationId,
+      })
+        .then((data) => {
+          if (data) {
+            setRoute(data);
+            resetOffRoute();
+          }
+        })
+        .catch(() => {});
+    }, RECOMPUTE_AFTER_MS);
+
+    return () => clearTimeout(timer);
+  }, [mode, offRoute, rawPosition, destinationId, resetOffRoute]);
+
+  const { spot: wifiSpot, dismiss: dismissWifi } = useNearbyWifi({
+    position,
+    enabled: settings.wifiProximityEnabled && mode === 'outdoor',
+  });
+
+  useEffect(() => {
+    if (!settings.voiceEnabled) return;
+    if (!currentStep) return;
+    tts.speak(currentStep.instruction, {
+      rate: settings.voiceRate,
+      lang: ttsLanguageForCurrentLang(),
+    });
+  }, [currentStep, settings.voiceEnabled, settings.voiceRate]);
+
+  useEffect(() => {
+    if (!currentStep) return;
+    if (currentStepIndex === 0) return;
+    haptics.turnPulse();
+  }, [currentStepIndex, currentStep]);
+
+  useEffect(() => {
+    if (offRoute) {
+      haptics.offRoutePulse();
+    }
+  }, [offRoute]);
+
+  useEffect(() => {
+    return () => {
+      tts.stop();
+    };
+  }, []);
+
+  // Arrival: the snap OR direct distance is enough.
+  useEffect(() => {
+    if (mode !== 'outdoor') return;
+    if (arrivedRef.current) return;
+    if (!route) return;
+
+    const nearBySnap = distanceRemainingM <= ARRIVAL_DISTANCE_M;
+
+    let nearByDirect = false;
+    if (position && route.geometry && route.geometry.length > 0) {
+      const last = route.geometry[route.geometry.length - 1];
+      const R = 6371000;
+      const phi1 = (position.lat * Math.PI) / 180;
+      const phi2 = (last.lat * Math.PI) / 180;
+      const dphi = ((last.lat - position.lat) * Math.PI) / 180;
+      const dlambda = ((last.lon - position.lon) * Math.PI) / 180;
+      const a =
+        Math.sin(dphi / 2) ** 2 +
+        Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+      const d = 2 * R * Math.asin(Math.sqrt(a));
+      nearByDirect = d <= ARRIVAL_DISTANCE_M;
+    }
+
+    if (!nearBySnap && !nearByDirect) return;
+
+    arrivedRef.current = true;
+    haptics.arrivalPulse();
+    router.replace({
+      pathname: '/arrival',
+      params: { toId: String(destinationId) },
+    });
+  }, [mode, distanceRemainingM, position, route, destinationId]);
+
+  const handleAdvanceStep = useCallback(() => {
+    if (!isLastStep) {
+      advanceStep();
+      return;
+    }
+    if (arrivedRef.current) return;
+    arrivedRef.current = true;
+    haptics.arrivalPulse();
+    router.replace({
+      pathname: '/arrival',
+      params: { toId: String(destinationId) },
+    });
+  }, [isLastStep, advanceStep, destinationId]);
+
+  const approachPhoto = (() => {
+    if (mode !== 'outdoor') return null;
+    if (approachPhotos.length === 0) return null;
+    if (distanceRemainingM > APPROACH_PHOTO_DISTANCE_M) return null;
+
+    if (!position || !route?.geometry?.length) {
+      return approachPhotos.find((p) => p.is_primary) || approachPhotos[0];
+    }
+
+    const last = route.geometry[route.geometry.length - 1];
+    const approachBearing = bearingDeg(
+      position.lat,
+      position.lon,
+      last.lat,
+      last.lon
+    );
+
+    return closestApproachPhoto(approachPhotos, approachBearing);
+  })();
+
+  const bearing = (() => {
+    if (mode !== 'outdoor') return null;
+    if (!position || !route || !route.geometry || route.geometry.length < 2) {
+      return null;
+    }
+    const steps = route.steps;
+    let targetAtM;
+    if (currentStepIndex < steps.length - 1) {
+      targetAtM = steps[currentStepIndex + 1].at_m;
+    } else {
+      targetAtM = route.distance_m;
+    }
+
+    let cumulative = 0;
+    for (let i = 0; i < route.geometry.length - 1; i++) {
+      const a = route.geometry[i];
+      const b = route.geometry[i + 1];
+      const segLen = haversine(a.lat, a.lon, b.lat, b.lon);
+      if (cumulative + segLen >= targetAtM) {
+        const fraction = (targetAtM - cumulative) / segLen;
+        const targetLat = a.lat + (b.lat - a.lat) * fraction;
+        const targetLon = a.lon + (b.lon - a.lon) * fraction;
+        return bearingDeg(position.lat, position.lon, targetLat, targetLon);
+      }
+      cumulative += segLen;
+    }
+    const last = route.geometry[route.geometry.length - 1];
+    return bearingDeg(position.lat, position.lon, last.lat, last.lon);
+  })();
+
+  // Recalculate: local re-snap first, server only when genuinely off
+  // route.
+  const handleRecalculate = useCallback(async () => {
+    if (mode !== 'indoor') return;
+    const from = rawPosition || position;
+    if (!from) return;
+    if (!destinationId) return;
+
+    if (route?.geometry?.length > 1) {
+      const local = snapToRoute(from, route.geometry, { nearIndex: null });
+      if (local && local.offRouteM <= LOCAL_RESNAP_MAX_M) {
+        setBannerDismissed(false);
+        setPhotoDismissed(false);
+        resetOffRoute();
+        tts.reset();
+        recomputeAttemptsRef.current = 0;
+        return;
+      }
+    }
+
+    setBannerDismissed(false);
+    setPhotoDismissed(false);
+    resetOffRoute();
+    tts.reset();
+    recomputeAttemptsRef.current = 0;
+    try {
+      const data = await computeRoute({
+        fromLat: from.lat,
+        fromLon: from.lon,
+        fromAccuracyM: rawPosition?.accuracyM ?? null,
+        toPlaceId: destinationId,
+      });
+      setRoute(data);
+    } catch {}
+  }, [mode, position, rawPosition, destinationId, resetOffRoute, route]);
+
+  const openChat = useCallback(() => {
+    router.push({
+      pathname: '/chat',
+      params: {
+        fromPlaceId: routeRequestRef.current?.fromId
+          ? String(routeRequestRef.current.fromId)
+          : '',
+        toPlaceId: String(destinationId || ''),
+        currentStepIndex: String(currentStepIndex ?? 0),
+        distanceFromStartM: String(
+          (route?.distance_m || 0) - distanceRemainingM
+        ),
+        currentLat: position ? String(position.lat) : '',
+        currentLon: position ? String(position.lon) : '',
+      },
+    });
+  }, [destinationId, currentStepIndex, route?.distance_m, distanceRemainingM, position]);
+
+  if (loading) {
+    return (
+      <>
+        <Stack.Screen options={{ title: t('walking.title') }} />
+        <View style={styles.state}>
+          <ActivityIndicator color={COLORS.textMuted} />
+        </View>
+      </>
+    );
+  }
+
+  if (error || !route) {
+    return (
+      <>
+        <Stack.Screen options={{ title: t('walking.title') }} />
+        <View style={styles.state}>
+          <Text style={styles.errorText}>{error || t('common.error')}</Text>
+        </View>
+      </>
+    );
+  }
+
+  if (permissionGranted === false && mode !== 'indoor') {
+    return (
+      <>
+        <Stack.Screen options={{ title: t('walking.title') }} />
+        <View style={styles.state}>
+          <Text style={styles.errorText}>{t('walking.permissionNeeded')}</Text>
+        </View>
+      </>
+    );
+  }
+
+  const markers = [
+    {
+      lat: route.geometry[0].lat,
+      lon: route.geometry[0].lon,
+      title: route.from_name,
+    },
+    {
+      lat: route.geometry[route.geometry.length - 1].lat,
+      lon: route.geometry[route.geometry.length - 1].lon,
+      title: route.to_name,
+    },
+  ];
+
+  const showApproachPhoto = approachPhoto && !photoDismissed;
+
+  return (
+    <>
+      <Stack.Screen
+        options={{
+          title: t('walking.title'),
+          headerBackVisible: false,
+          headerRight: () => (
+            <View style={styles.headerButtons}>
+              <TouchableOpacity
+                onPress={handleRecalculate}
+                style={styles.headerButton}
+                accessibilityRole="button"
+                accessibilityLabel="Recalculate route"
+                disabled={mode === 'indoor'}
+              >
+                <MaterialIcons
+                  name="my-location"
+                  size={22}
+                  color={mode === 'indoor' ? COLORS.headerTextFaint : COLORS.headerText}
+                />
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={openChat}
+                style={styles.headerButton}
+                accessibilityRole="button"
+                accessibilityLabel={t('chat.titleWalk')}
+              >
+                <MaterialIcons name={ICONS.chat} size={22} color={COLORS.headerText} />
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setReportOpen(true)}
+                style={styles.headerButton}
+                accessibilityRole="button"
+                accessibilityLabel={t('report.reportProblem')}
+              >
+                <MaterialIcons
+                  name={ICONS.report}
+                  size={22}
+                  color={COLORS.headerText}
+                />
+              </TouchableOpacity>
+            </View>
+          ),
+        }}
+      />
+      <View style={styles.container}>
+        {offRoute && !bannerDismissed && mode === 'outdoor' ? (
+          <OffRouteBanner
+            onRecalculate={handleRecalculate}
+            onDismiss={() => setBannerDismissed(true)}
+          />
+        ) : null}
+
+        {wifiSpot && mode === 'outdoor' ? (
+          <WifiBanner spot={wifiSpot} onDismiss={dismissWifi} />
+        ) : null}
+
+        <View style={styles.mapWrapper}>
+          <RouteMap
+            geometry={route.geometry}
+            markers={markers}
+            userLocation={position}
+            accuracyM={accuracyM}
+            bearing={heading}
+            followBearing={true}
+            mode={mode}
+            destinationName={route.to_name}
+            indoorBuildingName={indoorBuildingName}
+            indoorLevel={indoorLevel}
+            indoorGeometry={indoorGeometry}
+            indoorGeometryByLevel={indoorGeometryByLevel}
+            indoorDestination={indoorDestination}
+            currentStepPoint={currentStepGeometryPoint}
+            nextStepPoint={nextStepGeometryPoint}
+            currentStepLevel={indoorLevel}
+            style={styles.map}
+          />
+        </View>
+
+        {showApproachPhoto ? (
+          <ApproachPhoto
+            photo={approachPhoto}
+            destinationName={route.to_name}
+            onDismiss={() => setPhotoDismissed(true)}
+          />
+        ) : null}
+
+        <View style={styles.cardWrapper}>
+          <InstructionCard
+            step={currentStep}
+            distanceToNextStepM={distanceToNextStepM}
+            distanceRemainingM={distanceRemainingM}
+            progress={progress}
+            heading={heading}
+            bearing={bearing}
+            gpsStale={gpsStale}
+            mode={mode}
+            onAdvanceStep={handleAdvanceStep}
+            onPreviousStep={previousStep}
+            canGoBack={canGoBack}
+            isLastStep={isLastStep}
+          />
+        </View>
+      </View>
+
+      <ReportSheet
+        visible={reportOpen}
+        onClose={() => setReportOpen(false)}
+        placeId={destinationId ? Number(destinationId) : null}
+      />
+    </>
+  );
+}
+
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const phi1 = (lat1 * Math.PI) / 180;
+  const phi2 = (lat2 * Math.PI) / 180;
+  const dphi = ((lat2 - lat1) * Math.PI) / 180;
+  const dlambda = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dphi / 2) ** 2 +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: COLORS.background },
+  state: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.backgroundSubtle,
+  },
+  errorText: {
+    color: COLORS.danger,
+    fontSize: 15,
+    textAlign: 'center',
+    padding: 24,
+    lineHeight: 22,
+  },
+  mapWrapper: { flex: 1 },
+  map: { flex: 1 },
+  cardWrapper: { backgroundColor: COLORS.background },
+  headerButtons: { flexDirection: 'row' },
+  headerButton: {
+    padding: 8,
+    minWidth: TOUCH.minWidth,
+    minHeight: TOUCH.minHeight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+});
+
+--- FILE: mobile/components/IndoorMapView.jsx ---
+
+// IndoorMapView — draws the indoor floor plan.
+//
+// When the walking screen's current step is indoor, this component
+// replaces the outdoor tile map. It:
+//   1. Fetches the rooms and corridors for the current building+level
+//      from /api/indoor/areas (through the persistent cache).
+//   2. Renders them on a blank MapLibre map: rooms white, corridors
+//      light grey, room names as labels.
+//   3. Draws the indoor route: solid on the current floor, faint
+//      dashed on other floors.
+//   4. Marks the destination with a red dot.
+//   5. Shows a "you are here" dot on the current step's point, when
+//      the displayed floor matches the current step's floor.
+//   6. Shows a floor switcher on the right edge if the settings
+//      toggle is on, or always when `forceSwitcher` is true.
+//
+// The camera auto-fits to the room bounds on first render.
+//
+// Changes in this version:
+//   - The map is no longer unmounted while a new floor loads. The
+//     loading spinner is shown as an overlay on top of the existing
+//     map, so the Camera keeps its state.
+//   - The fit runs once per (building, level) via a ref, so re-renders
+//     and step advances don't override the student's zoom or pan.
+//   - The fit formula uses the container's real pixel size and a
+//     metres-per-pixel diagonal.
+//   - Heading is computed differently for the two modes:
+//       • Walking screen (lockHeading = false): the heading is the
+//         direction of the road the student is about to walk,
+//         rounded to a multiple of INDOOR_HEADING_SNAP_DEG (90, 45,
+//         22.5, or 0 for the exact angle). Updates on a Next press,
+//         not continuously.
+//       • Preview (lockHeading = true): the heading is the start-to-
+//         end bearing of the whole route, snapped to N or S only.
+//         Unchanged from the previous version.
+//   - `lockHeading` prop: used by the route preview. When true, the
+//     heading is computed from the whole route, so tapping a floor
+//     chip doesn't rotate the map.
+//   - forceSwitcher prop: when true, the floor switcher is shown
+//     regardless of the settings toggle.
+//   - onNoRooms is called in the catch branch too, so a network error
+//     on the floor-plan fetch falls back to the outdoor map.
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import {
+  MapView,
+  Camera,
+  ShapeSource,
+  FillLayer,
+  LineLayer,
+  SymbolLayer,
+  CircleLayer,
+} from '@maplibre/maplibre-react-native';
+
+import { getIndoorAreas } from '@/services/api';
+import { useSettings } from '@/context/SettingsContext';
+import { bearingDeg, haversineM } from '@/utils/geo';
+import { t } from '@/i18n';
+import { COLORS, RADIUS, SPACING } from '@/constants/theme';
+import { polygonLabelInfo } from '@/utils/polygonLabel';
+import { labelMinZoom } from '@/utils/labelFit';
+import { headingAlongRoute } from '@/utils/legBearing';
+import { headingLabel } from '@/utils/headingLabel';
+import {
+  INDOOR_BACKGROUND_COLOR,
+  INDOOR_INTERIOR_COLOR,
+  INDOOR_BUILDING_OUTLINE_COLOR,
+  INDOOR_BUILDING_OUTLINE_WIDTH,
+  INDOOR_STAIRS_COLOR,
+  INDOOR_STAIRS_OUTLINE_COLOR,
+  INDOOR_CORRIDOR_COLOR,
+  INDOOR_CORRIDOR_OUTLINE_COLOR,
+  INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_OUTLINE_COLOR,
+  INDOOR_ROOM_OUTLINE_WIDTH,
+  INDOOR_HEADING_SNAP_DEG,
+  INDOOR_LABEL_MIN_SIZE,
+  INDOOR_LABEL_MAX_SIZE,
+  INDOOR_LABEL_FULL_SIZE_ZOOM,
+  INDOOR_LABEL_WRAP_EM,
+  INDOOR_LABEL_FIT,
+  INDOOR_CURRENT_LEG_COLOR,
+  INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+  INDOOR_CURRENT_LEG_WIDTH,
+  INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+  INDOOR_LEG_END_DOT_RADIUS,
+  INDOOR_LEG_END_DOT_BORDER_WIDTH,
+  INDOOR_ROUTE_FADED_OPACITY,
+} from '@/constants/config';
+
+const BLANK_STYLE = JSON.stringify({
+  version: 8,
+  name: 'indoor-blank',
+  glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+  sources: {},
+  layers: [
+    {
+      id: 'background',
+      type: 'background',
+      paint: { 'background-color': INDOOR_BACKGROUND_COLOR },
+    },
+  ],
+});
+
+const FILL_COLOR_EXPR = [
+  'match',
+  ['get', 'type'],
+  'corridor', INDOOR_CORRIDOR_COLOR,
+  'room', INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_COLOR,
+];
+
+// A bearing needs at least this much movement to be meaningful.
+// Below it, GPS noise would dominate, so we fall back to 0.
+const MIN_HEADING_DISTANCE_M = 3;
+
+// Walking screen: the map turns so the corridor you are about to walk
+// points up the screen, but only in steps of INDOOR_HEADING_SNAP_DEG, so a
+// small bend in a corridor does not keep turning the map.
+//   90   -> N, E, S, W only (the original behaviour)
+//   45   -> also NE, SE, SW, NW (default)
+//   22.5 -> 16 directions, for buildings that sit at odd angles
+//   0    -> no snapping: the exact direction of the corridor
+// Set it in constants/config.js.
+
+function levelLabel(level) {
+  if (level === '-1') return 'B';
+  if (level === '0') return 'G';
+  return level;
+}
+
+// Snap a bearing to the nearest axis when it is close to one.
+//
+// A corridor surveyed at 86° or 93° is, on the ground, a corridor running
+// due east-west. Showing 86° tilts the whole floor plan for no reason. So a
+// bearing within AXIS_SNAP_TOLERANCE_DEG of a multiple of 90 is shown as
+// that multiple; a bearing further from an axis (a genuinely diagonal
+// corridor) is shown exactly as it is, so a real wrong angle still shows.
+const AXIS_SNAP_TOLERANCE_DEG = 15;
+
+function snapToCardinal(bearing) {
+  if (bearing == null || !Number.isFinite(bearing)) return 0;
+  const h = ((bearing % 360) + 360) % 360;
+  const nearest = (Math.round(h / 90) * 90) % 360;
+  const diff = Math.abs(((h - nearest + 540) % 360) - 180);
+  const off = Math.abs(180 - diff);
+  return off <= AXIS_SNAP_TOLERANCE_DEG ? nearest : h;
+}
+
+// Snap a bearing to N or S only. Used by the preview.
+function snapToNorthSouth(bearing) {
+  if (bearing == null || !Number.isFinite(bearing)) return 0;
+  const h = ((bearing % 360) + 360) % 360;
+  return Math.cos((h * Math.PI) / 180) >= 0 ? 0 : 180;
+}
+
+// Which compass letter is at the top of the screen for a given
+// heading.
+function firstLegBearing(points) {
+  /**
+   * Given a list of { lat, lon }, return the bearing from the first
+   * point to the first point at least MIN_HEADING_DISTANCE_M away.
+   * Returns 0 if no such point exists.
+   */
+  if (!points || points.length < 2) return null;
+  const from = points[0];
+  for (let i = 1; i < points.length; i++) {
+    const to = points[i];
+    if (
+      haversineM(from.lat, from.lon, to.lat, to.lon) >=
+      MIN_HEADING_DISTANCE_M
+    ) {
+      return bearingDeg(from.lat, from.lon, to.lat, to.lon);
+    }
+  }
+  return null;
+}
+
+// ---- Room names --------------------------------------------------------
+// A name is shown only from the zoom at which it fits inside its room, so a
+// long name never spills over the neighbouring rooms. Names are a little
+// smaller when zoomed out. All of this is set in constants/config.js; the
+// numbers after ?? are used if a setting is missing there.
+const LABEL_MIN_SIZE = INDOOR_LABEL_MIN_SIZE ?? 8;
+const LABEL_MAX_SIZE = INDOOR_LABEL_MAX_SIZE ?? 11;
+const LABEL_FULL_SIZE_ZOOM = INDOOR_LABEL_FULL_SIZE_ZOOM ?? 19;
+const LABEL_WRAP_EM = INDOOR_LABEL_WRAP_EM ?? 7;
+const LABEL_FIT = INDOOR_LABEL_FIT ?? 1.3;
+const LABEL_START_ZOOM = 16; // at or below this zoom, names use the minimum size
+const LABEL_BAND_STEP = 0.5; // names appear in half-zoom steps
+const LABEL_FROM_ZOOM = 15; // below this zoom no names are shown
+const LABEL_TO_ZOOM = 22;
+const LABEL_BANDS = [];
+for (let z = LABEL_FROM_ZOOM; z <= LABEL_TO_ZOOM; z += LABEL_BAND_STEP) {
+  LABEL_BANDS.push(z);
+}
+
+export function IndoorMapView({
+  buildingName,
+  level,
+  routeByLevel = [],
+  destination = null,
+  currentStepPoint = null,
+  nextStepPoint = null,
+  currentStepLevel = null,
+  style,
+  onNoRooms,
+  forceSwitcher = false,
+  lockHeading = false,
+}) {
+  const { settings } = useSettings();
+  const cameraRef = useRef(null);
+
+  const [selectedLevel, setSelectedLevel] = useState(level);
+
+  const [areas, setAreas] = useState(null);
+  const [availableLevels, setAvailableLevels] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // Container size, measured from onLayout, used for the fit maths.
+  const [containerSize, setContainerSize] = useState({ width: 360, height: 480 });
+
+  // Tracks which (building, level) the camera has already been fitted
+  // to. Once a floor has been fitted, we never re-fit it, so the
+  // student's zoom and pan are preserved across re-renders and step
+  // advances.
+  const fittedKeyRef = useRef(null);
+
+  // The zoom the student chose by pinching. Null until they zoom. While it
+  // is set, floor changes and Next presses keep this zoom instead of
+  // snapping back to the default fit.
+  const userZoomRef = useRef(null);
+  // The zoom currently in use in this building (the fit zoom, or the zoom
+  // the student pinched to). A new floor reuses it instead of re-fitting,
+  // so the zoom stays the same when you change floor.
+  const keptZoomRef = useRef(null);
+  const restoringZoomRef = useRef(false);
+  // Last heading we could compute, reused when no direction is available
+  // (e.g. on the final step), so the map doesn't swing back to north.
+  const lastHeadingRef = useRef(0);
+
+  // 180-degree flip. Off by default: the map is route-up (the walking
+  // direction is at the top of the screen). The corner button toggles
+  // this, which turns the map exactly half a turn.
+  const [flipped, setFlipped] = useState(false);
+
+  // When the building changes, reset the selected level to whatever
+  // the current step says, clear the fitted key so the new building's
+  // floors get fitted, and reset the flip.
+  useEffect(() => {
+    setSelectedLevel(level);
+    fittedKeyRef.current = null;
+    userZoomRef.current = null;
+    keptZoomRef.current = null;
+    setFlipped(false);
+  }, [buildingName]);
+
+  // Follow the current step's level unless the student manually
+  // switched.
+  const [manuallyChosen, setManuallyChosen] = useState(false);
+  useEffect(() => {
+    if (!manuallyChosen) {
+      setSelectedLevel(level);
+    }
+  }, [level, manuallyChosen]);
+  useEffect(() => {
+    setManuallyChosen(false);
+  }, [buildingName]);
+
+  // Fetch rooms and corridors for the selected level.
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!buildingName || selectedLevel == null) {
+      setAreas([]);
+      setLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setLoading(true);
+    setError(null);
+
+    getIndoorAreas({ buildingName, level: selectedLevel })
+      .then((data) => {
+        if (cancelled) return;
+        const list = data?.areas || [];
+        setAreas(list);
+        setAvailableLevels(data?.levels || []);
+        if (list.filter((a) => a.type !== 'level').length === 0 && onNoRooms) onNoRooms();
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err.message || 'Could not load floor plan.');
+        setAreas([]);
+        if (onNoRooms) onNoRooms();
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buildingName, selectedLevel]);
+
+  // -------------------------------------------------------------------------
+  // GeoJSON assembly
+  // -------------------------------------------------------------------------
+
+  const roomsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // One point per room, at the room's visual centre, carrying its name and
+  // the zoom from which that name fits inside the room (minZoom). Labels come
+  // from these points instead of from the room polygons, so every name sits
+  // in the middle of its room (see utils/polygonLabel.js and utils/labelFit.js).
+  const roomLabelsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      const info = polygonLabelInfo(ring);
+      if (!info) continue;
+      const minZoom = labelMinZoom(area.name, info.radiusM, {
+        latDeg: info.point[1],
+        minSize: LABEL_MIN_SIZE,
+        maxSize: LABEL_MAX_SIZE,
+        fullSizeZoom: LABEL_FULL_SIZE_ZOOM,
+        startZoom: LABEL_START_ZOOM,
+        wrapEm: LABEL_WRAP_EM,
+        fit: LABEL_FIT,
+        bandStep: LABEL_BAND_STEP,
+        fromZoom: LABEL_FROM_ZOOM,
+        toZoom: LABEL_TO_ZOOM,
+      });
+      if (minZoom === null) continue; // too small to ever hold its name
+      features.push({
+        type: 'Feature',
+        properties: { name: area.name || '', minZoom },
+        geometry: { type: 'Point', coordinates: info.point },
+      });
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  const corridorsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'corridor') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Stairs: polygons tagged indoor=stairs. Drawn in their own colour.
+  const stairsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'stairs') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Floor outline: polygons tagged indoor=level (one closed way around the
+  // building on each floor). Filled with the interior colour and outlined.
+  const footprintGeoJSON = useMemo(() => {
+    if (!areas) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'level') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'Polygon', coordinates: [ring] },
+      });
+    }
+    return features.length > 0
+      ? { type: 'FeatureCollection', features }
+      : null;
+  }, [areas]);
+
+  const { routeSolidGeoJSON, routeDashedGeoJSON } = useMemo(() => {
+    if (!routeByLevel || routeByLevel.length === 0) {
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+    if (routeByLevel.length === 1) {
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+
+    const segments = [];
+    let current = null;
+
+    for (const pt of routeByLevel) {
+      const matches = pt.level === selectedLevel;
+      if (!current || current.matches !== matches) {
+        if (current && current.points.length >= 2) segments.push(current);
+        current = { matches, points: [[pt.lon, pt.lat]] };
+      } else {
+        current.points.push([pt.lon, pt.lat]);
+      }
+    }
+    if (current && current.points.length >= 2) segments.push(current);
+
+    const solid = [];
+    const dashed = [];
+    for (const seg of segments) {
+      const feature = {
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: seg.points },
+      };
+      if (seg.matches) solid.push(feature);
+      else dashed.push(feature);
+    }
+
+    return {
+      routeSolidGeoJSON:
+        solid.length > 0 ? { type: 'FeatureCollection', features: solid } : null,
+      routeDashedGeoJSON:
+        dashed.length > 0 ? { type: 'FeatureCollection', features: dashed } : null,
+    };
+  }, [routeByLevel, selectedLevel]);
+
+  // The part of the route the student must walk during the current step:
+  // from the current step's point to the next step's point, on this floor only.
+  const currentLegGeoJSON = useMemo(() => {
+    if (!currentStepPoint || !nextStepPoint || !routeByLevel?.length) return null;
+    const same = (p, q) => p.lat === q.lat && p.lon === q.lon;
+
+    const startIdx = routeByLevel.findIndex((p) => same(p, currentStepPoint));
+    if (startIdx < 0) return null;
+    let endIdx = -1;
+    for (let i = startIdx + 1; i < routeByLevel.length; i++) {
+      if (same(routeByLevel[i], nextStepPoint)) { endIdx = i; break; }
+    }
+    if (endIdx < 0) return null;
+
+    const runs = [];
+    let cur = [];
+    for (let i = startIdx; i <= endIdx; i++) {
+      const p = routeByLevel[i];
+      if (p.level === selectedLevel) {
+        cur.push([p.lon, p.lat]);
+      } else {
+        if (cur.length >= 2) runs.push(cur);
+        cur = [];
+      }
+    }
+    if (cur.length >= 2) runs.push(cur);
+    if (runs.length === 0) return null;
+
+    return {
+      type: 'FeatureCollection',
+      features: runs.map((coordinates) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates },
+      })),
+    };
+  }, [routeByLevel, currentStepPoint, nextStepPoint, selectedLevel]);
+
+  // -------------------------------------------------------------------------
+  // Route-up heading
+  // -------------------------------------------------------------------------
+  //
+  // Two distinct behaviours, selected by `lockHeading`.
+  //
+  // Walking screen (lockHeading = false):
+  //   The heading is the direction of the road the student is about to
+  //   walk (see utils/legBearing.js), taken from `currentStepPoint`
+  //   forward, rounded to the nearest multiple of INDOOR_HEADING_SNAP_DEG
+  //   (90 = N/E/S/W, 45 = 8 directions, 22.5 = 16, 0 = exact angle,
+  //   no rounding). The heading updates
+  //   when `currentStepPoint` changes — i.e. when the student presses
+  //   Next. Between presses, the map holds still.
+  //
+  // Preview (lockHeading = true):
+  //   The heading is the start-to-end bearing of the whole route,
+  //   SNAPPED to N or S only. Tapping a floor chip does not rotate
+  //   the preview. This matches the previous version's behaviour.
+  const routeHeadingRaw = useMemo(() => {
+    const all = routeByLevel || [];
+    if (all.length < 2) return 0;
+
+    if (lockHeading) {
+      // Preview: overall direction of the trip, snapped to N or S.
+      const first = all[0];
+      const last = all[all.length - 1];
+      let raw;
+      if (
+        haversineM(first.lat, first.lon, last.lat, last.lon) >=
+        MIN_HEADING_DISTANCE_M
+      ) {
+        raw = bearingDeg(first.lat, first.lon, last.lat, last.lon);
+      } else {
+        raw = firstLegBearing(all);
+      }
+      return snapToNorthSouth(raw ?? 0);
+    }
+
+    // Walking: look at the points on the current floor from
+    // `currentStepPoint` forward, take the first real leg's bearing,
+    // then snap to the nearest cardinal.
+    let points = all.filter((p) => p.level === selectedLevel);
+    if (points.length < 2) {
+      points = all;
+    }
+
+    let startIdx = 0;
+    if (currentStepPoint) {
+      const idx = points.findIndex(
+        (p) =>
+          p.lat === currentStepPoint.lat && p.lon === currentStepPoint.lon
+      );
+      if (idx >= 0) startIdx = idx;
+    }
+
+    const slice = points.slice(startIdx);
+
+    // The very first step starts in a room. There the path begins with a
+    // short stub into the corridor, which must not decide the direction.
+    const isRouteStart = startIdx === 0;
+
+    // The direction of the road ahead (see utils/legBearing.js): along the
+    // corridor at the start, along the path until it turns on the way, and
+    // towards the destination door on the last turn.
+    const raw = headingAlongRoute(slice, { isRouteStart });
+    // No usable direction (last step, or the leg is under 3 m): keep the
+    // previous heading instead of swinging to north.
+    console.log('HEADING', { isRouteStart, startIdx, n: slice.length, first4: slice.slice(0, 4), raw });
+    return raw == null ? null : snapToCardinal(raw);
+  }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
+
+  if (routeHeadingRaw != null) lastHeadingRef.current = routeHeadingRaw;
+  const routeHeading = routeHeadingRaw ?? lastHeadingRef.current;
+
+  // The heading actually applied to the camera: the route-up heading,
+  // plus a half turn when the student has pressed the flip button.
+  const effectiveHeading = (routeHeading + (flipped ? 180 : 0)) % 360;
+
+  // -------------------------------------------------------------------------
+  // Camera fit — once per (building, level)
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    if (loading) return;
+    if (!areas || areas.length === 0) return;
+
+    const key = `${buildingName}|${selectedLevel}`;
+    if (fittedKeyRef.current === key) return;
+
+    const points = [];
+    for (const area of areas) {
+      for (const p of area.boundary || []) {
+        points.push([p.lon, p.lat]);
+      }
+    }
+    if (points.length === 0) return;
+
+    const lons = points.map((p) => p[0]);
+    const lats = points.map((p) => p[1]);
+    const west = Math.min(...lons);
+    const east = Math.max(...lons);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+
+    const centerLon = (west + east) / 2;
+    const centerLat = (south + north) / 2;
+
+    // Diagonal in metres at the building's latitude.
+    const refLat = centerLat;
+    const cosLat = Math.cos((refLat * Math.PI) / 180);
+    const widthM = Math.abs(east - west) * 111320 * cosLat;
+    const heightM = Math.abs(north - south) * 110540;
+    const diagM = Math.hypot(widthM, heightM);
+
+    // Metres per pixel, using the smaller container dimension and a
+    // 0.9 factor so the building doesn't touch the edges.
+    const minDim = Math.min(containerSize.width, containerSize.height);
+    const mPerPx = diagM / Math.max(minDim * 0.9, 1);
+
+    // Web Mercator: metres-per-pixel at zoom z is
+    //   (78271.5 * cosLat) / 2^z.
+    const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
+
+    const fitZoom = Math.max(16, Math.min(21, zoom));
+    // If the student has zoomed in, keep their zoom on the new floor and
+    // centre on where they are, rather than on the whole building.
+    const keepUserZoom = userZoomRef.current != null;
+    const clamped = keptZoomRef.current != null ? keptZoomRef.current : fitZoom;
+    const stepHere =
+      keepUserZoom && currentStepPoint && currentStepLevel === selectedLevel;
+    const camCenter = stepHere
+      ? [currentStepPoint.lon, currentStepPoint.lat]
+      : [centerLon, centerLat];
+
+    const timeout = setTimeout(() => {
+      // Mark as fitted only once we actually issue the camera call.
+      fittedKeyRef.current = key;
+      keptZoomRef.current = clamped;
+      try {
+        cameraRef.current?.setCamera({
+          centerCoordinate: camCenter,
+          zoomLevel: clamped,
+          heading: effectiveHeading,
+          animationDuration: 400,
+        });
+      } catch {
+        // Silent.
+      }
+    }, 100);
+
+    return () => clearTimeout(timeout);
+    // effectiveHeading intentionally excluded: the fit is a one-shot
+    // per floor; heading changes are handled by the separate effect
+    // below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [areas, loading, buildingName, selectedLevel, containerSize]);
+
+  // -------------------------------------------------------------------------
+  // Heading effect — turns the map when the route direction changes
+  // -------------------------------------------------------------------------
+  //
+  // Runs whenever `effectiveHeading` changes. That happens on a Next
+  // press in walking mode (currentStepPoint moves → routeHeading
+  // recomputes → snapped heading may change), and on a flip button
+  // press. It only sets the heading, leaving centre and zoom alone.
+  //
+  // It also runs on every Next press. If the student has zoomed, their zoom
+  // is sent in the same camera call as the heading, so a turn can never
+  // bring back the default zoom.
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    const cam = { heading: effectiveHeading, animationDuration: 500 };
+    if (userZoomRef.current != null) cam.zoomLevel = userZoomRef.current;
+    try {
+      cameraRef.current.setCamera(cam);
+    } catch {
+      // Silent.
+    }
+  }, [effectiveHeading, currentStepPoint?.lat, currentStepPoint?.lon]);
+
+  // Remember pinch-zooms. If the zoom changes by itself (not the student)
+  // while they have a zoom set, put it back.
+  const handleRegionDidChange = (feature) => {
+    const props = feature?.properties;
+    if (!props || typeof props.zoomLevel !== 'number') return;
+    if (props.isUserInteraction) {
+      userZoomRef.current = props.zoomLevel;
+      keptZoomRef.current = props.zoomLevel;
+      return;
+    }
+    const wanted = userZoomRef.current;
+    if (
+      wanted != null &&
+      !restoringZoomRef.current &&
+      Math.abs(props.zoomLevel - wanted) > 0.25
+    ) {
+      restoringZoomRef.current = true;
+      try {
+        cameraRef.current?.setCamera({
+          zoomLevel: wanted,
+          animationDuration: 250,
+        });
+      } catch {
+        // Silent.
+      }
+      setTimeout(() => {
+        restoringZoomRef.current = false;
+      }, 400);
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Render
+  // -------------------------------------------------------------------------
+
+  // First load only: nothing to show yet, so the spinner is fine and
+  // there's no camera state to preserve.
+  if (loading && !areas) {
+    return (
+      <View
+        style={[styles.container, style]}
+        onLayout={(e) => setContainerSize(e.nativeEvent.layout)}
+      >
+        <ActivityIndicator color={COLORS.primaryDark} />
+      </View>
+    );
+  }
+
+  if (error && (!areas || areas.length === 0)) {
+    return <View style={[styles.container, style]} />;
+  }
+
+  if (!areas || areas.length === 0) {
+    return <View style={[styles.container, style]} />;
+  }
+
+  const firstCentroid =
+    areas[0]?.centroid || areas[0]?.boundary?.[0] || null;
+  const initialCenter = firstCentroid
+    ? [firstCentroid.lon, firstCentroid.lat]
+    : [0, 0];
+
+  const showYouAreHere =
+    currentStepPoint && currentStepLevel === selectedLevel;
+
+  const showSwitcher =
+    (forceSwitcher || settings.showFloorSwitcher !== false) &&
+    availableLevels.length > 1;
+
+  return (
+    <View
+      style={[styles.container, style]}
+      onLayout={(e) => setContainerSize(e.nativeEvent.layout)}
+    >
+      <MapView
+        style={styles.map}
+        mapStyle={BLANK_STYLE}
+        logoEnabled={false}
+        attributionEnabled={false}
+        compassEnabled={false}
+        rotateEnabled={false}
+        onRegionDidChange={handleRegionDidChange}
+      >
+        <Camera
+          ref={cameraRef}
+          defaultSettings={{
+            centerCoordinate: initialCenter,
+            zoomLevel: 18,
+            heading: effectiveHeading,
+          }}
+        />
+
+        {footprintGeoJSON ? (
+          <ShapeSource id="footprintSource" shape={footprintGeoJSON}>
+            <FillLayer
+              id="footprintFill"
+              style={{ fillColor: INDOOR_INTERIOR_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="footprintOutline"
+              style={{
+                lineColor: INDOOR_BUILDING_OUTLINE_COLOR,
+                lineWidth: INDOOR_BUILDING_OUTLINE_WIDTH,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
+            <FillLayer
+              id="corridorsFill"
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="corridorsOutline"
+              style={{
+                lineColor: INDOOR_CORRIDOR_OUTLINE_COLOR,
+                lineWidth: 0.75,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {stairsGeoJSON && stairsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="stairsSource" shape={stairsGeoJSON}>
+            <FillLayer
+              id="stairsFill"
+              style={{ fillColor: INDOOR_STAIRS_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="stairsOutline"
+              style={{
+                lineColor: INDOOR_STAIRS_OUTLINE_COLOR,
+                lineWidth: 1.25,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {roomsGeoJSON && roomsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="roomsSource" shape={roomsGeoJSON}>
+            <FillLayer
+              id="roomsFill"
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="roomsOutline"
+              style={{
+                lineColor: INDOOR_ROOM_OUTLINE_COLOR,
+                lineWidth: INDOOR_ROOM_OUTLINE_WIDTH,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {roomLabelsGeoJSON && roomLabelsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="roomLabelsSource" shape={roomLabelsGeoJSON}>
+            {/* One layer per half-zoom step. Each shows only the names that
+                already fit at that zoom, so a hidden name never blocks a
+                visible one and no name is wider than its room. */}
+            {LABEL_BANDS.map((band, index) => (
+              <SymbolLayer
+                key={`roomsLabels-${band}`}
+                id={`roomsLabels-${band}`}
+                minZoomLevel={band}
+                maxZoomLevel={
+                  index === LABEL_BANDS.length - 1 ? 24 : band + LABEL_BAND_STEP
+                }
+                filter={['<=', ['get', 'minZoom'], band]}
+                style={{
+                  textField: ['get', 'name'],
+                  textFont: ['Noto Sans Regular'],
+                  textSize: [
+                    'interpolate',
+                    ['linear'],
+                    ['zoom'],
+                    LABEL_START_ZOOM,
+                    LABEL_MIN_SIZE,
+                    LABEL_FULL_SIZE_ZOOM,
+                    LABEL_MAX_SIZE,
+                  ],
+                  textMaxWidth: LABEL_WRAP_EM,
+                  textColor: '#334155',
+                  textHaloColor: '#ffffff',
+                  textHaloWidth: 1.5,
+                  textAllowOverlap: false,
+                  textIgnorePlacement: false,
+                  // Centred on the point and always upright, whichever way
+                  // the map is turned.
+                  textAnchor: 'center',
+                  textJustify: 'center',
+                  textRotate: 0,
+                  textRotationAlignment: 'viewport',
+                  textPitchAlignment: 'viewport',
+                }}
+              />
+            ))}
+          </ShapeSource>
+        ) : null}
+
+        {routeDashedGeoJSON ? (
+          <ShapeSource id="indoorRouteDashedSource" shape={routeDashedGeoJSON}>
+            <LineLayer
+              id="indoorRouteDashedLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 3,
+                lineCap: 'round',
+                lineJoin: 'round',
+                lineOpacity: 0.4,
+                lineDasharray: [4, 4],
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {routeSolidGeoJSON ? (
+          <ShapeSource id="indoorRouteSolidSource" shape={routeSolidGeoJSON}>
+            <LineLayer
+              id="indoorRouteSolidLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 4,
+                lineCap: 'round',
+                lineJoin: 'round',
+                lineOpacity: currentLegGeoJSON ? INDOOR_ROUTE_FADED_OPACITY : 1,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON ? (
+          <ShapeSource id="indoorCurrentLegSource" shape={currentLegGeoJSON}>
+            <LineLayer
+              id="indoorCurrentLegCasing"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+            <LineLayer
+              id="indoorCurrentLegLine"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON && nextStepPoint ? (
+          <ShapeSource id="indoorNextStepSource" shape={pointFeature(nextStepPoint)}>
+            <CircleLayer
+              id="indoorNextStepDot"
+              style={{
+                circleRadius: INDOOR_LEG_END_DOT_RADIUS,
+                circleColor: '#ffffff',
+                circleStrokeColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                circleStrokeWidth: INDOOR_LEG_END_DOT_BORDER_WIDTH,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {destination ? (
+          <ShapeSource id="indoorDestSource" shape={pointFeature(destination)}>
+            <CircleLayer
+              id="indoorDestHalo"
+              style={{ circleRadius: 11, circleColor: '#dc2626', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorDestDot"
+              style={{
+                circleRadius: 6,
+                circleColor: '#dc2626',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 2,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {showYouAreHere ? (
+          <ShapeSource id="indoorUserSource" shape={pointFeature(currentStepPoint)}>
+            <CircleLayer
+              id="indoorUserHalo"
+              style={{ circleRadius: 14, circleColor: '#2563eb', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorUserDot"
+              style={{
+                circleRadius: 8,
+                circleColor: '#2563eb',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 3,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+      </MapView>
+
+      {/* Spinner overlay for floor changes after the first load. */}
+      {loading && areas && areas.length > 0 ? (
+        <View style={styles.loadingOverlay} pointerEvents="none">
+          <ActivityIndicator color={COLORS.primaryDark} />
+        </View>
+      ) : null}
+
+      {/* Flip button, top-right corner. Shows the compass letter that is
+          at the top of the screen right now. Each press turns the map
+          exactly 180 degrees. */}
+      <TouchableOpacity
+        style={styles.northButton}
+        onPress={() => setFlipped((v) => !v)}
+        accessibilityRole="button"
+        accessibilityLabel={`Map top is ${headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG)}. Turn the map around`}
+      >
+        <Text
+          style={styles.northButtonText}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={0.6}
+        >
+          {headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG)}
+        </Text>
+      </TouchableOpacity>
+
+      {showSwitcher ? (
+        <View style={styles.switcherContainer}>
+          {availableLevels.map((lvl) => {
+            const active = lvl === selectedLevel;
+            const isStepLevel = lvl === currentStepLevel;
+            return (
+              <TouchableOpacity
+                key={lvl}
+                style={[
+                  styles.switcherChip,
+                  active && styles.switcherChipActive,
+                ]}
+                onPress={() => {
+                  setSelectedLevel(lvl);
+                  setManuallyChosen(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel={`Floor ${levelLabel(lvl)}`}
+                accessibilityState={{ selected: active }}
+              >
+                <Text
+                  style={[
+                    styles.switcherChipText,
+                    active && styles.switcherChipTextActive,
+                  ]}
+                >
+                  {levelLabel(lvl)}
+                </Text>
+                {isStepLevel && !active ? (
+                  <View style={styles.stepLevelDot} />
+                ) : null}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function pointFeature(p) {
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
+  };
+}
+
+function _closedRing(boundary) {
+  if (!boundary || boundary.length === 0) return null;
+  const ring = boundary.map((p) => [p.lon, p.lat]);
+  const first = ring[0];
+  const last = ring[ring.length - 1];
+  if (first[0] !== last[0] || first[1] !== last[1]) {
+    ring.push([first[0], first[1]]);
+  }
+  return ring;
+}
+
+function _polygonFeature(area, ring) {
+  return {
+    type: 'Feature',
+    properties: {
+      id: area.id,
+      name: area.name || '',
+      ref: area.ref || '',
+      type: area.type,
+      level: area.level,
+    },
+    geometry: {
+      type: 'Polygon',
+      coordinates: [ring],
+    },
+  };
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: INDOOR_BACKGROUND_COLOR,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  map: {
+    flex: 1,
+    width: '100%',
+  },
+  loadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(241, 245, 249, 0.35)',
+  },
+  northButton: {
+    position: 'absolute',
+    top: SPACING.md,
+    right: SPACING.md,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  northButtonText: {
+    // 16 fits "N" or "NE"; longer labels ("NNE", "137°") shrink to fit.
+    fontSize: 15,
+    paddingHorizontal: 2,
+    fontWeight: '700',
+    color: COLORS.primaryDark,
+  },
+  destMarkerOuter: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: 'rgba(220, 38, 38, 0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  destMarkerInner: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#dc2626',
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
+  userDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#2563eb',
+    borderWidth: 3,
+    borderColor: '#ffffff',
+  },
+  switcherContainer: {
+    position: 'absolute',
+    right: SPACING.md,
+    top: '40%',
+    backgroundColor: 'rgba(255, 255, 255, 0.85)',
+    borderRadius: RADIUS.md,
+    paddingVertical: SPACING.xs,
+    paddingHorizontal: 4,
+  },
+  switcherChip: {
+    width: 40,
+    height: 40,
+    borderRadius: RADIUS.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  switcherChipActive: {
+    backgroundColor: COLORS.primaryDark,
+  },
+  switcherChipText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.text,
+  },
+  switcherChipTextActive: {
+    color: '#ffffff',
+  },
+  stepLevelDot: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.primary,
+  },
+});
+
+--- FILE: mobile/components/MapView.jsx ---
+
+// MapView.jsx — MapLibre version with rotation and recentering.
+//
+// Two modes:
+//   - outdoor: the tile map (as before).
+//   - indoor:  the floor plan (IndoorMapView), which fetches rooms
+//              and corridors for the current building+level. If the
+//              API returns no rooms (unsurveyed building), we fall
+//              back to IndoorMapPlaceholder.
+//
+// What's drawn on the outdoor map, bottom to top:
+//
+//   1. The route line.
+//   2. The start and destination markers.
+//   3. The accuracy circle — a polygon whose radius is the reported
+//      GPS accuracy in metres. It's drawn under the dot so the dot
+//      stays legible. Its presence tells the student that the dot
+//      sitting a few metres off the line is the phone's uncertainty,
+//      not the app being wrong.
+//   4. The heading cone — a small triangle from the dot's position
+//      in the direction of travel.
+//   5. The dot — a CircleLayer (halo + dot).
+//
+// The dot is a CircleLayer rather than a MarkerView because a
+// MarkerView is a React Native view on top of the map, and the
+// native layer can lag or hold position while the camera is
+// animating or rotating. A CircleLayer is drawn by MapLibre itself
+// and can't lag.
+//
+// The camera is throttled: at most one update every
+// CAMERA_MIN_INTERVAL_MS, and only when the student has moved at
+// least CAMERA_MIN_MOVE_M or the heading has changed by at least
+// CAMERA_MIN_HEADING_DEG. This stops the camera animation from
+// being restarted several times a second around corners.
+//
+// Route-up preview
+// ----------------
+// When this component is used as a preview (followBearing = false),
+// the initial fit turns the map so the route runs from bottom to top
+// of the screen. This is a one-shot turn, not a continuous follow.
+// The walking screen passes followBearing = true, so it skips the
+// preview heading entirely and follows the walker's compass.
+//
+// The preview gets its own N/S flip button (top-right). It shows
+// which compass direction is at the top of the screen right now.
+// One press turns the map 180°.
+//
+// The fit runs only after `onDidFinishLoadingMap` fires, so a
+// setCamera call isn't dropped while the native map is still
+// loading.
+//
+// Walking screen is untouched by all of this: it passes
+// followBearing = true and the whole preview block is skipped.
+
+import { useMemo, useRef, useEffect, useState } from 'react';
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  MapView,
+  Camera,
+  ShapeSource,
+  LineLayer,
+  FillLayer,
+  CircleLayer,
+  MarkerView,
+} from '@maplibre/maplibre-react-native';
+
+import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
+import { IndoorMapView } from '@/components/IndoorMapView';
+import { haversineM, bearingDeg } from '@/utils/geo';
+import {
+  CAMERA_MIN_INTERVAL_MS,
+  CAMERA_MIN_MOVE_M,
+  CAMERA_MIN_HEADING_DEG,
+} from '@/constants/config';
+import { COLORS } from '@/constants/theme';
+
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
+const DEFAULT_CENTER = [39.2000, -6.7500];
+
+const CAMPUS_BOUNDS = {
+  minLon: 33.30,
+  maxLon: 33.55,
+  minLat: -9.10,
+  maxLat: -8.75,
+};
+
+// Above this accuracy (in metres) the accuracy circle stops being
+// useful — it covers a whole block. We still draw the dot, just
+// without the circle.
+const ACCURACY_CIRCLE_MAX_M = 60;
+
+// The preview fit pulls back by this many zoom levels when the map
+// is rotated, because a diagonal route can push its ends toward the
+// screen edges once the map is turned.
+const PREVIEW_HEADING_ZOOM_OFFSET = 0.5;
+
+function isWithinCampus(lon, lat) {
+  return (
+    lon >= CAMPUS_BOUNDS.minLon &&
+    lon <= CAMPUS_BOUNDS.maxLon &&
+    lat >= CAMPUS_BOUNDS.minLat &&
+    lat <= CAMPUS_BOUNDS.maxLat
+  );
+}
+
+function angularDifference(a, b) {
+  const d = Math.abs(a - b) % 360;
+  return Math.min(d, 360 - d);
+}
+
+// A GeoJSON point for the user's position.
+function userPointGeoJSON(userLocation) {
+  if (!userLocation) return null;
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Point',
+      coordinates: [userLocation.lon, userLocation.lat],
+    },
+  };
+}
+
+// A GeoJSON polygon approximating a circle of radius `radiusM`
+// around `userLocation`. 32 vertices is plenty for a small circle
+// and keeps the payload tiny.
+function accuracyCircleGeoJSON(userLocation, radiusM) {
+  if (!userLocation || radiusM == null || radiusM <= 0) return null;
+  if (radiusM > ACCURACY_CIRCLE_MAX_M) return null;
+
+  const METERS_PER_DEG_LAT = 111000;
+  const METERS_PER_DEG_LON =
+    111000 * Math.cos((userLocation.lat * Math.PI) / 180);
+
+  const steps = 32;
+  const ring = [];
+  for (let i = 0; i < steps; i++) {
+    const angle = (i / steps) * Math.PI * 2;
+    const dLat = (radiusM * Math.cos(angle)) / METERS_PER_DEG_LAT;
+    const dLon = (radiusM * Math.sin(angle)) / METERS_PER_DEG_LON;
+    ring.push([userLocation.lon + dLon, userLocation.lat + dLat]);
+  }
+  ring.push(ring[0]);
+
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Polygon',
+      coordinates: [ring],
+    },
+  };
+}
+
+// A small cone pointing in the direction of travel. About 12 m long
+// and 8 m wide at the far end.
+function userHeadingGeoJSON(userLocation, heading) {
+  if (!userLocation || heading == null) return null;
+  const METERS_PER_DEG_LAT = 111000;
+  const METERS_PER_DEG_LON =
+    111000 * Math.cos((userLocation.lat * Math.PI) / 180);
+
+  const rad = (heading * Math.PI) / 180;
+  const forwardLat =
+    userLocation.lat + (12 * Math.cos(rad)) / METERS_PER_DEG_LAT;
+  const forwardLon =
+    userLocation.lon + (12 * Math.sin(rad)) / METERS_PER_DEG_LON;
+
+  const leftAngle = rad - Math.PI / 6;
+  const rightAngle = rad + Math.PI / 6;
+  const leftLat =
+    userLocation.lat + (8 * Math.cos(leftAngle)) / METERS_PER_DEG_LAT;
+  const leftLon =
+    userLocation.lon + (8 * Math.sin(leftAngle)) / METERS_PER_DEG_LON;
+  const rightLat =
+    userLocation.lat + (8 * Math.cos(rightAngle)) / METERS_PER_DEG_LAT;
+  const rightLon =
+    userLocation.lon + (8 * Math.sin(rightAngle)) / METERS_PER_DEG_LON;
+
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[
+        [userLocation.lon, userLocation.lat],
+        [leftLon, leftLat],
+        [forwardLon, forwardLat],
+        [rightLon, rightLat],
+        [userLocation.lon, userLocation.lat],
+      ]],
+    },
+  };
+}
+
+export function RouteMap({
+  geometry = [],
+  markers = [],
+  userLocation = null,
+  accuracyM = null,
+  bearing = null,
+  followBearing = false,
+  mode = 'outdoor',
+  destinationName = null,
+  indoorBuildingName = null,
+  indoorLevel = null,
+  indoorGeometry = [],
+  indoorGeometryByLevel = [],
+  indoorDestination = null,
+  currentStepPoint = null,
+  nextStepPoint = null,
+  currentStepLevel = null,
+  style,
+}) {
+  const cameraRef = useRef(null);
+
+  const [indoorNoRooms, setIndoorNoRooms] = useState(false);
+
+  // Preview-only: gate the initial fit on the native map being
+  // loaded, so setCamera({ heading }) isn't dropped while the map is
+  // still initialising. On the walking screen (followBearing = true)
+  // this state is set but never used.
+  const [mapReady, setMapReady] = useState(false);
+
+  // Preview-only: 0°/180° flip. Chosen from the route's overall
+  // bearing, toggled by the button. Irrelevant on the walking screen.
+  const [flipped, setFlipped] = useState(false);
+
+  useEffect(() => {
+    setIndoorNoRooms(false);
+  }, [indoorBuildingName, indoorLevel]);
+
+  // Reset the flip when the route changes, so a new route starts on
+  // its own preferred side rather than inheriting the previous flip.
+  useEffect(() => {
+    setFlipped(false);
+  }, [geometry]);
+
+  const routeCoords = useMemo(
+    () => geometry.map((p) => [p.lon, p.lat]),
+    [geometry]
+  );
+
+  const lineGeoJSON = useMemo(() => {
+    if (routeCoords.length < 2) return null;
+    return {
+      type: 'Feature',
+      properties: {},
+      geometry: {
+        type: 'LineString',
+        coordinates: routeCoords,
+      },
+    };
+  }, [routeCoords]);
+
+  const userDot = useMemo(
+    () => userPointGeoJSON(userLocation),
+    [userLocation]
+  );
+
+  const userAccuracyCircle = useMemo(
+    () => accuracyCircleGeoJSON(userLocation, accuracyM),
+    [userLocation, accuracyM]
+  );
+
+  const userHeading = useMemo(
+    () => userHeadingGeoJSON(userLocation, bearing),
+    [userLocation, bearing]
+  );
+
+  // The route's overall bearing, from first point to last. Null when
+  // the walking screen is using this map (followBearing is true), or
+  // when the route is too short for a meaningful bearing.
+  const previewHeading = useMemo(() => {
+    if (followBearing) return null;
+    if (routeCoords.length < 2) return null;
+    const first = routeCoords[0];             // [lon, lat]
+    const last = routeCoords[routeCoords.length - 1];
+    return bearingDeg(first[1], first[0], last[1], last[0]);
+  }, [routeCoords, followBearing]);
+
+  // The base orientation for the preview, snapped to 0 or 180.
+  // Same idea as the indoor map's baseHeading: only two values, so
+  // the map never sits at a skew angle.
+  const previewBaseHeading = useMemo(() => {
+    if (previewHeading == null) return null;
+    return Math.cos((previewHeading * Math.PI) / 180) >= 0 ? 0 : 180;
+  }, [previewHeading]);
+
+  // Effective heading, including the flip.
+  const mapHeading =
+    previewBaseHeading == null
+      ? null
+      : (previewBaseHeading + (flipped ? 180 : 0)) % 360;
+
+  // Fit parameters, computed once per route. Used by the fit effect
+  // once mapReady is true.
+  const fit = useMemo(() => {
+    if (routeCoords.length < 2) return null;
+    const valid = routeCoords.filter(
+      (c) =>
+        Array.isArray(c) &&
+        Number.isFinite(c[0]) &&
+        Number.isFinite(c[1]) &&
+        isWithinCampus(c[0], c[1])
+    );
+    if (valid.length === 0) return null;
+
+    const lons = valid.map((c) => c[0]);
+    const lats = valid.map((c) => c[1]);
+    const west = Math.min(...lons);
+    const east = Math.max(...lons);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+
+    const centerLon = (west + east) / 2;
+    const centerLat = (south + north) / 2;
+    const span = Math.max(east - west, north - south);
+
+    let zoom = 16;
+    if (span > 0) {
+      zoom = 16 + Math.log2(0.005 / span);
+    }
+    zoom = Math.max(14, Math.min(18, zoom));
+
+    return { center: [centerLon, centerLat], zoom };
+  }, [routeCoords]);
+
+  // Camera throttle state — used only on the walking screen.
+  const lastCamRef = useRef({
+    t: 0,
+    lat: null,
+    lon: null,
+    heading: null,
+  });
+
+  // Preview fit. Only runs when followBearing is false, when the
+  // native map has finished loading, and when we have a fit and a
+  // heading.
+  useEffect(() => {
+    if (mode !== 'outdoor') return;
+    if (followBearing) return;
+    if (!mapReady) return;
+    if (!cameraRef.current) return;
+    if (!fit) return;
+
+    const cam = {
+      centerCoordinate: fit.center,
+      zoomLevel:
+        mapHeading != null
+          ? fit.zoom - PREVIEW_HEADING_ZOOM_OFFSET
+          : fit.zoom,
+      animationDuration: 500,
+    };
+    if (mapHeading != null) {
+      cam.heading = mapHeading;
+    }
+
+    // eslint-disable-next-line no-console
+    console.log('[preview fit]', {
+      mapHeading,
+      base: previewBaseHeading,
+      flipped,
+      zoom: cam.zoomLevel,
+      points: routeCoords.length,
+    });
+
+    try {
+      cameraRef.current.setCamera(cam);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.log('[preview fit] setCamera failed:', e && e.message);
+    }
+  }, [
+    mode,
+    followBearing,
+    mapReady,
+    fit,
+    mapHeading,
+    previewBaseHeading,
+    flipped,
+    routeCoords.length,
+  ]);
+
+  // Follow camera (walking screen only). Throttled: at most one
+  // update every CAMERA_MIN_INTERVAL_MS, and only when the student
+  // has moved at least CAMERA_MIN_MOVE_M or the heading has changed
+  // by at least CAMERA_MIN_HEADING_DEG.
+  useEffect(() => {
+    if (mode !== 'outdoor') return;
+    if (!followBearing) return;
+    if (!cameraRef.current) return;
+    if (!userLocation) return;
+    if (!isWithinCampus(userLocation.lon, userLocation.lat)) return;
+
+    const now = Date.now();
+    const last = lastCamRef.current;
+
+    const movedM =
+      last.lat != null && last.lon != null
+        ? haversineM(last.lat, last.lon, userLocation.lat, userLocation.lon)
+        : Infinity;
+
+    const headingChanged =
+      last.heading != null && bearing != null
+        ? angularDifference(last.heading, bearing)
+        : Infinity;
+
+    if (
+      now - last.t < CAMERA_MIN_INTERVAL_MS ||
+      (movedM < CAMERA_MIN_MOVE_M && headingChanged < CAMERA_MIN_HEADING_DEG)
+    ) {
+      return;
+    }
+
+    lastCamRef.current = {
+      t: now,
+      lat: userLocation.lat,
+      lon: userLocation.lon,
+      heading: bearing ?? last.heading,
+    };
+
+    const update = {
+      centerCoordinate: [userLocation.lon, userLocation.lat],
+      animationDuration: 600,
+    };
+    if (bearing != null) {
+      update.heading = bearing;
+    }
+
+    try {
+      cameraRef.current.setCamera(update);
+    } catch {
+      // Silent.
+    }
+  }, [userLocation, bearing, followBearing, mode]);
+
+  if (mode === 'indoor') {
+    if (indoorNoRooms) {
+      return (
+        <IndoorMapPlaceholder
+          destinationName={destinationName}
+          style={style}
+        />
+      );
+    }
+    return (
+      <IndoorMapView
+        buildingName={indoorBuildingName}
+        level={indoorLevel}
+        routeByLevel={indoorGeometryByLevel}
+        destination={indoorDestination}
+        currentStepPoint={currentStepPoint}
+        nextStepPoint={nextStepPoint}
+        currentStepLevel={currentStepLevel}
+        style={style}
+        onNoRooms={() => setIndoorNoRooms(true)}
+      />
+    );
+  }
+
+  const initialCenter = fit ? fit.center : DEFAULT_CENTER;
+
+  // The button label: N or S, whichever is currently at the top of
+  // the screen. Only shown in preview mode.
+  const showFlipButton =
+    !followBearing && mode === 'outdoor' && mapHeading != null;
+  const topLabel = mapHeading === 0 ? 'N' : 'S';
+
+  return (
+    <View style={[styles.wrapper, style]}>
+      <MapView
+        style={styles.map}
+        mapStyle={MAP_STYLE}
+        logoEnabled={false}
+        attributionEnabled={false}
+        compassEnabled={followBearing}
+        onDidFinishLoadingMap={() => setMapReady(true)}
+      >
+        <Camera
+          ref={cameraRef}
+          defaultSettings={{
+            centerCoordinate: initialCenter,
+            zoomLevel: fit ? fit.zoom : 16,
+            heading: mapHeading != null ? mapHeading : 0,
+          }}
+        />
+
+        {lineGeoJSON ? (
+          <ShapeSource id="routeSource" shape={lineGeoJSON}>
+            <LineLayer
+              id="routeLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 4,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {markers.map((marker, i) => (
+          <MarkerView
+            key={i}
+            coordinate={[marker.lon, marker.lat]}
+            anchor={{ x: 0.5, y: 1.0 }}
+          >
+            <View style={styles.marker}>
+              <View
+                style={[
+                  styles.markerDot,
+                  { backgroundColor: i === 0 ? '#16a34a' : '#dc2626' },
+                ]}
+              />
+            </View>
+          </MarkerView>
+        ))}
+
+        {/* Accuracy circle — under the heading cone and the dot. */}
+        {userAccuracyCircle ? (
+          <ShapeSource id="userAccuracySource" shape={userAccuracyCircle}>
+            <FillLayer
+              id="userAccuracyFill"
+              style={{
+                fillColor: '#2563eb',
+                fillOpacity: 0.12,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* Heading cone. */}
+        {userHeading ? (
+          <ShapeSource id="userHeadingSource" shape={userHeading}>
+            <FillLayer
+              id="userHeadingFill"
+              style={{
+                fillColor: '#2563eb',
+                fillOpacity: 0.25,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* The dot — halo, then core. */}
+        {userDot ? (
+          <ShapeSource id="userSource" shape={userDot}>
+            <CircleLayer
+              id="userHalo"
+              style={{
+                circleRadius: 13,
+                circleColor: '#2563eb',
+                circleOpacity: 0.25,
+              }}
+            />
+            <CircleLayer
+              id="userDot"
+              style={{
+                circleRadius: 7,
+                circleColor: '#2563eb',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 2,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+      </MapView>
+
+      {/* Preview flip button. Shows which compass direction is at the
+          top of the screen right now. One press turns the map 180°. */}
+      {showFlipButton ? (
+        <TouchableOpacity
+          style={styles.flipButton}
+          onPress={() => setFlipped((v) => !v)}
+          accessibilityRole="button"
+          accessibilityLabel={
+            topLabel === 'N' ? 'Flip map to south-up' : 'Flip map to north-up'
+          }
+        >
+          <Text style={styles.flipButtonText}>{topLabel}</Text>
+        </TouchableOpacity>
+      ) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  wrapper: {
+    overflow: 'hidden',
+  },
+  map: {
+    flex: 1,
+  },
+  marker: {
+    padding: 4,
+  },
+  markerDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
+  flipButton: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  flipButtonText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.primaryDark,
+  },
+});
+
+--- FILE: mobile/hooks/useRouteProgress.js ---
+
+// useRouteProgress — the walking screen's source of truth.
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { useWalkingProgress } from '@/hooks/useWalkingProgress';
+import { useSettings } from '@/context/SettingsContext';
+
+export function useRouteProgress(route, { startedFromPlace = false } = {}) {
+  const { settings } = useSettings();
+
+  const outdoor = useWalkingProgress(route);
+
+  const [manualStepIndex, setManualStepIndex] = useState(null);
+  const lastModeRef = useRef(null);
+
+  // The lowest step GPS may report after a stretch of manual (indoor)
+  // stepping. When the walker steps out of a building onto the first
+  // outdoor instruction, GPS takes over from that step, and must never
+  // report an earlier (indoor) one.
+  const [gpsFloorIdx, setGpsFloorIdx] = useState(0);
+  const sawIndoorManualRef = useRef(false);
+  const startedManualRef = useRef(false);
+
+  const steps = route?.steps || [];
+  const indoorsEnabled = settings.indoorsEnabled !== false;
+
+  useEffect(() => {
+    // Once per screen: after GPS takes over outdoors, manual mode must
+    // not be switched back on here.
+    if (
+      startedFromPlace &&
+      manualStepIndex === null &&
+      !startedManualRef.current
+    ) {
+      startedManualRef.current = true;
+      setManualStepIndex(0);
+    }
+  }, [startedFromPlace, manualStepIndex]);
+
+  const outdoorStepIndex =
+    outdoor.currentStepIndex >= 0 ? outdoor.currentStepIndex : 0;
+
+  const currentStep = useMemo(() => {
+    if (!steps.length) {
+      return { index: 0, mode: 'outdoor', step: null };
+    }
+    if (!indoorsEnabled) {
+      const idx = outdoorStepIndex;
+      const step = steps[idx] || null;
+      return { index: idx, mode: step?.mode || 'outdoor', step };
+    }
+    if (manualStepIndex !== null) {
+      const idx = Math.min(manualStepIndex, steps.length - 1);
+      const step = steps[idx] || null;
+      return { index: idx, mode: step?.mode || 'outdoor', step };
+    }
+    const idx = Math.max(outdoorStepIndex, Math.min(gpsFloorIdx, steps.length - 1));
+    const step = steps[idx] || null;
+    return { index: idx, mode: step?.mode || 'outdoor', step };
+  }, [steps, indoorsEnabled, manualStepIndex, outdoorStepIndex, gpsFloorIdx]);
+
+  // Indoor -> outdoor hand-over. While the walker taps through indoor
+  // steps, steps are manual. The moment the manual step is an outdoor one
+  // (they have left the building), hand the route back to GPS, starting
+  // at that step. Before this, manual mode stayed on for the whole trip:
+  // the first outdoor instruction kept the Next button and a tap skipped
+  // an outdoor instruction.
+  useEffect(() => {
+    if (manualStepIndex === null || !steps.length || !indoorsEnabled) return;
+    const idx = Math.min(manualStepIndex, steps.length - 1);
+    const step = steps[idx];
+    if (!step) return;
+    if (step.mode === 'indoor') {
+      sawIndoorManualRef.current = true;
+      return;
+    }
+    if (sawIndoorManualRef.current) {
+      sawIndoorManualRef.current = false;
+      setGpsFloorIdx(idx);
+      setManualStepIndex(null);
+    }
+  }, [manualStepIndex, steps, indoorsEnabled]);
+
+  useEffect(() => {
+    const mode = currentStep.mode;
+    if (
+      lastModeRef.current === 'outdoor' &&
+      mode === 'indoor' &&
+      manualStepIndex === null
+    ) {
+      setManualStepIndex(currentStep.index);
+    }
+    lastModeRef.current = mode;
+  }, [currentStep.mode, currentStep.index, manualStepIndex]);
+
+  useEffect(() => {
+    if (!startedFromPlace) {
+      setManualStepIndex(null);
+    }
+    setGpsFloorIdx(0);
+    sawIndoorManualRef.current = false;
+    lastModeRef.current = null;
+  }, [route, startedFromPlace]);
+
+  const advanceStep = useCallback(() => {
+    setManualStepIndex((prev) => {
+      const from = prev === null ? currentStep.index : prev;
+      if (from >= steps.length - 1) return from;
+      return from + 1;
+    });
+  }, [currentStep.index, steps.length]);
+
+  // Go back one INDOOR step. Not allowed past the first step, or into an
+  // outdoor step (outdoors the route follows GPS, not the buttons).
+  const canGoBack =
+    currentStep.mode === 'indoor' &&
+    currentStep.index > 0 &&
+    steps[currentStep.index - 1]?.mode === 'indoor';
+
+  const previousStep = useCallback(() => {
+    setManualStepIndex((prev) => {
+      const from = prev === null ? currentStep.index : prev;
+      if (from <= 0) return from;
+      if (steps[from - 1]?.mode !== 'indoor') return from;
+      return from - 1;
+    });
+  }, [currentStep.index, steps]);
+
+  const distanceRemainingM =
+    currentStep.mode === 'indoor' ? 0 : outdoor.distanceRemainingM;
+  const distanceToNextStepM =
+    currentStep.mode === 'indoor' ? 0 : outdoor.distanceToNextStepM;
+  const progress =
+    currentStep.mode === 'indoor'
+      ? steps.length > 1
+        ? currentStep.index / (steps.length - 1)
+        : 1
+      : outdoor.progress;
+
+  const indoorLevel =
+    currentStep.mode === 'indoor' && currentStep.step
+      ? currentStep.step.level || null
+      : null;
+
+  const indoorBuildingName =
+    currentStep.mode === 'indoor' && currentStep.step
+      ? currentStep.step.building_name || null
+      : null;
+
+  const currentStepGeometryPoint = useMemo(() => {
+    if (currentStep.mode !== 'indoor') return null;
+    if (!route?.geometry) return null;
+    const step = currentStep.step;
+    if (!step || step.geometry_index == null) return null;
+    return route.geometry[step.geometry_index] || null;
+  }, [currentStep.mode, currentStep.step, route?.geometry]);
+
+  const nextStepGeometryPoint = useMemo(() => {
+    if (currentStep.mode !== 'indoor') return null;
+    if (!route?.geometry) return null;
+    const next = steps[currentStep.index + 1];
+    if (!next || next.geometry_index == null) return null;
+    return route.geometry[next.geometry_index] || null;
+  }, [currentStep.mode, currentStep.index, steps, route?.geometry]);
+
+  const indoorGeometryByLevel = useMemo(() => {
+    if (!route?.geometry || !steps.length) return [];
+    const indoorSteps = steps.filter(
+      (s) => s.mode === 'indoor' && s.geometry_index != null
+    );
+    if (indoorSteps.length === 0) return [];
+    const points = [];
+    for (let i = 0; i < indoorSteps.length; i++) {
+      const step = indoorSteps[i];
+      const startIdx = step.geometry_index;
+      const endIdx =
+        i + 1 < indoorSteps.length
+          ? indoorSteps[i + 1].geometry_index
+          : route.geometry.length - 1;
+      for (let gi = startIdx; gi <= endIdx; gi++) {
+        const pt = route.geometry[gi];
+        if (!pt) continue;
+        points.push({ lat: pt.lat, lon: pt.lon, level: step.level || null });
+      }
+    }
+    return points;
+  }, [route?.geometry, steps]);
+
+  const indoorGeometry = useMemo(
+    () => indoorGeometryByLevel.map(({ lat, lon }) => ({ lat, lon })),
+    [indoorGeometryByLevel]
+  );
+
+  const indoorDestination = useMemo(() => {
+    if (!route?.geometry || !steps.length) return null;
+    let lastIndoorIdx = null;
+    for (const step of steps) {
+      if (step.mode !== 'indoor') continue;
+      if (step.geometry_index == null) continue;
+      lastIndoorIdx = step.geometry_index;
+    }
+    if (lastIndoorIdx === null) return null;
+    return route.geometry[lastIndoorIdx] || null;
+  }, [route?.geometry, steps]);
+
+  return {
+    permissionGranted: outdoor.permissionGranted,
+    position: currentStep.mode === 'indoor' ? null : outdoor.position,
+    rawPosition: outdoor.rawPosition,
+    currentStepIndex: currentStep.index,
+    currentStep: currentStep.step,
+    mode: currentStep.mode,
+    distanceRemainingM,
+    distanceToNextStepM,
+    progress,
+    offRoute: currentStep.mode === 'indoor' ? false : outdoor.offRoute,
+    gpsStale: currentStep.mode === 'indoor' ? false : outdoor.gpsStale,
+    resetOffRoute: outdoor.resetOffRoute,
+    advanceStep,
+    previousStep,
+    canGoBack,
+    isLastStep: currentStep.index >= steps.length - 1,
+    indoorLevel,
+    indoorBuildingName,
+    indoorGeometry,
+    indoorGeometryByLevel,
+    indoorDestination,
+    currentStepGeometryPoint,
+    nextStepGeometryPoint,
+  };
+}
+
+--- FILE: mobile/utils/legBearing.js ---
+
+// Which way the road ahead points, for turning the indoor map.
+//
+// legBearing(points) -> degrees (0 = north) or null
+//   points: [{ lat, lon }, ...] starting at the walker's position, in order
+//           along the route.
+//
+// The old version took the direction to the first path point that was 3 m
+// away. On a corridor drawn with small bends or a few extra nodes, that is
+// not the direction of the road. This version follows the path for as long as
+// it keeps going the same way and returns the straight-line direction from
+// the walker to the END of that stretch. It stops at the first real turn
+// (more than LEG_TURN_TOLERANCE_DEG), so a corner never drags the answer
+// round, and it follows a gentle curve for a while.
+//
+// Returns null when there is no usable direction (the walker is almost at the
+// end of the route), so the caller can keep the previous heading.
+
+import { bearingDeg, haversineM } from '@/utils/geo';
+
+const MIN_FIRST_CHORD_M = 3; // ignore moves smaller than this at the start
+const CHORD_M = 2; // after that, look at the path in 2 m pieces
+export const LEG_TURN_TOLERANCE_DEG = 25;
+export const LEG_MAX_LENGTH_M = 60;
+
+function angleDiff(a, b) {
+  return Math.abs(((a - b + 540) % 360) - 180);
+}
+
+export function legBearing(points) {
+  if (!points || points.length < 2) return null;
+
+  const from = points[0];
+  let anchor = from;
+  let end = null;
+  let reference = null;
+
+  for (let i = 1; i < points.length; i++) {
+    const to = points[i];
+    if (haversineM(from.lat, from.lon, to.lat, to.lon) > LEG_MAX_LENGTH_M) break;
+
+    const needed = end === null ? MIN_FIRST_CHORD_M : CHORD_M;
+    if (haversineM(anchor.lat, anchor.lon, to.lat, to.lon) < needed) continue;
+
+    const piece = bearingDeg(anchor.lat, anchor.lon, to.lat, to.lon);
+    if (reference !== null && angleDiff(piece, reference) > LEG_TURN_TOLERANCE_DEG) {
+      break; // the path has turned: the road ahead ends here
+    }
+
+    end = to;
+    anchor = to;
+    reference = bearingDeg(from.lat, from.lon, end.lat, end.lon);
+  }
+
+  return end ? bearingDeg(from.lat, from.lon, end.lat, end.lon) : null;
+}
+
+// ---------------------------------------------------------------------------
+// The start and the end of a route
+// ---------------------------------------------------------------------------
+//
+// START. A route that begins in a room starts with a short stub from the
+// door into the corridor, then turns onto the corridor. For the first step
+// we want the direction of the stub itself, which is the first leg the
+// walker actually takes. See firstLegBearing().
+//
+// END. The last stretch into the destination door is only a metre or two, too
+// short to be a "road". There we turn the map to face the destination.
+
+const STUB_MAX_M = 5; // a first stretch shorter than this, ending in a corner, is a door stub
+const STUB_CORNER_DEG = 40; // how sharp the corner must be
+const MICRO_SEGMENT_M = 0.3; // shorter pieces have no reliable direction
+const FACE_TARGET_MIN_M = 0.8; // nearer than this there is no direction to face
+
+function pathLength(points) {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    total += haversineM(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+  }
+  return total;
+}
+
+/** Index of the corner that ends a door stub, or -1 when the path has none. */
+function stubEndIndex(points) {
+  let travelled = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const before = haversineM(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+    travelled += before;
+    if (travelled > STUB_MAX_M) return -1;
+    const after = haversineM(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon);
+    if (before < MICRO_SEGMENT_M || after < MICRO_SEGMENT_M) continue;
+    const incoming = bearingDeg(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+    const outgoing = bearingDeg(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon);
+    if (angleDiff(incoming, outgoing) >= STUB_CORNER_DEG) return i;
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// The first real leg, used for the start of a route
+// ---------------------------------------------------------------------------
+
+const FIRST_LEG_TURN_DEG = 25;
+
+// Direction of the first real leg: skip zero-length duplicate points, then
+// follow the path until it turns. A door stub ends at its corner, so a
+// 2 m stub north gives ~0, not the corridor beyond it.
+function firstLegBearing(points) {
+  let i = 0;
+  while (
+    i < points.length - 1 &&
+    haversineM(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon) < MICRO_SEGMENT_M
+  ) i++;
+  if (i >= points.length - 1) return null;
+
+  const ref = bearingDeg(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon);
+  let j = i + 1;
+  while (j < points.length - 1) {
+    const seg = haversineM(points[j].lat, points[j].lon, points[j + 1].lat, points[j + 1].lon);
+    if (seg >= MICRO_SEGMENT_M) {
+      const b = bearingDeg(points[j].lat, points[j].lon, points[j + 1].lat, points[j + 1].lon);
+      if (angleDiff(b, ref) > FIRST_LEG_TURN_DEG) break;
+    }
+    j++;
+  }
+  return bearingDeg(points[i].lat, points[i].lon, points[j].lat, points[j].lon);
+}
+
+/**
+ * The direction the map should face for a step.
+ *   points        the route from the walker's position onward, on this floor
+ *   isRouteStart  true on the very first step, where the walker stands in a room
+ * Returns degrees, or null when there is no direction (the walker is already
+ * at the destination), so the caller keeps the previous heading.
+ */
+export function headingAlongRoute(points, { isRouteStart = false } = {}) {
+  if (!points || points.length < 2) return null;
+
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  // Last few metres: face the destination.
+  if (pathLength(points) < MIN_FIRST_CHORD_M) {
+    return haversineM(first.lat, first.lon, last.lat, last.lon) >= FACE_TARGET_MIN_M
+      ? bearingDeg(first.lat, first.lon, last.lat, last.lon)
+      : null;
+  }
+
+  // First step: aim along the leg you actually walk first, which is the
+  // door stub when the route starts in a room.
+  if (isRouteStart) {
+    const h = firstLegBearing(points);
+    if (h !== null) return h;
+  }
+
+  return legBearing(points);
+}
