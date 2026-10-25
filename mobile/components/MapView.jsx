@@ -65,15 +65,29 @@ import {
 
 import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
 import { IndoorMapView } from '@/components/IndoorMapView';
+import { OutdoorBaseMap } from '@/components/OutdoorBaseMap';
 import { haversineM, bearingDeg } from '@/utils/geo';
 import {
   CAMERA_MIN_INTERVAL_MS,
   CAMERA_MIN_MOVE_M,
   CAMERA_MIN_HEADING_DEG,
+  OUTDOOR_BASEMAP,
+  OUTDOOR_MAP_ATTRIBUTION,
 } from '@/constants/config';
 import { COLORS } from '@/constants/theme';
+import { OUTDOOR_BLANK_STYLE } from '@/constants/outdoorMapStyle';
+import { loadBaseMap } from '@/services/basemap';
 
+// The online map picture. Used when OUTDOOR_BASEMAP is 'openfreemap', and as
+// the fallback when your own map could not be loaded (no network and no saved
+// copy, or the server has no map file).
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
+
+// Which outdoor map to draw: 'own' = built from your map.osm (see
+// OutdoorBaseMap), 'openfreemap' = the online map picture. Set in config.js.
+const USE_OWN_BASEMAP = (OUTDOOR_BASEMAP ?? 'own') === 'own';
+// Credit line shown on your own map. Leave it as '' to hide it.
+const ATTRIBUTION_TEXT = OUTDOOR_MAP_ATTRIBUTION ?? '© OpenStreetMap contributors';
 const DEFAULT_CENTER = [39.2000, -6.7500];
 
 const CAMPUS_BOUNDS = {
@@ -220,6 +234,24 @@ export function RouteMap({
   // still initialising. On the walking screen (followBearing = true)
   // this state is set but never used.
   const [mapReady, setMapReady] = useState(false);
+
+  // Your own base map (roads, buildings...). null until loaded; if it cannot
+  // be had at all, baseMapFailed switches to the online map picture instead.
+  const [baseMap, setBaseMap] = useState(null);
+  const [baseMapFailed, setBaseMapFailed] = useState(false);
+  useEffect(() => {
+    if (!USE_OWN_BASEMAP) return undefined;
+    let cancelled = false;
+    loadBaseMap().then((data) => {
+      if (cancelled) return;
+      if (data) setBaseMap(data);
+      else setBaseMapFailed(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const useOwnBaseMap = USE_OWN_BASEMAP && !baseMapFailed;
 
   // Preview-only: 0°/180° flip. Chosen from the route's overall
   // bearing, toggled by the button. Irrelevant on the walking screen.
@@ -470,7 +502,7 @@ export function RouteMap({
     <View style={[styles.wrapper, style]}>
       <MapView
         style={styles.map}
-        mapStyle={MAP_STYLE}
+        mapStyle={useOwnBaseMap ? OUTDOOR_BLANK_STYLE : MAP_STYLE}
         logoEnabled={false}
         attributionEnabled={false}
         compassEnabled={followBearing}
@@ -484,6 +516,9 @@ export function RouteMap({
             heading: mapHeading != null ? mapHeading : 0,
           }}
         />
+
+        {/* The base map goes first, so everything below is drawn on top of it. */}
+        {useOwnBaseMap && baseMap ? <OutdoorBaseMap data={baseMap} /> : null}
 
         {lineGeoJSON ? (
           <ShapeSource id="routeSource" shape={lineGeoJSON}>
@@ -566,6 +601,14 @@ export function RouteMap({
         ) : null}
       </MapView>
 
+      {/* Credit for the map data, shown on your own map. Set the text in
+          config.js (OUTDOOR_MAP_ATTRIBUTION); '' hides it. */}
+      {useOwnBaseMap && baseMap && ATTRIBUTION_TEXT ? (
+        <View style={styles.attribution} pointerEvents="none">
+          <Text style={styles.attributionText}>{ATTRIBUTION_TEXT}</Text>
+        </View>
+      ) : null}
+
       {/* Preview flip button. Shows which compass direction is at the
           top of the screen right now. One press turns the map 180°. */}
       {showFlipButton ? (
@@ -585,6 +628,19 @@ export function RouteMap({
 }
 
 const styles = StyleSheet.create({
+  attribution: {
+    position: 'absolute',
+    left: 6,
+    bottom: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    backgroundColor: 'rgba(255, 255, 255, 0.7)',
+  },
+  attributionText: {
+    fontSize: 10,
+    color: '#444444',
+  },
   wrapper: {
     overflow: 'hidden',
   },
@@ -618,3 +674,4 @@ const styles = StyleSheet.create({
     color: COLORS.primaryDark,
   },
 });
+

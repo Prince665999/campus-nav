@@ -177,3 +177,11 @@ export const INDOOR_LEG_END_DOT_BORDER_WIDTH = 1;          // thickness of its d
 
 // How faint the rest of the route gets while a leg is highlighted (1 = no fade)
 export const INDOOR_ROUTE_FADED_OPACITY = 1;
+
+//   'openfreemap' the online map picture, as before.
+export const OUTDOOR_BASEMAP = "openfreemap";
+
+// Credit line on your own map. If any of map.osm came from OpenStreetMap,
+// keep this. Set it to "" only if every part of the file is your own drawing.
+export const OUTDOOR_MAP_ATTRIBUTION = "© OpenStreetMap contributors";
+

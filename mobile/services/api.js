@@ -110,6 +110,19 @@ export async function getPlaceByQr(code) {
 }
 
 /**
+ * The outdoor base map (roads, paths, buildings, grass) built from map.osm.
+ * Used by services/basemap.js.
+ */
+export async function getBaseMap() {
+  return request('/api/basemap');
+}
+
+/** Just its version, to skip the download when the saved copy is current. */
+export async function getBaseMapVersion() {
+  return request('/api/basemap/version');
+}
+
+/**
  * Category and intent counts, for hiding empty chips.
  * Returns { categories: {...}, intents: {...} }.
  */

@@ -28,6 +28,7 @@ from .routers import (
     media,
     narrate,
     places,
+    basemap,
     qr,
     reports,
     route,
@@ -126,6 +127,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(places.router)
     app.include_router(qr.router)
+    app.include_router(basemap.router)
     app.include_router(areas.router)
     app.include_router(indoor.router)          # ← new
     app.include_router(route.router)

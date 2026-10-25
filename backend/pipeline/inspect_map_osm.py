@@ -1,9 +1,8 @@
 """
 inspect_map_osm.py
 
-Tells you what is inside map.osm, so you can see whether it holds enough to
-draw the whole outdoor map yourself (roads, paths, buildings, grass, water,
-names) or only the routing paths and named places.
+Shows what the outdoor map will draw from map.osm, and which tagged things
+have no symbol yet, so you know what to add or tag in JOSM.
 
 Run from the repo root:
 
@@ -20,52 +19,42 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
-# What a base map needs, and the tag that says a way belongs to it.
-ROAD_TYPES = {"motorway", "trunk", "primary", "secondary", "tertiary",
-              "unclassified", "residential", "service", "living_street", "track"}
-PATH_TYPES = {"footway", "path", "pedestrian", "steps", "cycleway", "corridor"}
+from backend.api.services import basemap_service as bm
+
+LAYER_LABELS = [
+    ("landuse", "land use (campus, housing...)"),
+    ("green", "grass, trees, parks"),
+    ("water", "water"),
+    ("waterways", "rivers and streams"),
+    ("sports", "pitches and sports grounds"),
+    ("parking", "parking areas"),
+    ("roads", "roads"),
+    ("paths", "footpaths and steps"),
+    ("buildings", "buildings"),
+    ("trees", "single trees"),
+    ("pois", "symbols and names (points)"),
+]
 
 
-def read(osm_path):
-    nodes, ways = {}, []
+def tag_report(osm_path):
+    """Every tagged thing with a place-like tag, grouped by key=value."""
+    seen = Counter()
+    named_points = []
     for _event, el in ET.iterparse(str(osm_path), events=("end",)):
-        if el.tag == "node":
-            nodes[el.get("id")] = (float(el.get("lat")), float(el.get("lon")))
-            el.clear()
-        elif el.tag == "way":
+        if el.tag in ("node", "way"):
             tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
-            refs = [nd.get("ref") for nd in el.findall("nd")]
-            ways.append((tags, refs))
+            for key in bm.POI_KEYS:
+                value = tags.get(key)
+                if value is not None:
+                    seen[(key, value, el.tag)] += 1
+            if el.tag == "node" and tags.get("name") and bm.poi_icon_for(tags) is None:
+                named_points.append(tags["name"])
             el.clear()
-    return nodes, ways
-
-
-def classify(tags):
-    """Which base-map layer a way would be drawn in, or None."""
-    highway = tags.get("highway")
-    if highway in ROAD_TYPES:
-        return "roads"
-    if highway in PATH_TYPES:
-        return "paths"
-    if "building" in tags:
-        return "buildings"
-    if tags.get("natural") == "water" or "waterway" in tags or tags.get("landuse") == "reservoir":
-        return "water"
-    if tags.get("landuse") in {"grass", "forest", "meadow", "recreation_ground",
-                               "village_green", "farmland", "orchard", "cemetery"} \
-            or tags.get("natural") in {"wood", "scrub", "grassland", "heath"} \
-            or tags.get("leisure") in {"park", "garden", "pitch", "playground",
-                                       "sports_centre", "stadium"}:
-        return "green / sports"
-    if "landuse" in tags:
-        return "other land use"
-    if "barrier" in tags:
-        return "walls / fences"
-    return None
+    return seen, named_points
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Show what map.osm contains.")
+    ap = argparse.ArgumentParser(description="Show what the outdoor map will draw.")
     ap.add_argument("--osm", default="backend/data/map.osm")
     args = ap.parse_args(argv)
 
@@ -74,55 +63,53 @@ def main(argv=None):
         print(f"Cannot find {path}. Use --osm to point at map.osm.")
         return 1
 
-    nodes, ways = read(path)
-    layers = Counter()
-    named = Counter()
-    highway_kinds = Counter()
-    unclassified = 0
-    for tags, _refs in ways:
-        layer = classify(tags)
-        if layer is None:
-            unclassified += 1
-            continue
-        layers[layer] += 1
-        if tags.get("name"):
-            named[layer] += 1
-        if "highway" in tags:
-            highway_kinds[tags["highway"]] += 1
-
-    lats = [p[0] for p in nodes.values()]
-    lons = [p[1] for p in nodes.values()]
+    data = bm.build_base_map(path)
+    layers = data["layers"]
     print(f"\nFile: {path}  ({path.stat().st_size / 1024:.0f} KB)")
-    print(f"Nodes: {len(nodes)}   Ways: {len(ways)}")
-    if lats:
-        h = (max(lats) - min(lats)) * 110540
-        w = (max(lons) - min(lons)) * 111320 * math.cos(math.radians(sum(lats) / len(lats)))
+    if data["bounds"]:
+        lon0, lat0, lon1, lat1 = data["bounds"]
+        h = (lat1 - lat0) * 110540
+        w = (lon1 - lon0) * 111320 * math.cos(math.radians((lat0 + lat1) / 2))
         print(f"Area covered: about {w:.0f} m x {h:.0f} m")
 
-    print("\nWhat could be drawn on a base map")
-    print(f"  {'layer':<18}{'ways':>7}{'named':>8}")
-    for layer in ["roads", "paths", "buildings", "green / sports", "water",
-                  "other land use", "walls / fences"]:
-        print(f"  {layer:<18}{layers[layer]:>7}{named[layer]:>8}")
-    print(f"  (ways not in any of these: {unclassified})")
-    if highway_kinds:
-        print("\n  highway types: " + ", ".join(f"{k} {v}" for k, v in highway_kinds.most_common()))
+    print("\nWhat the map will draw")
+    print(f"  {'layer':<34}{'drawn':>7}{'named':>8}")
+    for key, label in LAYER_LABELS:
+        feats = layers[key]["features"]
+        named = sum(1 for f in feats if f["properties"].get("name"))
+        print(f"  {label:<34}{len(feats):>7}{named:>8}")
+
+    icons = Counter(f["properties"].get("icon") for f in layers["pois"]["features"])
+    if icons:
+        print("\nSymbols that will show")
+        for icon, n in icons.most_common():
+            print(f"  {icon or '(name only, no symbol)':<26}{n}")
+
+    seen, named_points = tag_report(path)
+    no_symbol = {
+        (k, v, kind): n for (k, v, kind), n in seen.items()
+        if (k, v) not in bm.POI_ICONS and (k, "*") not in bm.POI_ICONS
+        and (k, v) not in bm.POI_IGNORE
+        and not (k == "leisure" and v in bm.SPORTS_LEISURE | bm.GREEN_LEISURE)
+        and not (k == "amenity" and v in bm.LANDUSE_AMENITY)
+        and not (k == "highway")
+    }
+    if no_symbol:
+        print("\nTagged in your file but with NO symbol yet (tell me if you want one)")
+        for (k, v, kind), n in sorted(no_symbol.items()):
+            print(f"  {k}={v:<24} {n} x {kind}")
+    if named_points:
+        print(f"\nNamed points shown as a name only: {', '.join(sorted(set(named_points))[:12])}"
+              + (" ..." if len(set(named_points)) > 12 else ""))
 
     print("\nWhat this means")
-    if layers["buildings"] == 0:
-        print("  - No buildings. A base map would need you to draw the building outlines.")
-    elif layers["buildings"] < 5:
-        print(f"  - Only {layers['buildings']} buildings. Likely not every building is drawn.")
-    else:
-        print(f"  - {layers['buildings']} buildings: enough to draw them on the map.")
-    if layers["roads"] == 0:
-        print("  - No roads, only paths. Roads and parking would be missing from the map.")
-    else:
-        print(f"  - {layers['roads']} roads: they can be drawn.")
-    if layers["green / sports"] + layers["water"] == 0:
-        print("  - No grass, trees or water areas. The map would be plain between paths and buildings.")
-    else:
-        print(f"  - {layers['green / sports']} green areas and {layers['water']} water areas can be drawn.")
+    if not layers["landuse"]["features"]:
+        print("  - No campus area. Draw a closed way around the campus tagged landuse=education"
+              " to get the pale yellow ground.")
+    if not layers["parking"]["features"] and icons.get("parking", 0) == 0:
+        print("  - No parking. Tag car parks amenity=parking (a closed way, or a single point).")
+    if not layers["buildings"]["features"]:
+        print("  - No buildings found.")
     print()
     return 0
 
