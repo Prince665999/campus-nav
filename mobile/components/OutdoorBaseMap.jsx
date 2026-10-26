@@ -43,7 +43,8 @@ const ROAD_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 14, 0.8, 17, 
 const ROAD_CASING_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 14, 1.4, 17, 6, 19, 16, 21, 44];
 const MINOR_ROAD_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 15, 0.6, 17, 2.4, 19, 7, 21, 22];
 const MINOR_ROAD_CASING_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 15, 1.2, 17, 3.6, 19, 9.5, 21, 28];
-const PATH_WIDTH = ['interpolate', ['linear'], ['zoom'], 15, 0.6, 17, 1.4, 19, 2.6, 21, 5];
+// Footpaths: wider than before so the white dots read clearly on the milk ground.
+const PATH_WIDTH = ['interpolate', ['linear'], ['zoom'], 15, 1, 17, 2.4, 19, 4.6, 21, 9];
 const WATERWAY_WIDTH = ['interpolate', ['linear'], ['zoom'], 14, 0.8, 18, 4, 21, 14];
 const NAME_SIZE = ['interpolate', ['linear'], ['zoom'], 16, 10, 19, 12];
 const ICON_SIZE = ['interpolate', ['linear'], ['zoom'], 15, 0.2, 17, 0.28, 19, 0.38, 21, 0.5];
@@ -166,7 +167,7 @@ export function OutdoorBaseMap({ data }) {
       </ShapeSource>
 
       <ShapeSource id="base-paths" shape={get('paths')}>
-        {/* Footpaths are drawn as red dots, steps as short red dashes. */}
+        {/* Footpaths are drawn as white dots, steps as short white dashes. */}
         <LineLayer
           id="base-paths-walk"
           filter={['!', isKind('steps')]}

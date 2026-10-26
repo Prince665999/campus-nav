@@ -179,7 +179,7 @@ export const INDOOR_LEG_END_DOT_BORDER_WIDTH = 1;          // thickness of its d
 export const INDOOR_ROUTE_FADED_OPACITY = 1;
 
 //   'openfreemap' the online map picture, as before.
-export const OUTDOOR_BASEMAP = "openfreemap";
+export const OUTDOOR_BASEMAP = "own";
 
 // Credit line on your own map. If any of map.osm came from OpenStreetMap,
 // keep this. Set it to "" only if every part of the file is your own drawing.

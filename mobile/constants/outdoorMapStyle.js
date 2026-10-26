@@ -1,18 +1,17 @@
 // How the outdoor map looks when it is drawn from your own map.osm.
-// The colours follow the standard OpenStreetMap map, so it looks the same as
-// what you see on openstreetmap.org. Change a colour here and reload the app.
+// Change a colour here and reload the app.
 //
 // Used by components/OutdoorBaseMap.jsx and components/MapView.jsx.
 
 export const OUTDOOR_COLORS = {
-  land: '#f2efe9', // outside any area
+  land: '#f8f4f0', // the ground: milk white (outside any area)
   buildingFill: '#d9d0c9',
   buildingLine: '#c6b9ab',
   road: '#ffffff',
   roadPedestrian: '#ededed',
   roadCasing: '#bbbbbb', // the grey edge of a road
   track: '#996703', // dirt tracks (dashed)
-  path: '#fa8072', // footpaths: red dots, as on openstreetmap.org
+  path: '#ffffff', // footpaths: white dots, so they stand out from the milk ground
   parkingFill: '#eeeeee',
   parkingLine: '#cfc8bd',
   water: '#aad3df',
@@ -30,15 +29,16 @@ export const OUTDOOR_COLORS = {
   purpleText: '#ac39ac', // shops
 };
 
-// Land that is not green. "education" is the campus itself (the pale yellow).
+// Land that is not green. "education" is the campus itself: the same milk white
+// as the ground, so paths and buildings stand out from it.
 export const LANDUSE_COLORS = {
-  education: '#ffffe5',
-  university: '#ffffe5',
-  college: '#ffffe5',
-  school: '#ffffe5',
-  kindergarten: '#ffffe5',
-  hospital: '#ffffe5',
-  clinic: '#ffffe5',
+  education: '#f8f4f0',
+  university: '#f8f4f0',
+  college: '#f8f4f0',
+  school: '#f8f4f0',
+  kindergarten: '#f8f4f0',
+  hospital: '#f8f4f0',
+  clinic: '#f8f4f0',
   residential: '#e0dfdf',
   commercial: '#f2dad9',
   retail: '#ffd6d1',
