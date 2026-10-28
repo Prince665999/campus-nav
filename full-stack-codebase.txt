@@ -11719,6 +11719,7 @@ from .routers import (
     media,
     narrate,
     places,
+    basemap,
     qr,
     reports,
     route,
@@ -11817,6 +11818,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(places.router)
     app.include_router(qr.router)
+    app.include_router(basemap.router)
     app.include_router(areas.router)
     app.include_router(indoor.router)          # ← new
     app.include_router(route.router)
@@ -14012,6 +14014,45 @@ def get_area(area_id: int, session: Session = Depends(db_session)):
     if detail is None:
         raise NotFoundError(f"Area {area_id} not found")
     return detail
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\basemap.py ---
+
+"""
+basemap.py
+
+The outdoor base map, built from map.osm (see services/basemap_service.py).
+
+  GET /api/basemap          the whole thing: layers of roads, paths, buildings...
+  GET /api/basemap/version  just the version, so the phone can skip the download
+                            when its saved copy is still current
+"""
+
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse, Response
+
+from ..errors import NotFoundError
+from ..services import basemap_service
+
+router = APIRouter(prefix="/api/basemap", tags=["basemap"])
+
+
+@router.get("")
+def get_basemap():
+    built = basemap_service.get_base_map()
+    if built is None:
+        raise NotFoundError("The map file (map.osm) was not found on the server")
+    _version, payload = built
+    return Response(content=payload, media_type="application/json")
+
+
+@router.get("/version")
+def get_basemap_version():
+    built = basemap_service.get_base_map()
+    if built is None:
+        raise NotFoundError("The map file (map.osm) was not found on the server")
+    version, _payload = built
+    return JSONResponse({"version": version})
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\chat.py ---
 
@@ -16614,6 +16655,332 @@ def authenticate(session: Session, email: str, password: str) -> AdminUser | Non
         return None
 
     return user
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\basemap_service.py ---
+
+"""
+basemap_service.py
+
+Builds the outdoor BASE MAP (roads, paths, buildings, grass, water) from
+map.osm, so the phone can draw its own map instead of using a map picture
+from a tile service.
+
+The database keeps only named places and the walkable paths. This reads the
+whole .osm file again, so everything you draw in JOSM outdoors (unnamed
+buildings, roads, grass) shows up on the map. It only reads closed ways, lines and
+tagged points; areas stored as OSM relations are not drawn.
+
+The result is cached in memory and rebuilt on its own when map.osm changes.
+"""
+
+import hashlib
+import json
+import logging
+import threading
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from ..settings import MAP_OSM_PATH
+
+logger = logging.getLogger(__name__)
+
+ROAD_TYPES = {
+    "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified",
+    "residential", "service", "living_street", "track", "pedestrian",
+}
+PATH_TYPES = {"footway", "path", "steps", "cycleway", "bridleway", "corridor"}
+
+# Green ground. Colours by kind are in the app (constants/outdoorMapStyle.js).
+GREEN_LANDUSE = {
+    "grass", "forest", "meadow", "recreation_ground", "village_green",
+    "farmland", "orchard", "cemetery", "greenfield", "allotments", "vineyard",
+}
+GREEN_NATURAL = {"wood", "scrub", "grassland", "heath", "wetland"}
+GREEN_LEISURE = {"park", "garden", "nature_reserve"}
+
+# Sports and play areas: pitches, courts, stadiums, pools.
+SPORTS_LEISURE = {
+    "pitch", "sports_centre", "stadium", "track", "swimming_pool", "playground",
+    "golf_course", "miniature_golf",
+}
+
+# Land that is not "green": the campus itself (education), housing, shops...
+EDUCATION_AMENITY = {"university", "college", "school", "kindergarten"}
+LANDUSE_AMENITY = EDUCATION_AMENITY | {"hospital", "clinic"}
+
+# ---- Symbols (points of interest) ------------------------------------------
+# (tag, value) -> icon name. "*" means any value of that tag.
+# The icon names match the picture files in mobile/assets/poi/.
+POI_ICONS = {
+    ("amenity", "parking"): "parking",
+    ("amenity", "library"): "library",
+    ("amenity", "clinic"): "medical",
+    ("amenity", "doctors"): "medical",
+    ("amenity", "hospital"): "medical",
+    ("amenity", "pharmacy"): "medical",
+    ("amenity", "dentist"): "medical",
+    ("healthcare", "*"): "medical",
+    ("amenity", "restaurant"): "food",
+    ("amenity", "fast_food"): "food",
+    ("amenity", "cafe"): "food",
+    ("amenity", "canteen"): "food",
+    ("amenity", "food_court"): "food",
+    ("amenity", "ice_cream"): "food",
+    ("amenity", "bar"): "food",
+    ("amenity", "pub"): "food",
+    ("amenity", "bank"): "bank",
+    ("amenity", "atm"): "bank",
+    ("amenity", "toilets"): "toilets",
+    ("amenity", "place_of_worship"): "worship",
+    ("amenity", "bus_station"): "bus",
+    ("highway", "bus_stop"): "bus",
+    ("amenity", "fuel"): "fuel",
+    ("amenity", "post_office"): "post",
+    ("amenity", "police"): "police",
+    ("amenity", "community_centre"): "community",
+    ("amenity", "social_facility"): "community",
+    ("amenity", "marketplace"): "shop",
+    ("shop", "*"): "shop",
+    ("tourism", "hotel"): "lodging",
+    ("tourism", "hostel"): "lodging",
+    ("tourism", "guest_house"): "lodging",
+    ("tourism", "motel"): "lodging",
+    ("tourism", "apartment"): "lodging",
+    ("tourism", "information"): "info",
+}
+# Tags that decide a thing is a place worth a symbol or a name on the map.
+POI_KEYS = ("amenity", "shop", "tourism", "healthcare", "highway", "leisure", "office", "historic", "man_made")
+# Things that are tagged but never worth a symbol (street furniture).
+POI_IGNORE = {
+    ("amenity", "bench"), ("amenity", "waste_basket"), ("amenity", "bicycle_parking"),
+    ("amenity", "shelter"), ("amenity", "drinking_water"), ("amenity", "lighting"),
+    ("amenity", "post_box"), ("amenity", "recycling"), ("amenity", "vending_machine"),
+    ("highway", "crossing"), ("highway", "traffic_signals"), ("highway", "street_lamp"),
+    ("highway", "turning_circle"), ("highway", "turning_loop"), ("highway", "give_way"),
+    ("highway", "stop"), ("highway", "speed_camera"), ("highway", "milestone"),
+}
+
+LAYER_NAMES = (
+    "landuse", "green", "water", "waterways", "sports", "parking",
+    "roads", "paths", "buildings", "pois", "trees",
+)
+
+_cache_lock = threading.Lock()
+_cache: dict = {"key": None, "payload": None, "version": None}
+
+
+def poi_icon_for(tags: dict):
+    """The icon for a tagged thing, or None. Looks at every tag."""
+    for key in POI_KEYS:
+        value = tags.get(key)
+        if value is None or (key, value) in POI_IGNORE:
+            continue
+        icon = POI_ICONS.get((key, value)) or POI_ICONS.get((key, "*"))
+        if icon:
+            return icon
+    return None
+
+
+def _layer_for(tags: dict, closed: bool):
+    """(layer, kind, is_polygon) for a way, or None when it is not drawn."""
+    highway = tags.get("highway")
+    if highway in ROAD_TYPES:
+        return "roads", highway, False
+    if highway in PATH_TYPES:
+        return "paths", highway, False
+    if "waterway" in tags:
+        return "waterways", tags["waterway"], False
+    if closed:
+        if "building" in tags:
+            return "buildings", tags["building"], True
+        if tags.get("amenity") == "parking":
+            return "parking", "parking", True
+        if tags.get("leisure") in SPORTS_LEISURE:
+            return "sports", tags["leisure"], True
+        if tags.get("natural") == "water" or tags.get("landuse") == "reservoir":
+            return "water", "water", True
+        landuse = tags.get("landuse")
+        natural = tags.get("natural")
+        leisure = tags.get("leisure")
+        if landuse in GREEN_LANDUSE or natural in GREEN_NATURAL or leisure in GREEN_LEISURE:
+            return "green", landuse or natural or leisure, True
+        if landuse:
+            return "landuse", landuse, True
+        if tags.get("amenity") in LANDUSE_AMENITY:
+            return "landuse", tags["amenity"], True
+    return None
+
+
+def _centroid(coords):
+    """
+    Centre of mass of a closed ring of [lon, lat] (falls back to the average).
+    Measured from the first corner: at real coordinates (33.41, -8.94) the
+    sums lose their accuracy otherwise (metres off for a large building).
+    """
+    pts = coords[:-1] if len(coords) > 1 and coords[0] == coords[-1] else coords
+    n = len(pts)
+    ox, oy = pts[0]
+    area2 = cx = cy = 0.0
+    for i in range(n):
+        x0, y0 = pts[i][0] - ox, pts[i][1] - oy
+        x1, y1 = pts[(i + 1) % n][0] - ox, pts[(i + 1) % n][1] - oy
+        cross = x0 * y1 - x1 * y0
+        area2 += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    if abs(area2) < 1e-18:
+        return [round(sum(p[0] for p in pts) / n, 6), round(sum(p[1] for p in pts) / n, 6)]
+    return [round(ox + cx / (3 * area2), 6), round(oy + cy / (3 * area2), 6)]
+
+
+def build_base_map(osm_path) -> dict:
+    """Read map.osm and return {version, bounds, layers}."""
+    nodes: dict[str, tuple[float, float]] = {}
+    tagged_nodes = []  # (lon, lat, tags) for nodes that carry tags
+    ways = []
+    for _event, el in ET.iterparse(str(osm_path), events=("end",)):
+        if el.tag == "node":
+            try:
+                lon = round(float(el.get("lon")), 6)
+                lat = round(float(el.get("lat")), 6)
+            except (TypeError, ValueError):
+                el.clear()
+                continue
+            nodes[el.get("id")] = (lon, lat)
+            tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
+            if tags:
+                tagged_nodes.append((lon, lat, tags))
+            el.clear()
+        elif el.tag == "way":
+            tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
+            refs = [nd.get("ref") for nd in el.findall("nd")]
+            ways.append((el.get("id"), tags, refs))
+            el.clear()
+
+    layers = {name: [] for name in LAYER_NAMES}
+    min_lon = min_lat = float("inf")
+    max_lon = max_lat = float("-inf")
+
+    def add_poi(lon, lat, tags):
+        """A symbol and/or a name at a point. Unnamed things still get a symbol."""
+        name = (tags.get("name") or "").strip()
+        icon = poi_icon_for(tags)
+        if icon is None and not name:
+            return
+        properties = {}
+        if icon:
+            properties["icon"] = icon
+        if name:
+            properties["name"] = name
+        layers["pois"].append(
+            {
+                "type": "Feature",
+                "properties": properties,
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            }
+        )
+
+    for lon, lat, tags in tagged_nodes:
+        if tags.get("natural") == "tree":
+            layers["trees"].append(
+                {
+                    "type": "Feature",
+                    "properties": {},
+                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                }
+            )
+            continue
+        add_poi(lon, lat, tags)
+
+    for way_id, tags, refs in ways:
+        coords = [list(nodes[r]) for r in refs if r in nodes]
+        if len(coords) < 2:
+            continue
+        closed = len(refs) >= 4 and refs[0] == refs[-1]
+        found = _layer_for(tags, closed)
+        if found is None:
+            continue
+        layer, kind, is_polygon = found
+
+        if is_polygon:
+            if coords[0] != coords[-1]:
+                coords.append(coords[0])
+            if len(coords) < 4:
+                continue
+            geometry = {"type": "Polygon", "coordinates": [coords]}
+        else:
+            geometry = {"type": "LineString", "coordinates": coords}
+
+        properties = {"kind": kind}
+        name = (tags.get("name") or "").strip()
+        if name:
+            properties["name"] = name
+        layers[layer].append(
+            {"type": "Feature", "properties": properties, "geometry": geometry}
+        )
+
+        # A building, car park or area that is also a place (library,
+        # dispensary, parking...) gets its symbol at its centre, with its name
+        # underneath. The polygon is marked `poi` so the app does not also
+        # write the name on the shape itself.
+        if is_polygon and layer in ("buildings", "parking", "sports", "landuse"):
+            icon = poi_icon_for(tags)
+            if icon:
+                properties["poi"] = True
+                lon, lat = _centroid(coords)
+                poi = {"icon": icon}
+                if name:
+                    poi["name"] = name
+                layers["pois"].append(
+                    {
+                        "type": "Feature",
+                        "properties": poi,
+                        "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                    }
+                )
+
+        for lon, lat in coords:
+            min_lon, max_lon = min(min_lon, lon), max(max_lon, lon)
+            min_lat, max_lat = min(min_lat, lat), max(max_lat, lat)
+
+    collections = {
+        name: {"type": "FeatureCollection", "features": feats}
+        for name, feats in layers.items()
+    }
+    bounds = (
+        [min_lon, min_lat, max_lon, max_lat] if min_lon != float("inf") else None
+    )
+
+    body = json.dumps(collections, sort_keys=True, separators=(",", ":"))
+    version = hashlib.sha1(body.encode("utf-8")).hexdigest()[:12]
+    return {"version": version, "bounds": bounds, "layers": collections}
+
+
+def get_base_map(osm_path=None):
+    """
+    The base map as (version, json_bytes), or None when map.osm is missing.
+    Cached; rebuilt when the file changes.
+    """
+    path = Path(osm_path or MAP_OSM_PATH)
+    if not path.exists():
+        return None
+
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+
+    with _cache_lock:
+        if _cache["key"] == key and _cache["payload"] is not None:
+            return _cache["version"], _cache["payload"]
+
+        data = build_base_map(path)
+        payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        _cache.update(key=key, payload=payload, version=data["version"])
+        logger.info(
+            "Base map built from %s: version %s, %d KB",
+            path.name, data["version"], len(payload) // 1024,
+        )
+        return data["version"], payload
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\cache_service.py ---
 
@@ -28582,6 +28949,128 @@ if __name__ == "__main__":
 
 
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\inspect_map_osm.py ---
+
+"""
+inspect_map_osm.py
+
+Shows what the outdoor map will draw from map.osm, and which tagged things
+have no symbol yet, so you know what to add or tag in JOSM.
+
+Run from the repo root:
+
+    python -m backend.pipeline.inspect_map_osm
+    python -m backend.pipeline.inspect_map_osm --osm backend/data/map.osm
+
+It only reads the file. Nothing is changed.
+"""
+
+import argparse
+import math
+import sys
+import xml.etree.ElementTree as ET
+from collections import Counter
+from pathlib import Path
+
+from backend.api.services import basemap_service as bm
+
+LAYER_LABELS = [
+    ("landuse", "land use (campus, housing...)"),
+    ("green", "grass, trees, parks"),
+    ("water", "water"),
+    ("waterways", "rivers and streams"),
+    ("sports", "pitches and sports grounds"),
+    ("parking", "parking areas"),
+    ("roads", "roads"),
+    ("paths", "footpaths and steps"),
+    ("buildings", "buildings"),
+    ("trees", "single trees"),
+    ("pois", "symbols and names (points)"),
+]
+
+
+def tag_report(osm_path):
+    """Every tagged thing with a place-like tag, grouped by key=value."""
+    seen = Counter()
+    named_points = []
+    for _event, el in ET.iterparse(str(osm_path), events=("end",)):
+        if el.tag in ("node", "way"):
+            tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
+            for key in bm.POI_KEYS:
+                value = tags.get(key)
+                if value is not None:
+                    seen[(key, value, el.tag)] += 1
+            if el.tag == "node" and tags.get("name") and bm.poi_icon_for(tags) is None:
+                named_points.append(tags["name"])
+            el.clear()
+    return seen, named_points
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Show what the outdoor map will draw.")
+    ap.add_argument("--osm", default="backend/data/map.osm")
+    args = ap.parse_args(argv)
+
+    path = Path(args.osm)
+    if not path.exists():
+        print(f"Cannot find {path}. Use --osm to point at map.osm.")
+        return 1
+
+    data = bm.build_base_map(path)
+    layers = data["layers"]
+    print(f"\nFile: {path}  ({path.stat().st_size / 1024:.0f} KB)")
+    if data["bounds"]:
+        lon0, lat0, lon1, lat1 = data["bounds"]
+        h = (lat1 - lat0) * 110540
+        w = (lon1 - lon0) * 111320 * math.cos(math.radians((lat0 + lat1) / 2))
+        print(f"Area covered: about {w:.0f} m x {h:.0f} m")
+
+    print("\nWhat the map will draw")
+    print(f"  {'layer':<34}{'drawn':>7}{'named':>8}")
+    for key, label in LAYER_LABELS:
+        feats = layers[key]["features"]
+        named = sum(1 for f in feats if f["properties"].get("name"))
+        print(f"  {label:<34}{len(feats):>7}{named:>8}")
+
+    icons = Counter(f["properties"].get("icon") for f in layers["pois"]["features"])
+    if icons:
+        print("\nSymbols that will show")
+        for icon, n in icons.most_common():
+            print(f"  {icon or '(name only, no symbol)':<26}{n}")
+
+    seen, named_points = tag_report(path)
+    no_symbol = {
+        (k, v, kind): n for (k, v, kind), n in seen.items()
+        if (k, v) not in bm.POI_ICONS and (k, "*") not in bm.POI_ICONS
+        and (k, v) not in bm.POI_IGNORE
+        and not (k == "leisure" and v in bm.SPORTS_LEISURE | bm.GREEN_LEISURE)
+        and not (k == "amenity" and v in bm.LANDUSE_AMENITY)
+        and not (k == "highway")
+    }
+    if no_symbol:
+        print("\nTagged in your file but with NO symbol yet (tell me if you want one)")
+        for (k, v, kind), n in sorted(no_symbol.items()):
+            print(f"  {k}={v:<24} {n} x {kind}")
+    if named_points:
+        print(f"\nNamed points shown as a name only: {', '.join(sorted(set(named_points))[:12])}"
+              + (" ..." if len(set(named_points)) > 12 else ""))
+
+    print("\nWhat this means")
+    if not layers["landuse"]["features"]:
+        print("  - No campus area. Draw a closed way around the campus tagged landuse=education"
+              " to get the pale yellow ground.")
+    if not layers["parking"]["features"] and icons.get("parking", 0) == 0:
+        print("  - No parking. Tag car parks amenity=parking (a closed way, or a single point).")
+    if not layers["buildings"]["features"]:
+        print("  - No buildings found.")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\knowledge_probe.py ---
 
 """
@@ -31465,6 +31954,284 @@ class TestWhoAmI:
     def test_whoami_without_token(self, client, temp_db):
         r = client.get("/api/admin/auth/me")
         assert r.status_code == 400
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_basemap.py ---
+
+"""Tests for the outdoor base map built from map.osm."""
+
+import json
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from backend.api.errors import http_exception_handler
+from backend.api.routers import basemap as basemap_router
+from backend.api.services import basemap_service
+
+OSM = """<?xml version='1.0' encoding='UTF-8'?>
+<osm version='0.6'>
+ <node id='1' lat='-8.9400' lon='33.4100'/>
+ <node id='2' lat='-8.9400' lon='33.4110'/>
+ <node id='3' lat='-8.9410' lon='33.4110'/>
+ <node id='4' lat='-8.9410' lon='33.4100'/>
+ <node id='5' lat='-8.9420' lon='33.4100'/>
+ <node id='6' lat='-8.9420' lon='33.4120'/>
+ <node id='7' lat='-8.9430' lon='33.4110'/>
+ <way id='10'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/>
+   <tag k='building' v='university'/><tag k='name' v='Library'/></way>
+ <way id='11'><nd ref='5'/><nd ref='6'/><tag k='highway' v='residential'/></way>
+ <way id='12'><nd ref='5'/><nd ref='7'/><tag k='highway' v='footway'/></way>
+ <way id='13'><nd ref='4'/><nd ref='5'/><nd ref='7'/><nd ref='4'/>
+   <tag k='landuse' v='grass'/><tag k='name' v='Quad'/></way>
+ <way id='14'><nd ref='2'/><nd ref='6'/><nd ref='7'/><nd ref='2'/><tag k='landuse' v='residential'/></way>
+ <way id='15'><nd ref='1'/><nd ref='7'/><tag k='barrier' v='fence'/></way>
+ <way id='16'><nd ref='1'/><nd ref='999'/><tag k='highway' v='footway'/></way>
+ <way id='17'><nd ref='1'/><nd ref='2'/><nd ref='3'/><tag k='building' v='yes'/></way>
+ <way id='18'><nd ref='3'/><nd ref='6'/><tag k='highway' v='proposed'/></way>
+</osm>
+"""
+
+
+@pytest.fixture
+def osm_file(tmp_path):
+    p = tmp_path / "map.osm"
+    p.write_text(OSM)
+    return p
+
+
+def test_the_right_things_go_in_the_right_layers(osm_file):
+    data = basemap_service.build_base_map(osm_file)
+    layers = data["layers"]
+    count = {k: len(v["features"]) for k, v in layers.items()}
+
+    assert count["buildings"] == 1                  # the open way "17" is not a closed building
+    assert count["roads"] == 1
+    assert count["paths"] == 1                      # way 16 has a missing node: only 1 point, skipped
+    assert count["green"] == 1
+    assert count["landuse"] == 1                    # residential land use, not green
+    assert count["water"] == 0 and count["waterways"] == 0
+
+
+def test_names_kinds_and_geometry(osm_file):
+    layers = basemap_service.build_base_map(osm_file)["layers"]
+    building = layers["buildings"]["features"][0]
+    assert building["properties"] == {"kind": "university", "name": "Library"}
+    ring = building["geometry"]["coordinates"][0]
+    assert building["geometry"]["type"] == "Polygon"
+    assert ring[0] == ring[-1] and len(ring) == 5
+    assert ring[0] == [33.41, -8.94]                # [lon, lat], the order MapLibre wants
+
+    road = layers["roads"]["features"][0]
+    assert road["geometry"]["type"] == "LineString"
+    assert road["properties"] == {"kind": "residential"}   # no name: no name key
+    assert layers["green"]["features"][0]["properties"]["name"] == "Quad"
+
+
+def test_unknown_and_unwanted_ways_are_left_out(osm_file):
+    data = basemap_service.build_base_map(osm_file)
+    everything = json.dumps(data["layers"])
+    assert "fence" not in everything and "proposed" not in everything
+
+
+def test_bounds_cover_what_is_drawn(osm_file):
+    b = basemap_service.build_base_map(osm_file)["bounds"]
+    assert b == [33.41, -8.943, 33.412, -8.94]
+
+
+def test_open_area_ring_is_closed_for_us():
+    # a landuse way that is closed in the file stays closed; polygons always end where they start
+    import tempfile, pathlib
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "m.osm").write_text(OSM)
+    ring = basemap_service.build_base_map(d / "m.osm")["layers"]["green"]["features"][0]["geometry"]["coordinates"][0]
+    assert ring[0] == ring[-1]
+
+
+def test_version_is_stable_and_changes_with_the_map(osm_file, tmp_path):
+    v1 = basemap_service.build_base_map(osm_file)["version"]
+    assert v1 == basemap_service.build_base_map(osm_file)["version"]
+
+    other = tmp_path / "other.osm"
+    other.write_text(OSM.replace("Library", "Library Block"))
+    assert basemap_service.build_base_map(other)["version"] != v1
+
+
+def test_a_missing_file_gives_none(tmp_path):
+    assert basemap_service.get_base_map(tmp_path / "nope.osm") is None
+
+
+def test_cache_is_reused_then_rebuilt_when_the_file_changes(osm_file):
+    first = basemap_service.get_base_map(osm_file)
+    assert basemap_service.get_base_map(osm_file) is not None
+    assert basemap_service.get_base_map(osm_file)[1] is first[1]       # same cached bytes
+
+    osm_file.write_text(OSM.replace("Library", "Science Block"))
+    second = basemap_service.get_base_map(osm_file)
+    assert second[0] != first[0]
+    assert b"Science Block" in second[1]
+
+
+@pytest.fixture
+def client(osm_file, monkeypatch):
+    monkeypatch.setattr(basemap_service, "MAP_OSM_PATH", osm_file)
+    app = FastAPI()
+    app.include_router(basemap_router.router)
+    from fastapi import HTTPException
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(Exception, http_exception_handler)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_endpoints(client):
+    full = client.get("/api/basemap")
+    assert full.status_code == 200
+    body = full.json()
+    assert set(body["layers"]) == set(basemap_service.LAYER_NAMES)
+    assert client.get("/api/basemap/version").json() == {"version": body["version"]}
+
+
+def test_endpoint_404_when_the_file_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(basemap_service, "MAP_OSM_PATH", tmp_path / "none.osm")
+    app = FastAPI()
+    app.include_router(basemap_router.router)
+    from fastapi import HTTPException
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(Exception, http_exception_handler)
+    c = TestClient(app, raise_server_exceptions=False)
+    assert c.get("/api/basemap").status_code == 404
+    assert c.get("/api/basemap/version").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Parking, pitches, symbols (points of interest) and trees
+# ---------------------------------------------------------------------------
+
+OSM2 = """<?xml version='1.0' encoding='UTF-8'?>
+<osm version='0.6'>
+ <node id='1' lat='-8.9400' lon='33.4100'/>
+ <node id='2' lat='-8.9400' lon='33.4110'/>
+ <node id='3' lat='-8.9410' lon='33.4110'/>
+ <node id='4' lat='-8.9410' lon='33.4100'/>
+ <node id='20' lat='-8.9500' lon='33.4200'>
+   <tag k='amenity' v='clinic'/><tag k='name' v='MUST Dispensary'/></node>
+ <node id='21' lat='-8.9501' lon='33.4201'><tag k='amenity' v='parking'/></node>
+ <node id='22' lat='-8.9502' lon='33.4202'><tag k='shop' v='kiosk'/></node>
+ <node id='23' lat='-8.9503' lon='33.4203'><tag k='amenity' v='bench'/></node>
+ <node id='24' lat='-8.9504' lon='33.4204'><tag k='natural' v='tree'/></node>
+ <node id='25' lat='-8.9505' lon='33.4205'><tag k='barrier' v='gate'/><tag k='name' v='MUST Main Gate'/></node>
+ <node id='26' lat='-8.9506' lon='33.4206'><tag k='highway' v='bus_stop'/></node>
+ <node id='27' lat='-8.9507' lon='33.4207'><tag k='highway' v='crossing'/></node>
+ <node id='28' lat='-8.9508' lon='33.4208'><tag k='amenity' v='fountain'/></node>
+ <way id='30'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/>
+   <tag k='building' v='yes'/><tag k='amenity' v='library'/><tag k='name' v='Dr. Magufuli Library'/></way>
+ <way id='31'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/>
+   <tag k='building' v='yes'/><tag k='name' v='Block 8D Hostel'/></way>
+ <way id='32'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/><tag k='amenity' v='parking'/></way>
+ <way id='33'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/>
+   <tag k='leisure' v='pitch'/><tag k='sport' v='volleyball'/><tag k='name' v='Volleyball'/></way>
+ <way id='34'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/>
+   <tag k='leisure' v='sports_centre'/><tag k='name' v='MUST Playgrounds'/></way>
+ <way id='35'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/>
+   <tag k='amenity' v='university'/><tag k='name' v='Mbeya University of Science and Technology'/></way>
+ <way id='36'><nd ref='1'/><nd ref='2'/><nd ref='3'/><nd ref='4'/><nd ref='1'/>
+   <tag k='landuse' v='education'/></way>
+ <way id='37'><nd ref='1'/><nd ref='3'/><tag k='highway' v='pedestrian'/></way>
+</osm>
+"""
+
+
+@pytest.fixture
+def osm2(tmp_path):
+    p = tmp_path / "map2.osm"
+    p.write_text(OSM2)
+    return basemap_service.build_base_map(p)["layers"]
+
+
+def _names(layer):
+    return [f["properties"].get("name") for f in layer["features"]]
+
+
+def test_parking_areas_pitches_and_sports_centres_have_their_own_layers(osm2):
+    assert len(osm2["parking"]["features"]) == 1
+    assert [f["properties"]["kind"] for f in osm2["sports"]["features"]] == ["pitch", "sports_centre"]
+    assert _names(osm2["sports"]) == ["Volleyball", "MUST Playgrounds"]
+
+
+def test_the_campus_education_area_goes_in_the_landuse_layer(osm2):
+    kinds = sorted(f["properties"]["kind"] for f in osm2["landuse"]["features"])
+    assert kinds == ["education", "university"]
+    assert "Mbeya University of Science and Technology" in _names(osm2["landuse"])
+
+
+def test_pedestrian_ways_are_drawn_as_roads(osm2):
+    assert [f["properties"]["kind"] for f in osm2["roads"]["features"]] == ["pedestrian"]
+
+
+def test_symbols_for_places_with_and_without_names(osm2):
+    pois = {(f["properties"].get("icon"), f["properties"].get("name")) for f in osm2["pois"]["features"]}
+    assert ("medical", "MUST Dispensary") in pois              # named clinic: symbol + name
+    assert ("parking", None) in pois                           # unnamed parking: symbol only
+    assert ("shop", None) in pois                              # unnamed kiosk
+    assert ("bus", None) in pois                               # bus stop
+    assert (None, "MUST Main Gate") in pois                    # named gate: name only, no symbol
+
+
+def test_street_furniture_and_unknown_unnamed_things_are_left_out(osm2):
+    icons = [f["properties"].get("icon") for f in osm2["pois"]["features"]]
+    text = json.dumps(osm2["pois"])
+    assert "bench" not in text and "crossing" not in text and "fountain" not in text
+    assert icons.count(None) == 1                               # only the named gate
+
+
+def test_trees_are_their_own_points(osm2):
+    assert len(osm2["trees"]["features"]) == 1
+    assert osm2["trees"]["features"][0]["geometry"]["type"] == "Point"
+    assert "natural" not in json.dumps(osm2["pois"])           # trees are not symbols
+
+
+def test_a_building_that_is_a_place_gets_one_symbol_at_its_centre_and_carries_the_name(osm2):
+    library = [f for f in osm2["pois"]["features"] if f["properties"].get("icon") == "library"]
+    assert len(library) == 1
+    assert library[0]["properties"]["name"] == "Dr. Magufuli Library"
+    lon, lat = library[0]["geometry"]["coordinates"]
+    assert lon == 33.4105 and lat == -8.9405   # the exact middle of the square
+
+
+def test_the_polygon_of_a_place_is_marked_so_its_name_is_not_written_twice(osm2):
+    by_name = {f["properties"].get("name"): f["properties"] for f in osm2["buildings"]["features"]}
+    assert by_name["Dr. Magufuli Library"].get("poi") is True
+    assert "poi" not in by_name["Block 8D Hostel"]              # an ordinary building keeps its own label
+
+
+def test_a_parking_area_gets_a_p_symbol_too(osm2):
+    assert osm2["parking"]["features"][0]["properties"].get("poi") is True
+    assert any(f["properties"].get("icon") == "parking" and f["geometry"]["coordinates"] == [33.4105, -8.9405]
+               for f in osm2["pois"]["features"])
+
+
+def test_icon_names_match_the_picture_files():
+    import pathlib
+    icons = set(basemap_service.POI_ICONS.values()) | {"generic"}
+    assets = pathlib.Path(__file__).resolve().parents[2] / "mobile" / "assets" / "poi"
+    if assets.exists():   # the picture files live in the app folder
+        have = {p.stem for p in assets.glob("*.png")}
+        assert icons - {"generic"} <= have
+
+
+def test_centroid_is_exact_at_real_coordinates():
+    # A 30 m x 12 m hall at the campus location. Measuring from the origin
+    # would put the centre metres out.
+    lat0, lon0 = -8.9402, 33.4103
+    import math
+    d_lat = 12 / 110540
+    d_lon = 30 / (111320 * math.cos(math.radians(8.94)))
+    ring = [[lon0, lat0], [lon0 + d_lon, lat0], [lon0 + d_lon, lat0 + d_lat], [lon0, lat0 + d_lat], [lon0, lat0]]
+    lon, lat = basemap_service._centroid(ring)
+    err_m = math.hypot((lon - (lon0 + d_lon / 2)) * 111320 * math.cos(math.radians(8.94)),
+                       (lat - (lat0 + d_lat / 2)) * 110540)
+    assert err_m < 0.2        # coordinates are rounded to 1e-6 degrees (about 0.1 m)
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_cache.py ---
 
@@ -41771,15 +42538,29 @@ import {
 
 import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
 import { IndoorMapView } from '@/components/IndoorMapView';
+import { OutdoorBaseMap } from '@/components/OutdoorBaseMap';
 import { haversineM, bearingDeg } from '@/utils/geo';
 import {
   CAMERA_MIN_INTERVAL_MS,
   CAMERA_MIN_MOVE_M,
   CAMERA_MIN_HEADING_DEG,
+  OUTDOOR_BASEMAP,
+  OUTDOOR_MAP_ATTRIBUTION,
 } from '@/constants/config';
 import { COLORS } from '@/constants/theme';
+import { OUTDOOR_BLANK_STYLE } from '@/constants/outdoorMapStyle';
+import { loadBaseMap } from '@/services/basemap';
 
+// The online map picture. Used when OUTDOOR_BASEMAP is 'openfreemap', and as
+// the fallback when your own map could not be loaded (no network and no saved
+// copy, or the server has no map file).
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
+
+// Which outdoor map to draw: 'own' = built from your map.osm (see
+// OutdoorBaseMap), 'openfreemap' = the online map picture. Set in config.js.
+const USE_OWN_BASEMAP = (OUTDOOR_BASEMAP ?? 'own') === 'own';
+// Credit line shown on your own map. Leave it as '' to hide it.
+const ATTRIBUTION_TEXT = OUTDOOR_MAP_ATTRIBUTION ?? '© OpenStreetMap contributors';
 const DEFAULT_CENTER = [39.2000, -6.7500];
 
 const CAMPUS_BOUNDS = {
@@ -41926,6 +42707,24 @@ export function RouteMap({
   // still initialising. On the walking screen (followBearing = true)
   // this state is set but never used.
   const [mapReady, setMapReady] = useState(false);
+
+  // Your own base map (roads, buildings...). null until loaded; if it cannot
+  // be had at all, baseMapFailed switches to the online map picture instead.
+  const [baseMap, setBaseMap] = useState(null);
+  const [baseMapFailed, setBaseMapFailed] = useState(false);
+  useEffect(() => {
+    if (!USE_OWN_BASEMAP) return undefined;
+    let cancelled = false;
+    loadBaseMap().then((data) => {
+      if (cancelled) return;
+      if (data) setBaseMap(data);
+      else setBaseMapFailed(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const useOwnBaseMap = USE_OWN_BASEMAP && !baseMapFailed;
 
   // Preview-only: 0°/180° flip. Chosen from the route's overall
   // bearing, toggled by the button. Irrelevant on the walking screen.
@@ -42176,7 +42975,7 @@ export function RouteMap({
     <View style={[styles.wrapper, style]}>
       <MapView
         style={styles.map}
-        mapStyle={MAP_STYLE}
+        mapStyle={useOwnBaseMap ? OUTDOOR_BLANK_STYLE : MAP_STYLE}
         logoEnabled={false}
         attributionEnabled={false}
         compassEnabled={followBearing}
@@ -42190,6 +42989,9 @@ export function RouteMap({
             heading: mapHeading != null ? mapHeading : 0,
           }}
         />
+
+        {/* The base map goes first, so everything below is drawn on top of it. */}
+        {useOwnBaseMap && baseMap ? <OutdoorBaseMap data={baseMap} /> : null}
 
         {lineGeoJSON ? (
           <ShapeSource id="routeSource" shape={lineGeoJSON}>
@@ -42272,6 +43074,14 @@ export function RouteMap({
         ) : null}
       </MapView>
 
+      {/* Credit for the map data, shown on your own map. Set the text in
+          config.js (OUTDOOR_MAP_ATTRIBUTION); '' hides it. */}
+      {useOwnBaseMap && baseMap && ATTRIBUTION_TEXT ? (
+        <View style={styles.attribution} pointerEvents="none">
+          <Text style={styles.attributionText}>{ATTRIBUTION_TEXT}</Text>
+        </View>
+      ) : null}
+
       {/* Preview flip button. Shows which compass direction is at the
           top of the screen right now. One press turns the map 180°. */}
       {showFlipButton ? (
@@ -42291,6 +43101,19 @@ export function RouteMap({
 }
 
 const styles = StyleSheet.create({
+  attribution: {
+    position: 'absolute',
+    left: 6,
+    bottom: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    backgroundColor: 'rgba(255, 255, 255, 0.7)',
+  },
+  attributionText: {
+    fontSize: 10,
+    color: '#444444',
+  },
   wrapper: {
     overflow: 'hidden',
   },
@@ -42324,6 +43147,8 @@ const styles = StyleSheet.create({
     color: COLORS.primaryDark,
   },
 });
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\NextClassBanner.jsx ---
 
@@ -42568,6 +43393,274 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
 });
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\OutdoorBaseMap.jsx ---
+
+// OutdoorBaseMap: draws the outdoor map from your own map.osm data
+// (ground, grass, pitches, parking, roads, paths, buildings, trees, symbols
+// and names) instead of using a map picture from a tile service.
+//
+// Rendered inside the outdoor <MapView>. It adds layers only; the route line,
+// the blue dot, the camera and the heading are drawn by MapView as before and
+// sit on top, because these layers are added first.
+//
+// Layer order, bottom to top:
+//   land use -> grass -> water -> sports -> parking -> roads -> paths
+//   -> buildings -> trees -> symbols -> names
+//
+// Symbols come first among the labels, so a symbol is never hidden by a name.
+
+import { useMemo } from 'react';
+import {
+  Images,
+  ShapeSource,
+  FillLayer,
+  LineLayer,
+  CircleLayer,
+  SymbolLayer,
+} from '@maplibre/maplibre-react-native';
+
+import {
+  OUTDOOR_COLORS as C,
+  LANDUSE_COLORS,
+  GREEN_COLORS,
+  SPORTS_FILL,
+  SPORTS_LINE,
+  POI_TEXT_COLORS,
+  kindColor,
+  OUTDOOR_LABEL_MIN_ZOOM,
+  OUTDOOR_SYMBOL_MIN_ZOOM,
+  OUTDOOR_TREE_MIN_ZOOM,
+} from '@/constants/outdoorMapStyle';
+import { POI_IMAGES } from '@/constants/poiIcons';
+import { labelPointsFor } from '@/utils/basemapLabels';
+
+// Line widths grow with the zoom, so a road stays road-shaped from the whole
+// campus down to a few metres.
+const ROAD_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 14, 0.8, 17, 4, 19, 12, 21, 36];
+const ROAD_CASING_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 14, 1.4, 17, 6, 19, 16, 21, 44];
+const MINOR_ROAD_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 15, 0.6, 17, 2.4, 19, 7, 21, 22];
+const MINOR_ROAD_CASING_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 15, 1.2, 17, 3.6, 19, 9.5, 21, 28];
+// Footpaths: wider than before so the white dots read clearly on the milk ground.
+const PATH_WIDTH = ['interpolate', ['linear'], ['zoom'], 15, 1, 17, 2.4, 19, 4.6, 21, 9];
+const WATERWAY_WIDTH = ['interpolate', ['linear'], ['zoom'], 14, 0.8, 18, 4, 21, 14];
+const NAME_SIZE = ['interpolate', ['linear'], ['zoom'], 16, 10, 19, 12];
+const ICON_SIZE = ['interpolate', ['linear'], ['zoom'], 15, 0.2, 17, 0.28, 19, 0.38, 21, 0.5];
+const TREE_RADIUS = ['interpolate', ['linear'], ['zoom'], 17, 1.5, 19, 3.5, 21, 8];
+
+// Small roads are drawn narrower than main ones.
+const MINOR_ROADS = ['service', 'living_street', 'pedestrian', 'track'];
+const isKind = (...kinds) => ['in', ['get', 'kind'], ['literal', kinds]];
+const isMinor = isKind(...MINOR_ROADS);
+const roadFillColor = ['match', ['get', 'kind'], 'pedestrian', C.roadPedestrian, C.road];
+
+const EMPTY = { type: 'FeatureCollection', features: [] };
+
+function nameStyle(color, extra = {}) {
+  return {
+    textField: ['get', 'name'],
+    textFont: ['Noto Sans Regular'],
+    textSize: NAME_SIZE,
+    textMaxWidth: 7,
+    textColor: color,
+    textHaloColor: C.halo,
+    textHaloWidth: 1.5,
+    textAnchor: 'center',
+    textJustify: 'center',
+    textAllowOverlap: false,
+    textRotationAlignment: 'viewport',
+    textPitchAlignment: 'viewport',
+    ...extra,
+  };
+}
+
+const POI_TEXT_COLOR = kindColor(POI_TEXT_COLORS, 'icon');
+
+export function OutdoorBaseMap({ data }) {
+  const layers = data?.layers ?? {};
+  const get = (name) => layers[name] ?? EMPTY;
+
+  // Names sit at the middle of their shape. Shapes that carry a symbol
+  // (library, dispensary, parking...) show their name under the symbol
+  // instead, so they are left out here.
+  const buildingNames = useMemo(() => labelPointsFor(get('buildings')), [data]);
+  const sportsNames = useMemo(() => labelPointsFor(get('sports')), [data]);
+  const greenNames = useMemo(() => labelPointsFor(get('green')), [data]);
+  const landNames = useMemo(() => labelPointsFor(get('landuse')), [data]);
+
+  return (
+    <>
+      <Images images={POI_IMAGES} />
+
+      <ShapeSource id="base-landuse" shape={get('landuse')}>
+        <FillLayer
+          id="base-landuse-fill"
+          style={{ fillColor: kindColor(LANDUSE_COLORS), fillOpacity: 1 }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-green" shape={get('green')}>
+        <FillLayer
+          id="base-green-fill"
+          style={{ fillColor: kindColor(GREEN_COLORS), fillOpacity: 1 }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-water" shape={get('water')}>
+        <FillLayer id="base-water-fill" style={{ fillColor: C.water, fillOpacity: 1 }} />
+      </ShapeSource>
+      <ShapeSource id="base-waterways" shape={get('waterways')}>
+        <LineLayer
+          id="base-waterways-line"
+          style={{ lineColor: C.water, lineWidth: WATERWAY_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-sports" shape={get('sports')}>
+        <FillLayer
+          id="base-sports-fill"
+          style={{ fillColor: kindColor(SPORTS_FILL), fillOpacity: 1 }}
+        />
+        <LineLayer
+          id="base-sports-line"
+          style={{ lineColor: kindColor(SPORTS_LINE), lineWidth: 1, lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-parking" shape={get('parking')}>
+        <FillLayer id="base-parking-fill" style={{ fillColor: C.parkingFill, fillOpacity: 1 }} />
+        <LineLayer
+          id="base-parking-line"
+          style={{ lineColor: C.parkingLine, lineWidth: 1, lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-roads" shape={get('roads')}>
+        {/* All the grey edges first, then all the roads on top, so junctions are clean. */}
+        <LineLayer
+          id="base-roads-casing-minor"
+          filter={['all', isMinor, ['!=', ['get', 'kind'], 'track']]}
+          style={{ lineColor: C.roadCasing, lineWidth: MINOR_ROAD_CASING_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-casing"
+          filter={['!', isMinor]}
+          style={{ lineColor: C.roadCasing, lineWidth: ROAD_CASING_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-fill-minor"
+          filter={['all', isMinor, ['!=', ['get', 'kind'], 'track']]}
+          style={{ lineColor: roadFillColor, lineWidth: MINOR_ROAD_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-fill"
+          filter={['!', isMinor]}
+          style={{ lineColor: roadFillColor, lineWidth: ROAD_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-track"
+          filter={isKind('track')}
+          style={{ lineColor: C.track, lineWidth: PATH_WIDTH, lineDasharray: [3, 1.5], lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-paths" shape={get('paths')}>
+        {/* Footpaths are drawn as white dots, steps as short white dashes. */}
+        <LineLayer
+          id="base-paths-walk"
+          filter={['!', isKind('steps')]}
+          style={{ lineColor: C.path, lineWidth: PATH_WIDTH, lineDasharray: [0.1, 2], lineCap: 'round' }}
+        />
+        <LineLayer
+          id="base-paths-steps"
+          filter={isKind('steps')}
+          style={{ lineColor: C.path, lineWidth: PATH_WIDTH, lineDasharray: [0.8, 0.6] }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-buildings" shape={get('buildings')}>
+        <FillLayer id="base-buildings-fill" style={{ fillColor: C.buildingFill, fillOpacity: 1 }} />
+        <LineLayer
+          id="base-buildings-line"
+          style={{ lineColor: C.buildingLine, lineWidth: 1, lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-trees" shape={get('trees')}>
+        <CircleLayer
+          id="base-trees-dot"
+          minZoomLevel={OUTDOOR_TREE_MIN_ZOOM}
+          style={{
+            circleRadius: TREE_RADIUS,
+            circleColor: C.treeFill,
+            circleStrokeColor: C.treeLine,
+            circleStrokeWidth: 0.75,
+          }}
+        />
+      </ShapeSource>
+
+      {/* Symbols and their names (symbols have priority over the names below). */}
+      <ShapeSource id="base-pois" shape={get('pois')}>
+        <SymbolLayer
+          id="base-pois-icon"
+          minZoomLevel={OUTDOOR_SYMBOL_MIN_ZOOM}
+          filter={['has', 'icon']}
+          style={{
+            iconImage: ['get', 'icon'],
+            iconSize: ICON_SIZE,
+            iconAllowOverlap: false,
+            textOptional: true,
+            ...nameStyle(POI_TEXT_COLOR, {
+              textAnchor: 'top',
+              textOffset: [0, 1.1],
+              textOptional: true,
+            }),
+          }}
+        />
+        <SymbolLayer
+          id="base-pois-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          filter={['!', ['has', 'icon']]}
+          style={nameStyle(C.text)}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-landuse-names" shape={landNames}>
+        <SymbolLayer
+          id="base-landuse-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM - 1}
+          style={nameStyle(C.landText, {
+            textSize: ['interpolate', ['linear'], ['zoom'], 15, 12, 19, 17],
+            textMaxWidth: 10,
+            textLetterSpacing: 0.12,
+          })}
+        />
+      </ShapeSource>
+      <ShapeSource id="base-sports-names" shape={sportsNames}>
+        <SymbolLayer
+          id="base-sports-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          style={nameStyle(C.areaText)}
+        />
+      </ShapeSource>
+      <ShapeSource id="base-green-names" shape={greenNames}>
+        <SymbolLayer
+          id="base-green-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          style={nameStyle(C.areaText)}
+        />
+      </ShapeSource>
+      <ShapeSource id="base-building-names" shape={buildingNames}>
+        <SymbolLayer
+          id="base-building-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          style={nameStyle(C.text)}
+        />
+      </ShapeSource>
+    </>
+  );
+}
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\PhotoCarousel.jsx ---
 
@@ -44219,7 +45312,7 @@ export const ALL_CATEGORIES = null;
 // App-wide configuration read from environment variables and shared
 // constants.
 
-const DEFAULT_API_BASE_URL = 'http://192.168.100.149:8000';
+const DEFAULT_API_BASE_URL = 'http://192.168.100.148:8000';
 
 export const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
@@ -44396,6 +45489,14 @@ export const INDOOR_LEG_END_DOT_BORDER_WIDTH = 1;          // thickness of its d
 // How faint the rest of the route gets while a leg is highlighted (1 = no fade)
 export const INDOOR_ROUTE_FADED_OPACITY = 1;
 
+//   'openfreemap' the online map picture, as before.
+export const OUTDOOR_BASEMAP = "own";
+
+// Credit line on your own map. If any of map.osm came from OpenStreetMap,
+// keep this. Set it to "" only if every part of the file is your own drawing.
+export const OUTDOOR_MAP_ATTRIBUTION = "© OpenStreetMap contributors";
+
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\icons.js ---
 
@@ -44493,6 +45594,177 @@ export const INTENTS = [
   { key: 'toilet',  labelKey: 'intents.toilet', iconKey: 'toilet' },
   { key: 'prayer',  labelKey: 'intents.prayer', iconKey: 'prayer' },
 ];
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\outdoorMapStyle.js ---
+
+// How the outdoor map looks when it is drawn from your own map.osm.
+// Change a colour here and reload the app.
+//
+// Used by components/OutdoorBaseMap.jsx and components/MapView.jsx.
+
+export const OUTDOOR_COLORS = {
+  land: '#f8f4f0', // the ground: milk white (outside any area)
+  buildingFill: '#d9d0c9',
+  buildingLine: '#c6b9ab',
+  road: '#ffffff',
+  roadPedestrian: '#ededed',
+  roadCasing: '#bbbbbb', // the grey edge of a road
+  track: '#996703', // dirt tracks (dashed)
+  path: '#ffffff', // footpaths: white dots, so they stand out from the milk ground
+  parkingFill: '#eeeeee',
+  parkingLine: '#cfc8bd',
+  water: '#aad3df',
+  treeFill: '#add19e',
+  treeLine: '#8cb87d',
+  halo: '#ffffff', // outline around text so it reads on any colour
+
+  // Names
+  text: '#444444', // building names
+  areaText: '#3b7a5a', // pitches, parks, sports grounds
+  landText: '#6b6b52', // the campus itself
+  brownText: '#734a08', // library, food, banks...
+  redText: '#bf0000', // clinics and the dispensary
+  blueText: '#0066aa', // parking, buses
+  purpleText: '#ac39ac', // shops
+};
+
+// Land that is not green. "education" is the campus itself: the same milk white
+// as the ground, so paths and buildings stand out from it.
+export const LANDUSE_COLORS = {
+  education: '#f8f4f0',
+  university: '#f8f4f0',
+  college: '#f8f4f0',
+  school: '#f8f4f0',
+  kindergarten: '#f8f4f0',
+  hospital: '#f8f4f0',
+  clinic: '#f8f4f0',
+  residential: '#e0dfdf',
+  commercial: '#f2dad9',
+  retail: '#ffd6d1',
+  industrial: '#ebdbe8',
+  military: '#f3e6e6',
+  religious: '#cdebb0',
+  construction: '#c7c7b4',
+  brownfield: '#b9a979',
+  default: '#ecebdf',
+};
+
+// Green ground.
+export const GREEN_COLORS = {
+  grass: '#cdebb0',
+  meadow: '#cdebb0',
+  greenfield: '#cdebb0',
+  village_green: '#cdebb0',
+  garden: '#cdebb0',
+  park: '#c8facc',
+  recreation_ground: '#dffce2',
+  forest: '#add19e',
+  wood: '#add19e',
+  scrub: '#c8d7ab',
+  grassland: '#cdebb0',
+  heath: '#d6d99f',
+  wetland: '#d2e0c9',
+  farmland: '#eef0d5',
+  orchard: '#aedfa3',
+  vineyard: '#aedfa3',
+  allotments: '#c9e1bf',
+  nature_reserve: '#cdebb0',
+  cemetery: '#aacbaf',
+  default: '#cdebb0',
+};
+
+// Pitches, courts, stadiums, pools.
+export const SPORTS_FILL = {
+  pitch: '#88e0be',
+  sports_centre: '#dffce2',
+  stadium: '#dffce2',
+  track: '#74dcba',
+  swimming_pool: '#aad3df',
+  playground: '#ccffff',
+  golf_course: '#b5e3b5',
+  miniature_golf: '#b5e3b5',
+  default: '#88e0be',
+};
+export const SPORTS_LINE = {
+  pitch: '#5fb99a',
+  sports_centre: '#9ad6ae',
+  stadium: '#9ad6ae',
+  track: '#5fb99a',
+  swimming_pool: '#7fb7c6',
+  playground: '#8fd1d1',
+  default: '#5fb99a',
+};
+
+// Name colour by symbol, as on openstreetmap.org.
+export const POI_TEXT_COLORS = {
+  medical: OUTDOOR_COLORS.redText,
+  parking: OUTDOOR_COLORS.blueText,
+  bus: OUTDOOR_COLORS.blueText,
+  toilets: OUTDOOR_COLORS.blueText,
+  lodging: OUTDOOR_COLORS.blueText,
+  info: OUTDOOR_COLORS.blueText,
+  fuel: OUTDOOR_COLORS.blueText,
+  police: OUTDOOR_COLORS.blueText,
+  shop: OUTDOOR_COLORS.purpleText,
+  default: OUTDOOR_COLORS.brownText,
+};
+
+/** A MapLibre expression that picks a colour by the feature's "kind". */
+export function kindColor(table, property = 'kind') {
+  const { default: fallback, ...rest } = table;
+  const pairs = Object.entries(rest).flat();
+  return ['match', ['get', property], ...pairs, fallback];
+}
+
+// Names show from this zoom. Lower = names appear sooner (more clutter).
+export const OUTDOOR_LABEL_MIN_ZOOM = 16;
+// Symbols (parking, dispensary...) show from this zoom.
+export const OUTDOOR_SYMBOL_MIN_ZOOM = 15.5;
+// Trees show from this zoom.
+export const OUTDOOR_TREE_MIN_ZOOM = 17;
+
+// A blank map: just the ground colour. Everything else is drawn on top from
+// your data. The text fonts still come from the same free font server the
+// indoor map uses (fonts only, no map pictures).
+export const OUTDOOR_BLANK_STYLE = JSON.stringify({
+  version: 8,
+  name: 'outdoor-blank',
+  glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+  sources: {},
+  layers: [
+    {
+      id: 'background',
+      type: 'background',
+      paint: { 'background-color': OUTDOOR_COLORS.land },
+    },
+  ],
+});
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\poiIcons.js ---
+
+// The map symbols. One picture per icon name; the names are the ones the
+// server sends (POI_ICONS in backend/api/services/basemap_service.py).
+// Redraw or change them with assets/poi/make_icons.py.
+
+export const POI_IMAGES = {
+  parking: require('../assets/poi/parking.png'),
+  library: require('../assets/poi/library.png'),
+  medical: require('../assets/poi/medical.png'),
+  food: require('../assets/poi/food.png'),
+  bank: require('../assets/poi/bank.png'),
+  toilets: require('../assets/poi/toilets.png'),
+  worship: require('../assets/poi/worship.png'),
+  bus: require('../assets/poi/bus.png'),
+  shop: require('../assets/poi/shop.png'),
+  lodging: require('../assets/poi/lodging.png'),
+  post: require('../assets/poi/post.png'),
+  info: require('../assets/poi/info.png'),
+  fuel: require('../assets/poi/fuel.png'),
+  police: require('../assets/poi/police.png'),
+  community: require('../assets/poi/community.png'),
+  generic: require('../assets/poi/generic.png'),
+};
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\constants\profiles.js ---
 
@@ -63849,6 +65121,19 @@ export async function getPlaceByQr(code) {
 }
 
 /**
+ * The outdoor base map (roads, paths, buildings, grass) built from map.osm.
+ * Used by services/basemap.js.
+ */
+export async function getBaseMap() {
+  return request('/api/basemap');
+}
+
+/** Just its version, to skip the download when the saved copy is current. */
+export async function getBaseMapVersion() {
+  return request('/api/basemap/version');
+}
+
+/**
  * Category and intent counts, for hiding empty chips.
  * Returns { categories: {...}, intents: {...} }.
  */
@@ -64118,6 +65403,78 @@ export async function getHealth() {
   return request('/api/health');
 }
 
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\basemap.js ---
+
+// Loads the outdoor base map from the server and keeps a copy on the phone.
+//
+// Order of events:
+//   1. Use the copy already in memory (opened a map earlier this session).
+//   2. Otherwise read the saved copy from the phone.
+//   3. Ask the server only for the version number. Same version = use the
+//      saved copy, no download. Different (the map was updated) = download.
+//   4. No network? Use the saved copy. No saved copy either? Return null and
+//      the map falls back to the online map picture.
+
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+import { getBaseMap, getBaseMapVersion } from '@/services/api';
+
+const KEY = 'basemap-cache-v1';
+// Android reads each saved value through a ~2 MB window. A campus map is a
+// few hundred KB; this guard just stops us saving something too big to read.
+const MAX_SAVED_CHARS = 1_500_000;
+
+let memory = null;
+let inflight = null;
+
+async function readSaved() {
+  try {
+    const raw = await AsyncStorage.getItem(KEY);
+    const saved = raw ? JSON.parse(raw) : null;
+    return saved && saved.layers ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+async function load() {
+  const saved = await readSaved();
+  try {
+    if (saved) {
+      const { version } = await getBaseMapVersion();
+      if (version === saved.version) return saved;
+    }
+    const fresh = await getBaseMap();
+    if (fresh && fresh.layers) {
+      const text = JSON.stringify(fresh);
+      if (text.length <= MAX_SAVED_CHARS) {
+        AsyncStorage.setItem(KEY, text).catch(() => {});
+      }
+      return fresh;
+    }
+  } catch {
+    // Offline, or the server has no map file: fall through to the saved copy.
+  }
+  return saved;
+}
+
+/** The base map, or null if there is none to be had. Never throws. */
+export function loadBaseMap() {
+  if (memory) return Promise.resolve(memory);
+  if (!inflight) {
+    inflight = load()
+      .then((data) => {
+        memory = data;
+        return data;
+      })
+      .finally(() => {
+        inflight = null;
+      });
+  }
+  return inflight;
+}
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\services\compass.js ---
@@ -65105,6 +66462,34 @@ export function messageForResult(result, ssid) {
       return `Couldn't connect. Open Settings → Wi-Fi to join "${ssid}".`;
   }
 }
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\basemapLabels.js ---
+
+// One label point per named area (building, grass area...), at the visual
+// centre of the shape, so each name sits in the middle of what it names.
+// Shapes marked `poi` carry a symbol and show their name under it, so they
+// get no label here.
+
+import { polygonLabelPoint } from '@/utils/polygonLabel';
+
+/** FeatureCollection of polygons -> FeatureCollection of named Points. */
+export function labelPointsFor(featureCollection) {
+  const features = [];
+  for (const feature of featureCollection?.features ?? []) {
+    const name = feature?.properties?.name;
+    const ring = feature?.geometry?.coordinates?.[0];
+    if (!name || !ring || feature.properties.poi) continue;
+    const point = polygonLabelPoint(ring);
+    if (!point) continue;
+    features.push({
+      type: 'Feature',
+      properties: { name },
+      geometry: { type: 'Point', coordinates: point },
+    });
+  }
+  return { type: 'FeatureCollection', features };
+}
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\format.js ---
 
@@ -66374,6 +67759,155 @@ describe('response handling', () => {
   });
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\basemap.test.js ---
+
+// The base map loader: server, saved copy, and what happens offline.
+
+jest.mock('@react-native-async-storage/async-storage', () => {
+  const store = {};
+  return {
+    __esModule: true,
+    default: {
+      getItem: jest.fn(async (k) => (k in store ? store[k] : null)),
+      setItem: jest.fn(async (k, v) => {
+        store[k] = v;
+      }),
+      __store: store,
+    },
+  };
+});
+
+jest.mock('@/services/api', () => ({
+  getBaseMap: jest.fn(),
+  getBaseMapVersion: jest.fn(),
+}));
+
+const map = (version, extra = {}) => ({
+  version,
+  bounds: [0, 0, 1, 1],
+  layers: { buildings: { type: 'FeatureCollection', features: [] } },
+  ...extra,
+});
+
+let api, storage, loadBaseMap;
+
+beforeEach(() => {
+  jest.resetModules(); // the loader keeps a copy in memory, so start fresh
+  api = require('@/services/api');
+  storage = require('@react-native-async-storage/async-storage').default;
+  Object.keys(storage.__store).forEach((k) => delete storage.__store[k]);
+  ({ loadBaseMap } = require('@/services/basemap'));
+});
+
+test('downloads the map and saves it when nothing is saved yet', async () => {
+  api.getBaseMap.mockResolvedValue(map('v1'));
+  const result = await loadBaseMap();
+  expect(result.version).toBe('v1');
+  expect(api.getBaseMapVersion).not.toHaveBeenCalled(); // nothing saved to compare
+  expect(JSON.parse(storage.__store['basemap-cache-v1']).version).toBe('v1');
+});
+
+test('uses the saved copy when the server says the version is the same', async () => {
+  storage.__store['basemap-cache-v1'] = JSON.stringify(map('v1'));
+  api.getBaseMapVersion.mockResolvedValue({ version: 'v1' });
+  const result = await loadBaseMap();
+  expect(result.version).toBe('v1');
+  expect(api.getBaseMap).not.toHaveBeenCalled(); // no download
+});
+
+test('downloads again when the map was updated', async () => {
+  storage.__store['basemap-cache-v1'] = JSON.stringify(map('v1'));
+  api.getBaseMapVersion.mockResolvedValue({ version: 'v2' });
+  api.getBaseMap.mockResolvedValue(map('v2'));
+  const result = await loadBaseMap();
+  expect(result.version).toBe('v2');
+  expect(JSON.parse(storage.__store['basemap-cache-v1']).version).toBe('v2');
+});
+
+test('offline with a saved copy: uses the saved copy', async () => {
+  storage.__store['basemap-cache-v1'] = JSON.stringify(map('v1'));
+  api.getBaseMapVersion.mockRejectedValue(new Error('Network request failed'));
+  const result = await loadBaseMap();
+  expect(result.version).toBe('v1');
+});
+
+test('offline with nothing saved: null, so the app falls back to the online map', async () => {
+  api.getBaseMap.mockRejectedValue(new Error('Network request failed'));
+  expect(await loadBaseMap()).toBeNull();
+});
+
+test('a server without a map file: null', async () => {
+  api.getBaseMap.mockRejectedValue(new Error('The map file (map.osm) was not found'));
+  expect(await loadBaseMap()).toBeNull();
+});
+
+test('a damaged saved copy is ignored', async () => {
+  storage.__store['basemap-cache-v1'] = '{not json';
+  api.getBaseMap.mockResolvedValue(map('v3'));
+  expect((await loadBaseMap()).version).toBe('v3');
+});
+
+test('the second call in a session does not touch the network', async () => {
+  api.getBaseMap.mockResolvedValue(map('v1'));
+  await loadBaseMap();
+  await loadBaseMap();
+  expect(api.getBaseMap).toHaveBeenCalledTimes(1);
+});
+
+test('two screens asking at once share one request', async () => {
+  api.getBaseMap.mockResolvedValue(map('v1'));
+  await Promise.all([loadBaseMap(), loadBaseMap()]);
+  expect(api.getBaseMap).toHaveBeenCalledTimes(1);
+});
+
+test('a map too big to save safely is used but not saved', async () => {
+  const big = map('big', { padding: 'x'.repeat(1_600_000) });
+  api.getBaseMap.mockResolvedValue(big);
+  const result = await loadBaseMap();
+  expect(result.version).toBe('big');
+  expect(storage.setItem).not.toHaveBeenCalled();
+});
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\basemapLabels.test.js ---
+
+import { labelPointsFor } from '@/utils/basemapLabels';
+
+const square = (name) => ({
+  type: 'Feature',
+  properties: name ? { name } : {},
+  geometry: { type: 'Polygon', coordinates: [[[0, 0], [2, 0], [2, 2], [0, 2], [0, 0]]] },
+});
+
+describe('labelPointsFor', () => {
+  test('one point at the middle of each named polygon', () => {
+    const out = labelPointsFor({ type: 'FeatureCollection', features: [square('Library')] });
+    expect(out.features.length).toBe(1);
+    expect(out.features[0].properties.name).toBe('Library');
+    expect(out.features[0].geometry.type).toBe('Point');
+    const [lon, lat] = out.features[0].geometry.coordinates;
+    expect(Math.abs(lon - 1) < 1e-9 && Math.abs(lat - 1) < 1e-9).toBe(true);
+  });
+
+  test('unnamed shapes get no label', () => {
+    const out = labelPointsFor({ type: 'FeatureCollection', features: [square(null), square('Hall')] });
+    expect(out.features.length).toBe(1);
+  });
+
+  test('a shape that carries a symbol gets no label (its name goes under the symbol)', () => {
+    const library = square('Library');
+    library.properties.poi = true;
+    const out = labelPointsFor({ type: 'FeatureCollection', features: [library, square('Hostel')] });
+    expect(out.features.map((f) => f.properties.name)).toEqual(['Hostel']);
+  });
+
+  test('missing or empty data does not crash', () => {
+    expect(labelPointsFor(null).features).toEqual([]);
+    expect(labelPointsFor({ features: [{ properties: { name: 'x' } }] }).features).toEqual([]);
+  });
+});
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\format.test.js ---
 
 // Tests for utils/format.js.
@@ -66816,6 +68350,318 @@ describe('polygonLabelInfo', () => {
   test('nothing for no polygon', () => {
     expect(polygonLabelInfo([])).toBeNull();
   });
+});
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\legBearing.test.js ---
+
+import { headingAlongRoute, legBearing } from '@/utils/legBearing';
+import { headingLabel } from '@/utils/headingLabel';
+
+// A point `eastM` metres east and `northM` metres north of a start (near -8.94 S).
+const P = (eastM, northM) => ({
+  lat: -8.94 + northM / 110540,
+  lon: 33.41 + eastM / (111320 * Math.cos((8.94 * Math.PI) / 180)),
+});
+const near = (a, b, tol) => Math.abs(((a - b + 540) % 360) - 180) <= tol;
+
+describe('legBearing', () => {
+  test('a straight road east is 90', () => {
+    expect(near(legBearing([P(0, 0), P(5, 0), P(12, 0), P(20, 0)]), 90, 1)).toBe(true);
+  });
+
+  test('a diagonal road (not on a compass point) keeps its real angle', () => {
+    // 30 degrees east of north
+    const d = (m) => P(m * Math.sin(Math.PI / 6), m * Math.cos(Math.PI / 6));
+    expect(near(legBearing([d(0), d(6), d(14), d(25)]), 30, 1)).toBe(true);
+  });
+
+  test('small zig-zags along a straight road do not matter', () => {
+    const pts = [P(0, 0), P(2.5, 0.4), P(5, -0.3), P(8, 0.3), P(11, -0.2), P(15, 0)];
+    expect(near(legBearing(pts), 90, 5)).toBe(true);
+  });
+
+  test('it stops at a corner: the leg is the part before the turn', () => {
+    // 12 m east, then 12 m north
+    const pts = [P(0, 0), P(6, 0), P(12, 0), P(12, 6), P(12, 12)];
+    expect(near(legBearing(pts), 90, 8)).toBe(true);
+  });
+
+  test('a first piece shorter than 3 m is ignored, like before', () => {
+    expect(near(legBearing([P(0, 0), P(1, 0), P(8, 0)]), 90, 1)).toBe(true);
+  });
+
+  test('no usable direction at the very end of the route', () => {
+    expect(legBearing([P(0, 0)])).toBeNull();
+    expect(legBearing([P(0, 0), P(1, 0)])).toBeNull();
+    expect(legBearing(null)).toBeNull();
+  });
+
+  test('a gentle curve is followed for a while', () => {
+    // quarter circle of radius 30 m, from heading north towards east
+    const pts = [];
+    for (let a = 0; a <= 90; a += 6) {
+      const r = (a * Math.PI) / 180;
+      pts.push(P(30 - 30 * Math.cos(r), 30 * Math.sin(r)));
+    }
+    const b = legBearing(pts);
+    expect(b > 5 && b < 60).toBe(true); // turned towards east, but not all the way
+  });
+});
+
+describe('headingLabel', () => {
+  test('90 and 45 give the 8 compass points', () => {
+    expect(headingLabel(0, 90)).toBe('N');
+    expect(headingLabel(45, 45)).toBe('NE');
+    expect(headingLabel(180, 45)).toBe('S');
+    expect(headingLabel(315, 45)).toBe('NW');
+  });
+  test('22.5 gives 16 directions', () => {
+    expect(headingLabel(22.5, 22.5)).toBe('NNE');
+    expect(headingLabel(67.5, 22.5)).toBe('ENE');
+    expect(headingLabel(202.5, 22.5)).toBe('SSW');
+  });
+  test('0 (exact) shows the real angle', () => {
+    expect(headingLabel(137.4, 0)).toBe('137°');
+    expect(headingLabel(359.7, 0)).toBe('0°');
+    expect(headingLabel(0, undefined)).toBe('0°');
+  });
+});
+
+
+// Geometry for a point at a bearing (degrees) and distance (metres) from another.
+const go = (p, bearingDegrees, metres) => {
+  const r = (bearingDegrees * Math.PI) / 180;
+  return {
+    lat: p.lat + (metres * Math.cos(r)) / 110540,
+    lon: p.lon + (metres * Math.sin(r)) / (111320 * Math.cos((8.94 * Math.PI) / 180)),
+  };
+};
+
+describe('headingAlongRoute: the start of a route', () => {
+  // Standing at a room door: a 2 m stub east into the corridor, then a
+  // corridor that runs at 300 degrees. The first step faces the first leg the
+  // walker actually takes, which is the stub (east, 90).
+  const door = P(0, 0);
+  const corridorStart = go(door, 90, 2);
+  const corridor = [corridorStart, go(corridorStart, 300, 3), go(corridorStart, 300, 14), go(corridorStart, 300, 26)];
+  const route = [door, ...corridor];
+
+  test('the first step faces the first real leg: the door stub', () => {
+    expect(near(headingAlongRoute(route, { isRouteStart: true }), 90, 2)).toBe(true);
+  });
+
+  test('a 3 m stub is faced too, not the corridor beyond it', () => {
+    const stubEnd = go(door, 90, 3.2);
+    const longStub = [door, stubEnd, go(stubEnd, 300, 12), go(stubEnd, 300, 24)];
+    expect(near(headingAlongRoute(longStub, { isRouteStart: true }), 90, 2)).toBe(true);
+  });
+
+  test('later steps (not the start) still follow the road ahead', () => {
+    expect(near(headingAlongRoute(corridor, { isRouteStart: false }), 300, 2)).toBe(true);
+  });
+
+  test('a first leg that is long is followed to its end', () => {
+    const long = [door, go(door, 90, 9), go(go(door, 90, 9), 0, 8), go(go(door, 90, 9), 0, 16)];
+    expect(near(headingAlongRoute(long, { isRouteStart: true }), 90, 3)).toBe(true);
+  });
+
+  test('a start with no stub is unchanged', () => {
+    const straight = [door, go(door, 45, 6), go(door, 45, 14), go(door, 45, 22)];
+    expect(near(headingAlongRoute(straight, { isRouteStart: true }), 45, 1)).toBe(true);
+  });
+
+  test('duplicate points at the very start are skipped', () => {
+    const doubled = [door, { ...door }, go(door, 120, 6), go(door, 120, 14)];
+    expect(near(headingAlongRoute(doubled, { isRouteStart: true }), 120, 1)).toBe(true);
+  });
+
+  test('a leg with a gentle bend is followed up to a real turn', () => {
+    const start = P(0, 0);
+    const pts = [start, go(start, 80, 5), go(go(start, 80, 5), 95, 5), go(go(go(start, 80, 5), 95, 5), 0, 8)];
+    const h = headingAlongRoute(pts, { isRouteStart: true });
+    expect(h > 80 && h < 95).toBe(true);
+  });
+});
+
+describe('headingAlongRoute: the end of a route', () => {
+  test('on the last turn, the map faces the destination door', () => {
+    // At the corridor, the door is 2 m to the west
+    const here = P(0, 0);
+    expect(near(headingAlongRoute([here, go(here, 270, 2)]), 270, 1)).toBe(true);
+  });
+
+  test('a stub with a small kink still faces the door', () => {
+    const here = P(0, 0);
+    const mid = go(here, 270, 1);
+    expect(near(headingAlongRoute([here, { lat: mid.lat + 0.1 / 110540, lon: mid.lon }, go(here, 270, 2)]), 270, 6)).toBe(true);
+  });
+
+  test('already at the destination: no direction, so the heading is kept', () => {
+    expect(headingAlongRoute([P(0, 0)])).toBeNull();
+    expect(headingAlongRoute([P(0, 0), P(0.2, 0)])).toBeNull();
+  });
+});
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\__tests__\OutdoorBaseMap.test.js ---
+
+// Renders the base map layers with a stand-in for MapLibre and checks what is
+// handed to it: every layer present, in the right order, with no crash.
+
+jest.mock('@maplibre/maplibre-react-native', () => {
+  const React = require('react');
+  const make = (name) => (props) => React.createElement(name, props, props.children);
+  return {
+    Images: make('Images'),
+    ShapeSource: make('ShapeSource'),
+    FillLayer: make('FillLayer'),
+    LineLayer: make('LineLayer'),
+    CircleLayer: make('CircleLayer'),
+    SymbolLayer: make('SymbolLayer'),
+  };
+});
+
+// The picture files are not needed to check the layers.
+jest.mock('@/constants/poiIcons', () => ({ POI_IMAGES: { parking: 1, library: 2 } }));
+
+import renderer from 'react-test-renderer';
+import { OutdoorBaseMap } from '@/components/OutdoorBaseMap';
+
+const fc = (features) => ({ type: 'FeatureCollection', features });
+const poly = (name, kind) => ({
+  type: 'Feature',
+  properties: name ? { kind, name } : { kind },
+  geometry: { type: 'Polygon', coordinates: [[[33.41, -8.94], [33.411, -8.94], [33.411, -8.941], [33.41, -8.941], [33.41, -8.94]]] },
+});
+const line = (kind) => ({
+  type: 'Feature',
+  properties: { kind },
+  geometry: { type: 'LineString', coordinates: [[33.41, -8.94], [33.412, -8.941]] },
+});
+
+const pt = (props) => ({
+  type: 'Feature',
+  properties: props,
+  geometry: { type: 'Point', coordinates: [33.4105, -8.9405] },
+});
+
+const DATA = {
+  version: 'v1',
+  bounds: [33.41, -8.941, 33.412, -8.94],
+  layers: {
+    landuse: fc([poly('Mbeya University', 'education')]),
+    green: fc([poly('Quad', 'grass')]),
+    water: fc([]),
+    waterways: fc([]),
+    sports: fc([poly('Volleyball', 'pitch')]),
+    parking: fc([{ ...poly(null, 'parking'), properties: { kind: 'parking', poi: true } }]),
+    roads: fc([line('residential'), line('service'), line('track'), line('pedestrian')]),
+    paths: fc([line('footway'), line('steps')]),
+    buildings: fc([
+      poly('Hostel', 'yes'),
+      poly(null, 'yes'),
+      { ...poly('Library', 'yes'), properties: { kind: 'yes', name: 'Library', poi: true } },
+    ]),
+    pois: fc([pt({ icon: 'medical', name: 'Dispensary' }), pt({ icon: 'parking' }), pt({ name: 'Main Gate' })]),
+    trees: fc([pt({})]),
+  },
+};
+
+const ids = (tree, type) => tree.root.findAllByType(type).map((n) => n.props.id);
+const source = (tree, id) => tree.root.findAllByType('ShapeSource').find((s) => s.props.id === id);
+
+test('draws every layer: ground first, then areas, roads, buildings, symbols, names', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  expect(ids(tree, 'ShapeSource')).toEqual([
+    'base-landuse', 'base-green', 'base-water', 'base-waterways', 'base-sports',
+    'base-parking', 'base-roads', 'base-paths', 'base-buildings', 'base-trees',
+    'base-pois', 'base-landuse-names', 'base-sports-names', 'base-green-names',
+    'base-building-names',
+  ]);
+});
+
+test('registers the symbol pictures with the map', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const images = tree.root.findAllByType('Images');
+  expect(images.length).toBe(1);
+  expect(Object.keys(images[0].props.images)).toEqual(['parking', 'library']);
+});
+
+test('every layer id is unique, and none clashes with the route layers', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const all = ['FillLayer', 'LineLayer', 'CircleLayer', 'SymbolLayer'].flatMap((t) => ids(tree, t));
+  expect(new Set(all).size).toBe(all.length);
+  expect(all.every((id) => id.startsWith('base-'))).toBe(true);
+});
+
+test('roads: all the grey edges are drawn before any road surface', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const lines = ids(tree, 'LineLayer');
+  const lastCasing = Math.max(lines.indexOf('base-roads-casing'), lines.indexOf('base-roads-casing-minor'));
+  const firstFill = Math.min(lines.indexOf('base-roads-fill'), lines.indexOf('base-roads-fill-minor'));
+  expect(lastCasing).toBeLessThan(firstFill);
+  expect(lines).toContain('base-roads-track');
+});
+
+test('footpaths and steps are separate layers', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  expect(ids(tree, 'LineLayer')).toEqual(expect.arrayContaining(['base-paths-walk', 'base-paths-steps']));
+});
+
+test('names: only named shapes get a label, and shapes with a symbol get none', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const names = (id) => source(tree, id).props.shape.features.map((f) => f.properties.name);
+  expect(names('base-building-names')).toEqual(['Hostel']);   // not the unnamed one, not the Library (it has a symbol)
+  expect(names('base-sports-names')).toEqual(['Volleyball']);
+  expect(names('base-green-names')).toEqual(['Quad']);
+  expect(names('base-landuse-names')).toEqual(['Mbeya University']);
+});
+
+test('symbols: with a picture when there is an icon, name-only otherwise', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const [withIcon, textOnly] = tree.root.findAllByType('SymbolLayer').filter((l) => l.props.id.startsWith('base-pois'));
+  expect(withIcon.props.style.iconImage).toEqual(['get', 'icon']);
+  expect(withIcon.props.filter).toEqual(['has', 'icon']);
+  expect(withIcon.props.style.textOptional).toBe(true);        // the symbol shows even if its name does not fit
+  expect(textOnly.props.filter).toEqual(['!', ['has', 'icon']]);
+});
+
+test('symbol names are coloured by what they are (clinic red, parking blue)', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const colour = tree.root.findAllByType('SymbolLayer').find((l) => l.props.id === 'base-pois-icon').props.style.textColor;
+  expect(colour[0]).toBe('match');
+  expect(colour).toEqual(expect.arrayContaining(['medical', '#bf0000', 'parking', '#0066aa']));
+});
+
+test('ground colours follow the kind: the campus is pale yellow, grass is green', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const fill = (id) => tree.root.findAllByType('FillLayer').find((l) => l.props.id === id).props.style.fillColor;
+  expect(fill('base-landuse-fill')).toEqual(expect.arrayContaining(['education', '#ffffe5']));
+  expect(fill('base-green-fill')).toEqual(expect.arrayContaining(['grass', '#cdebb0']));
+  expect(fill('base-sports-fill')).toEqual(expect.arrayContaining(['pitch', '#88e0be']));
+  expect(tree.root.findAllByType('FillLayer').find((l) => l.props.id === 'base-buildings-fill').props.style.fillColor).toBe('#d9d0c9');
+});
+
+test('trees are small dots', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  expect(ids(tree, 'CircleLayer')).toEqual(['base-trees-dot']);
+});
+
+test('labels are centred and upright', () => {
+  const tree = renderer.create(<OutdoorBaseMap data={DATA} />);
+  const label = tree.root.findAllByType('SymbolLayer').find((l) => l.props.id === 'base-building-names-text').props.style;
+  expect(label.textAnchor).toBe('center');
+  expect(label.textRotationAlignment).toBe('viewport');
+  expect(label.textAllowOverlap).toBe(false);
+});
+
+test('missing or empty data draws empty layers without crashing', () => {
+  expect(() => renderer.create(<OutdoorBaseMap data={null} />)).not.toThrow();
+  expect(() => renderer.create(<OutdoorBaseMap data={{ layers: {} }} />)).not.toThrow();
+  const tree = renderer.create(<OutdoorBaseMap data={{ layers: {} }} />);
+  const shapes = tree.root.findAllByType('ShapeSource').map((s) => s.props.shape.features.length);
+  expect(shapes.every((n) => n === 0)).toBe(true);
 });
 
 

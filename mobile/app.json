@@ -29,7 +29,8 @@
     },
     "web": {
       "favicon": "./assets/favicon.png",
-      "bundler": "metro"
+      "bundler": "metro",
+      "output": "single"
     },
     "plugins": [
       "expo-router",
@@ -39,7 +40,8 @@
         {
           "cameraPermission": "Campus Navigation uses the camera to scan QR codes that show where you are inside a building."
         }
-      ]
+      ],
+      "expo-asset"
     ],
     "experiments": {
       "typedRoutes": false
