@@ -77,6 +77,7 @@ import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
 import { IndoorMapView } from '@/components/IndoorMapView';
 import { OutdoorBaseMap } from '@/components/OutdoorBaseMap';
 import { haversineM, bearingDeg } from '@/utils/geo';
+import { rememberPreviewHeading, startHeadingFor } from '@/utils/walkStartHeading';
 import {
   CAMERA_MIN_INTERVAL_MS,
   CAMERA_MIN_MOVE_M,
@@ -334,6 +335,20 @@ export function RouteMap({
       ? null
       : (previewBaseHeading + (flipped ? 180 : 0)) % 360;
 
+  // The preview remembers the heading it shows (including a flip), so the
+  // walking screen can open facing the same way.
+  useEffect(() => {
+    if (followBearing || mapHeading == null) return;
+    rememberPreviewHeading(routeCoords, mapHeading);
+  }, [followBearing, mapHeading, routeCoords]);
+
+  // Walking screen: the heading to start with, before the compass or GPS has
+  // one. The same direction the preview showed, not north.
+  const walkStartHeading = useMemo(
+    () => (followBearing ? startHeadingFor(routeCoords) : null),
+    [followBearing, routeCoords]
+  );
+
   // Fit parameters, computed once per route. Used by the fit effect
   // once mapReady is true.
   const fit = useMemo(() => {
@@ -413,6 +428,20 @@ export function RouteMap({
     routeCoords.length,
   ]);
 
+  // Walking screen: face the preview's direction as soon as the native map is
+  // ready, and keep it until the compass or GPS gives a real heading (the
+  // follow camera below takes over then).
+  useEffect(() => {
+    if (mode !== 'outdoor' || !followBearing) return;
+    if (!mapReady || !cameraRef.current) return;
+    if (bearing != null || walkStartHeading == null) return;
+    try {
+      cameraRef.current.setCamera({ heading: walkStartHeading, animationDuration: 0 });
+    } catch {
+      // Silent.
+    }
+  }, [mode, followBearing, mapReady, bearing, walkStartHeading]);
+
   // Follow camera (walking screen only). Throttled: at most one
   // update every CAMERA_MIN_INTERVAL_MS, and only when the student
   // has moved at least CAMERA_MIN_MOVE_M or the heading has changed
@@ -444,19 +473,24 @@ export function RouteMap({
       return;
     }
 
+    // Live heading if there is one, else the last one used, else the
+    // direction the preview showed. Never north just because the student has
+    // not started moving yet.
+    const heading = bearing ?? last.heading ?? walkStartHeading;
+
     lastCamRef.current = {
       t: now,
       lat: userLocation.lat,
       lon: userLocation.lon,
-      heading: bearing ?? last.heading,
+      heading,
     };
 
     const update = {
       centerCoordinate: [userLocation.lon, userLocation.lat],
       animationDuration: 600,
     };
-    if (bearing != null) {
-      update.heading = bearing;
+    if (heading != null) {
+      update.heading = heading;
     }
 
     try {
@@ -464,7 +498,7 @@ export function RouteMap({
     } catch {
       // Silent.
     }
-  }, [userLocation, bearing, followBearing, mode]);
+  }, [userLocation, bearing, followBearing, mode, walkStartHeading]);
 
   if (mode === 'indoor') {
     if (indoorNoRooms) {
@@ -513,7 +547,7 @@ export function RouteMap({
           defaultSettings={{
             centerCoordinate: initialCenter,
             zoomLevel: fit ? fit.zoom : 16,
-            heading: mapHeading != null ? mapHeading : 0,
+            heading: mapHeading != null ? mapHeading : (walkStartHeading ?? 0),
           }}
         />
 
@@ -674,5 +708,4 @@ const styles = StyleSheet.create({
     color: COLORS.primaryDark,
   },
 });
-
 

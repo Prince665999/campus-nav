@@ -183,5 +183,9 @@ export const OUTDOOR_BASEMAP = "own";
 
 // Credit line on your own map. If any of map.osm came from OpenStreetMap,
 // keep this. Set it to "" only if every part of the file is your own drawing.
-export const OUTDOOR_MAP_ATTRIBUTION = "© OpenStreetMap contributors";
+export const OUTDOOR_MAP_ATTRIBUTION = "© Prince Co.LMT";
+
+export const INDOOR_FOCUS_ZOOM = 20; // walking: zoom on the blue dot
+export const INDOOR_PREVIEW_MIN_ZOOM = 19; // preview: never opens further out than this
+
 

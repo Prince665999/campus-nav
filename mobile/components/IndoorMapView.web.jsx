@@ -77,6 +77,7 @@ import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 import { polygonLabelInfo } from '@/utils/polygonLabel';
 import { labelMinZoom } from '@/utils/labelFit';
 import { headingAlongRoute } from '@/utils/legBearing';
+import { chooseIndoorCamera } from '@/utils/indoorCameraStart';
 import { headingLabel } from '@/utils/headingLabel';
 import {
   INDOOR_BACKGROUND_COLOR,
@@ -103,6 +104,8 @@ import {
   INDOOR_LEG_END_DOT_RADIUS,
   INDOOR_LEG_END_DOT_BORDER_WIDTH,
   INDOOR_ROUTE_FADED_OPACITY,
+  INDOOR_FOCUS_ZOOM,
+  INDOOR_PREVIEW_MIN_ZOOM,
 } from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
@@ -192,6 +195,17 @@ function firstLegBearing(points) {
   }
   return null;
 }
+
+// ---- Where the camera starts ---------------------------------------------
+// The map opens already zoomed in and focused on where you are (walking) or
+// where the route starts (preview), not zoomed out over the whole building.
+// Set both in constants/config.js; the numbers after ?? are used if missing.
+//   FOCUS_ZOOM        zoom when walking. 20 shows a corridor and its doors.
+//   PREVIEW_MIN_ZOOM  the preview shows the whole route on a floor if it fits
+//                     at this zoom or closer; a longer route opens at this
+//                     zoom on its start instead of zoomed out.
+const FOCUS_ZOOM = INDOOR_FOCUS_ZOOM ?? 20;
+const PREVIEW_MIN_ZOOM = INDOOR_PREVIEW_MIN_ZOOM ?? 19;
 
 // ---- Room names --------------------------------------------------------
 // A name is shown only from the zoom at which it fits inside its room, so a
@@ -624,15 +638,25 @@ export function IndoorMapView({
     const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
 
     const fitZoom = Math.max(16, Math.min(21, zoom));
-    // If the student has zoomed in, keep their zoom on the new floor and
-    // centre on where they are, rather than on the whole building.
-    const keepUserZoom = userZoomRef.current != null;
-    const clamped = keptZoomRef.current != null ? keptZoomRef.current : fitZoom;
-    const stepHere =
-      keepUserZoom && currentStepPoint && currentStepLevel === selectedLevel;
-    const camCenter = stepHere
-      ? [currentStepPoint.lon, currentStepPoint.lat]
-      : [centerLon, centerLat];
+
+    // Where to look, and how close (see utils/indoorCameraStart.js).
+    const { center: camCenter, zoom: camZoom } = chooseIndoorCamera({
+      here:
+        currentStepPoint && currentStepLevel === selectedLevel
+          ? currentStepPoint
+          : null,
+      routeHere: (routeByLevel || []).filter((p) => p.level === selectedLevel),
+      floorCenter: [centerLon, centerLat],
+      floorFitZoom: fitZoom,
+      cosLat,
+      minDim,
+      focusZoom: FOCUS_ZOOM,
+      previewMinZoom: PREVIEW_MIN_ZOOM,
+    });
+
+    // A zoom already in use in this building (the student's own, or the one
+    // set on the first floor) is kept when moving to another floor.
+    const clamped = keptZoomRef.current != null ? keptZoomRef.current : camZoom;
 
     const timeout = setTimeout(() => {
       // Mark as fitted only once we actually issue the camera call.
@@ -673,12 +697,28 @@ export function IndoorMapView({
     if (!cameraRef.current) return;
     const cam = { heading: effectiveHeading, animationDuration: 500 };
     if (userZoomRef.current != null) cam.zoomLevel = userZoomRef.current;
+    // Walking: every Next press brings the blue dot back to the middle of
+    // the screen, however far the student had zoomed in or panned away. (Not
+    // in the preview, which has no dot, and not when looking at another
+    // floor than the one the dot is on.)
+    if (!lockHeading && currentStepPoint && currentStepLevel === selectedLevel) {
+      cam.centerCoordinate = [currentStepPoint.lon, currentStepPoint.lat];
+    }
     try {
       cameraRef.current.setCamera(cam);
     } catch {
       // Silent.
     }
-  }, [effectiveHeading, currentStepPoint?.lat, currentStepPoint?.lon]);
+    // selectedLevel / currentStepLevel: when a step takes the student to
+    // another floor, centre on the dot once that floor is showing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    effectiveHeading,
+    currentStepPoint?.lat,
+    currentStepPoint?.lon,
+    selectedLevel,
+    currentStepLevel,
+  ]);
 
   // Remember pinch-zooms. If the zoom changes by itself (not the student)
   // while they have a zoom set, put it back.
@@ -748,6 +788,12 @@ export function IndoorMapView({
   // The compass letter(s) at the top of the screen, e.g. "N", "NE", "137°".
   const topLabel = headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG);
 
+  // Where the camera is before the floor plan has loaded: on the dot when
+  // walking, on the route start in the preview.
+  const startPoint = showYouAreHere
+    ? currentStepPoint
+    : (routeByLevel || []).find((p) => p.level === selectedLevel) || null;
+
   const showSwitcher =
     (forceSwitcher || settings.showFloorSwitcher !== false) &&
     availableLevels.length > 1;
@@ -769,8 +815,14 @@ export function IndoorMapView({
         <Camera
           ref={cameraRef}
           defaultSettings={{
-            centerCoordinate: initialCenter,
-            zoomLevel: 18,
+            centerCoordinate: startPoint
+              ? [startPoint.lon, startPoint.lat]
+              : initialCenter,
+            zoomLevel: startPoint
+              ? showYouAreHere
+                ? FOCUS_ZOOM
+                : PREVIEW_MIN_ZOOM
+              : 18,
             heading: effectiveHeading,
           }}
         />
@@ -1205,3 +1257,4 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
 });
+
