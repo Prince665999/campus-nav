@@ -1,13 +1,11 @@
-// Chat screen.
+// Walk chat screen.
 //
-// Two modes, decided by URL params:
+// Opened from the walking screen with route params (a from-place OR
+// from-coordinates, plus a destination and step index). Calls
+// /api/chat. The student is walking and asking about the walk.
 //
-//   - No route params → document chat. Calls /api/chat/doc.
-//     The student is asking about the university.
-//
-//   - Route params present (a from-place OR from-coordinates, plus a
-//     destination and step index) → route chat. Calls /api/chat. The
-//     student is walking and asking about the walk.
+// Without route params there is nothing to ask about, so the screen
+// sends the student back home.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -26,26 +24,12 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ChatBubble } from '@/components/ChatBubble';
 import {
-  // Route chat
   sendRouteChatMessage,
   startRouteChatSession,
   endRouteChatSession,
-  // Doc chat
-  sendDocChatMessage,
-  startDocChatSession,
-  endDocChatSession,
 } from '@/services/api';
 import { t } from '@/i18n';
-import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
-
-// Quick-prompt chips for the doc chat. Tapping one fills the input
-// with that question and sends it.
-const DOC_QUICK_PROMPTS = [
-  'When does the semester end?',
-  'What are the exam rules?',
-  'What does MUSTSO cabinet comprise of?',
-  'Who is the head of the Computer Science department?',
-];
+import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 
 export default function ChatScreen() {
   const params = useLocalSearchParams();
@@ -82,10 +66,8 @@ export default function ChatScreen() {
       ? Number(params.currentLon)
       : null;
 
-  // Route chat is active when we have a destination AND some form of
-  // starting point. That covers both a place-started walk and a
-  // GPS-started walk — the case that used to silently fall through
-  // to doc chat.
+  // Route chat needs a destination AND some form of starting point.
+  // That covers both a place-started walk and a GPS-started walk.
   const hasRouteContext = !!(
     toPlaceId &&
     (fromPlaceId != null || (fromLat != null && fromLon != null))
@@ -100,15 +82,18 @@ export default function ChatScreen() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(null);
 
-  // Start the right kind of session on mount.
+  // Nothing to chat about without a walk — go home.
   useEffect(() => {
+    if (!hasRouteContext) router.replace('/');
+  }, [hasRouteContext]);
+
+  // Start a route chat session on mount.
+  useEffect(() => {
+    if (!hasRouteContext) return undefined;
     let cancelled = false;
     let startedSessionId = null;
 
-    const start = hasRouteContext ? startRouteChatSession : startDocChatSession;
-    const end = hasRouteContext ? endRouteChatSession : endDocChatSession;
-
-    start()
+    startRouteChatSession()
       .then((data) => {
         if (!cancelled) {
           startedSessionId = data.session_id;
@@ -122,23 +107,19 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
       if (startedSessionId) {
-        end(startedSessionId).catch(() => {});
+        endRouteChatSession(startedSessionId).catch(() => {});
       }
     };
   }, [hasRouteContext]);
 
-  // Greeting, tailored to the mode.
   useEffect(() => {
-    const greeting = hasRouteContext
-      ? t('chat.greetingWalk')
-      : t('chat.greetingDoc');
-    setMessages([{ role: 'assistant', content: greeting }]);
-  }, [hasRouteContext]);
+    setMessages([{ role: 'assistant', content: t('chat.greetingWalk') }]);
+  }, []);
 
   const send = useCallback(
     async (messageOverride) => {
       const message = (messageOverride ?? input).trim();
-      if (!message || sending) return;
+      if (!message || sending || !hasRouteContext) return;
 
       setInput('');
       setError(null);
@@ -146,23 +127,18 @@ export default function ChatScreen() {
       setSending(true);
 
       try {
-        let response;
-        if (hasRouteContext) {
-          response = await sendRouteChatMessage({
-            message,
-            sessionId,
-            fromPlaceId,
-            fromLat,
-            fromLon,
-            toPlaceId,
-            currentStepIndex,
-            distanceFromStartM,
-            currentLat,
-            currentLon,
-          });
-        } else {
-          response = await sendDocChatMessage({ message, sessionId });
-        }
+        const response = await sendRouteChatMessage({
+          message,
+          sessionId,
+          fromPlaceId,
+          fromLat,
+          fromLon,
+          toPlaceId,
+          currentStepIndex,
+          distanceFromStartM,
+          currentLat,
+          currentLon,
+        });
 
         setMessages((prev) => [
           ...prev,
@@ -209,13 +185,11 @@ export default function ChatScreen() {
     return () => clearTimeout(timeout);
   }, [messages]);
 
-  const showQuickPrompts = !hasRouteContext && messages.length <= 1;
-
   return (
     <>
       <Stack.Screen
         options={{
-          title: hasRouteContext ? t('chat.titleWalk') : t('chat.titleDoc'),
+          title: t('chat.titleWalk'),
         }}
       />
       <KeyboardAvoidingView
@@ -238,30 +212,6 @@ export default function ChatScreen() {
           ) : null}
         </ScrollView>
 
-        {/* Quick prompts for the doc chat, shown until the student
-            has asked something. */}
-        {showQuickPrompts ? (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.promptsRow}
-            style={styles.promptsScroll}
-          >
-            {DOC_QUICK_PROMPTS.map((prompt) => (
-              <TouchableOpacity
-                key={prompt}
-                style={styles.promptChip}
-                onPress={() => send(prompt)}
-                disabled={sending}
-                accessibilityRole="button"
-                accessibilityLabel={prompt}
-              >
-                <Text style={styles.promptText}>{prompt}</Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
-        ) : null}
-
         {error ? <Text style={styles.error}>{error}</Text> : null}
 
         <View
@@ -274,9 +224,7 @@ export default function ChatScreen() {
             style={styles.input}
             value={input}
             onChangeText={setInput}
-            placeholder={
-              hasRouteContext ? t('chat.placeholderWalk') : t('chat.placeholderDoc')
-            }
+            placeholder={t('chat.placeholderWalk')}
             placeholderTextColor={COLORS.textFaint}
             multiline
             maxLength={500}
@@ -317,29 +265,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.md,
     paddingVertical: SPACING.sm,
     alignItems: 'flex-start',
-  },
-  promptsScroll: {
-    flexGrow: 0,
-    borderTopWidth: 1,
-    borderTopColor: COLORS.borderSubtle,
-  },
-  promptsRow: {
-    paddingHorizontal: SPACING.md,
-    paddingVertical: SPACING.sm,
-    gap: SPACING.sm,
-  },
-  promptChip: {
-    backgroundColor: COLORS.backgroundSubtle,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: RADIUS.pill,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    marginRight: SPACING.sm,
-  },
-  promptText: {
-    fontSize: FONT_SIZE.small,
-    color: COLORS.text,
   },
   error: {
     color: COLORS.danger,

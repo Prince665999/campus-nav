@@ -21,7 +21,6 @@ from .rate_limit import limiter, rate_limit_exceeded_handler
 from .routers import (
     areas,
     chat,
-    chat_doc,
     favorites,
     health,
     indoor,
@@ -37,7 +36,6 @@ from .routers import (
 )
 from .routers.admin import (
     auth as admin_auth,
-    knowledge as admin_knowledge,
     map_health as admin_map_health,
     media as admin_media,
     places as admin_places,
@@ -137,7 +135,6 @@ def create_app() -> FastAPI:
     app.include_router(reports.router)
     app.include_router(chat.router)
     app.include_router(wifi.router)
-    app.include_router(chat_doc.router)
     app.include_router(timetable.router)
 
     # Admin auth — NOT behind the guard, because login itself can't
@@ -170,9 +167,6 @@ def create_app() -> FastAPI:
         admin_users.router, prefix=admin_prefix, dependencies=admin_deps
     )
     app.include_router(
-        admin_knowledge.router, prefix=admin_prefix, dependencies=admin_deps
-    )
-    app.include_router(
         admin_timetable.router, prefix=admin_prefix, dependencies=admin_deps
     )
 
@@ -195,4 +189,5 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
 

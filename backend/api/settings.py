@@ -64,32 +64,6 @@ MEDIA_VARIANTS = [
     ("full", 1600),
 ]
 
-
-# ---------------------------------------------------------------------------
-# Knowledge base
-# ---------------------------------------------------------------------------
-
-CHROMA_DIR = Path(os.environ.get("CHROMA_DIR", DATA_DIR / "chroma"))
-CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-
-CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "campus_knowledge")
-
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-
-KNOWLEDGE_UPLOAD_DIR = Path(
-    os.environ.get("KNOWLEDGE_UPLOAD_DIR", DATA_DIR / "knowledge")
-)
-KNOWLEDGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-KNOWLEDGE_MAX_UPLOAD_BYTES = int(
-    os.environ.get("KNOWLEDGE_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
-)
-
-KNOWLEDGE_CHUNK_WORDS = int(os.environ.get("KNOWLEDGE_CHUNK_WORDS", 300))
-
-KNOWLEDGE_TOP_K = int(os.environ.get("KNOWLEDGE_TOP_K", 5))
-
-
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------

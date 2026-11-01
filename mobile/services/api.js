@@ -305,35 +305,6 @@ export async function sendRouteChatMessage({
 }
 
 // ---------------------------------------------------------------
-// Doc chat (university questions)
-// ---------------------------------------------------------------
-
-export async function startDocChatSession() {
-  return request('/api/chat/doc/session', { method: 'POST' });
-}
-
-export async function endDocChatSession(sessionId) {
-  return request(`/api/chat/doc/session/${sessionId}`, { method: 'DELETE' });
-}
-
-export async function sendDocChatMessage({ message, sessionId }) {
-  const body = {
-    message,
-    session_id: sessionId || null,
-  };
-  return request('/api/chat/doc', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-}
-
-export async function searchKnowledge(q, { topK = 5 } = {}) {
-  const params = new URLSearchParams({ q, top_k: String(topK) });
-  return request(`/api/chat/doc/search?${params.toString()}`);
-}
-
-// ---------------------------------------------------------------
 // Wi-Fi
 // ---------------------------------------------------------------
 
@@ -391,4 +362,5 @@ export async function listIndoorDoors({ buildingName } = {}) {
 export async function getHealth() {
   return request('/api/health');
 }
+
 

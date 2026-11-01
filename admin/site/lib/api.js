@@ -106,11 +106,6 @@ export const api = {
   deleteUser: (id) =>
     request(`/api/admin/users/${id}`, { method: 'DELETE' }),
 
-  // ---------- Knowledge base ----------
-  listKnowledgeDocuments: () => request('/api/admin/knowledge'),
-  deleteKnowledgeDocument: (id) =>
-    request(`/api/admin/knowledge/${id}`, { method: 'DELETE' }),
-
   // ---------- Timetable ----------
   // Programs are read through the admin endpoint (identical shape to
   // the public one, but consistent with the rest of the admin site).

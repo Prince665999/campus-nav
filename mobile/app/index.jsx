@@ -209,10 +209,6 @@ export default function HomeScreen() {
     router.push(`/place/${id}`);
   }, []);
 
-  const openChat = useCallback(() => {
-    router.push('/chat');
-  }, []);
-
   const openExplore = useCallback(() => {
     router.push('/explore');
   }, []);
@@ -506,29 +502,6 @@ export default function HomeScreen() {
             style={styles.scroll}
             contentContainerStyle={styles.scrollContent}
           >
-            <View style={styles.featureRow}>
-              <FeatureCard
-                icon={ICONS.compass}
-                iconColor="#0d9488"
-                title={t('home.exploreTitle')}
-                description={t('home.exploreDescription')}
-                onPress={openExplore}
-              />
-              <FeatureCard
-                icon={ICONS.chat}
-                iconColor="#6366f1"
-                title={t('home.chatTitle')}
-                description={t('home.chatDescription')}
-                onPress={openChat}
-              />
-            </View>
-
-            <RecentStrip
-              recents={recents}
-              favorites={favorites}
-              onPress={openPlace}
-            />
-
             <View style={styles.chipsWrapper}>
               <Text style={styles.sectionTitle}>
                 {t('home.categoriesTitle')}
@@ -539,6 +512,25 @@ export default function HomeScreen() {
                 counts={categoryCounts}
               />
             </View>
+
+            <View style={styles.featureRow}>
+              <FeatureCard
+                icon={ICONS.compass}
+                iconColor="#0d9488"
+                title={t('home.exploreTitle')}
+                description={t('home.exploreDescription')}
+                onPress={openExplore}
+              />
+              {/* Empty slot keeps the Explore card at its original
+                  half width now that Campus Chat is gone. */}
+              <View style={styles.featureSpacer} />
+            </View>
+
+            <RecentStrip
+              recents={recents}
+              favorites={favorites}
+              onPress={openPlace}
+            />
           </ScrollView>
         )}
       </View>
@@ -603,7 +595,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.md,
     marginTop: SPACING.md,
   },
-  chipsWrapper: { marginTop: SPACING.md },
+  featureSpacer: { flex: 1 },
+  chipsWrapper: { marginTop: SPACING.sm },
   sectionTitle: {
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
@@ -638,4 +631,5 @@ const styles = StyleSheet.create({
   },
   listContent: { paddingBottom: 32 },
 });
+
 

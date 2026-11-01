@@ -5,9 +5,8 @@ The route chat service. Answers questions about the walk the student
 is currently on, using the route timeline, the narration they heard,
 and the places near their current position.
 
-This service does not touch the knowledge base. University questions
-belong to chat_doc_service.py, and the two are deliberately separate
-so neither can accidentally answer from the other's source.
+It answers only from the walk's own data; there is no document or
+embedding search anywhere in the app.
 """
 
 import json

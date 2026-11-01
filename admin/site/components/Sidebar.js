@@ -13,7 +13,6 @@ const NAV_ITEMS = [
   { href: '/place-editor', label: 'Places', icon: 'pin' },
   { href: '/timetable', label: 'Timetable', icon: 'calendar' },
   { href: '/timetable-import', label: 'Import CSV', icon: 'upload' },
-  { href: '/knowledge', label: 'Knowledge', icon: 'book' },
   { href: '/route-tester', label: 'Route Tester', icon: 'compass' },
   { href: '/reimport-view', label: 'Re-import', icon: 'refresh' },
   { href: '/roles', label: 'Roles', icon: 'people' },

@@ -24,9 +24,7 @@
     "nearbyTitle": "Karibu nami",
     "emptyHint": "Tafuta mahali au vinjari kwa aina hapa chini.",
     "exploreTitle": "Vinjari",
-    "exploreDescription": "Angalia majengo, chakula, na huduma",
-    "chatTitle": "Mazungumzo ya Chuo",
-    "chatDescription": "Uliza kuhusu sheria, historia, na saa za kufungua"
+    "exploreDescription": "Angalia majengo, chakula, na huduma"
   },
   "start": {
     "title": "Unaanza kutoka wapi?",
@@ -113,13 +111,10 @@
   "chat": {
     "title": "Ujumbe",
     "titleWalk": "Uliza kuhusu safari hii",
-    "titleDoc": "Mazungumzo ya Chuo",
     "greetingGeneral": "Habari! Niambie unakwenda wapi — jaribu \"nipeleke maktaba\".",
     "greetingWalk": "Niulize kuhusu safari hii. Naweza kukuambia kilicho karibu na kinachofuata.",
-    "greetingDoc": "Habari! Niulize kuhusu chuo — sheria zake, historia, saa za kufungua, au kitu kingine chochote.",
     "placeholder": "Uliza kitu…",
     "placeholderWalk": "Uliza kuhusu safari hii…",
-    "placeholderDoc": "Uliza kuhusu chuo…",
     "send": "Tuma",
     "error": "Samahani, sikuweza kufikia msaidizi. Jaribu tena baadaye.",
     "foundDestination": "Nimeipata. Nafungua njia kwa {name}."
@@ -289,3 +284,4 @@
     "number": "Ghorofa ya {n}"
   }
 }
+
