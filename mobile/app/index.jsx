@@ -516,14 +516,10 @@ export default function HomeScreen() {
             <View style={styles.featureRow}>
               <FeatureCard
                 icon={ICONS.compass}
-                iconColor="#0d9488"
                 title={t('home.exploreTitle')}
                 description={t('home.exploreDescription')}
                 onPress={openExplore}
               />
-              {/* Empty slot keeps the Explore card at its original
-                  half width now that Campus Chat is gone. */}
-              <View style={styles.featureSpacer} />
             </View>
 
             <RecentStrip
@@ -590,12 +586,9 @@ const styles = StyleSheet.create({
   scroll: { flex: 1 },
   scrollContent: { paddingBottom: SPACING.xl },
   featureRow: {
-    flexDirection: 'row',
-    gap: SPACING.md,
     paddingHorizontal: SPACING.md,
     marginTop: SPACING.md,
   },
-  featureSpacer: { flex: 1 },
   chipsWrapper: { marginTop: SPACING.sm },
   sectionTitle: {
     fontSize: FONT_SIZE.small,
