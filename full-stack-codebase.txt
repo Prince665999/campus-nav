@@ -39187,7 +39187,8 @@ export default function RootLayout() {
     },
     "web": {
       "favicon": "./assets/favicon.png",
-      "bundler": "metro"
+      "bundler": "metro",
+      "output": "single"
     },
     "plugins": [
       "expo-router",
@@ -39197,7 +39198,8 @@ export default function RootLayout() {
         {
           "cameraPermission": "Campus Navigation uses the camera to scan QR codes that show where you are inside a building."
         }
-      ]
+      ],
+      "expo-asset"
     ],
     "experiments": {
       "typedRoutes": false
@@ -40957,6 +40959,7 @@ import { COLORS, RADIUS, SPACING } from '@/constants/theme';
 import { polygonLabelInfo } from '@/utils/polygonLabel';
 import { labelMinZoom } from '@/utils/labelFit';
 import { headingAlongRoute } from '@/utils/legBearing';
+import { chooseIndoorCamera } from '@/utils/indoorCameraStart';
 import { headingLabel } from '@/utils/headingLabel';
 import {
   INDOOR_BACKGROUND_COLOR,
@@ -40983,6 +40986,8 @@ import {
   INDOOR_LEG_END_DOT_RADIUS,
   INDOOR_LEG_END_DOT_BORDER_WIDTH,
   INDOOR_ROUTE_FADED_OPACITY,
+  INDOOR_FOCUS_ZOOM,
+  INDOOR_PREVIEW_MIN_ZOOM,
 } from '@/constants/config';
 
 const BLANK_STYLE = JSON.stringify({
@@ -41072,6 +41077,17 @@ function firstLegBearing(points) {
   }
   return null;
 }
+
+// ---- Where the camera starts ---------------------------------------------
+// The map opens already zoomed in and focused on where you are (walking) or
+// where the route starts (preview), not zoomed out over the whole building.
+// Set both in constants/config.js; the numbers after ?? are used if missing.
+//   FOCUS_ZOOM        zoom when walking. 20 shows a corridor and its doors.
+//   PREVIEW_MIN_ZOOM  the preview shows the whole route on a floor if it fits
+//                     at this zoom or closer; a longer route opens at this
+//                     zoom on its start instead of zoomed out.
+const FOCUS_ZOOM = INDOOR_FOCUS_ZOOM ?? 20;
+const PREVIEW_MIN_ZOOM = INDOOR_PREVIEW_MIN_ZOOM ?? 19;
 
 // ---- Room names --------------------------------------------------------
 // A name is shown only from the zoom at which it fits inside its room, so a
@@ -41505,15 +41521,25 @@ export function IndoorMapView({
     const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
 
     const fitZoom = Math.max(16, Math.min(21, zoom));
-    // If the student has zoomed in, keep their zoom on the new floor and
-    // centre on where they are, rather than on the whole building.
-    const keepUserZoom = userZoomRef.current != null;
-    const clamped = keptZoomRef.current != null ? keptZoomRef.current : fitZoom;
-    const stepHere =
-      keepUserZoom && currentStepPoint && currentStepLevel === selectedLevel;
-    const camCenter = stepHere
-      ? [currentStepPoint.lon, currentStepPoint.lat]
-      : [centerLon, centerLat];
+
+    // Where to look, and how close (see utils/indoorCameraStart.js).
+    const { center: camCenter, zoom: camZoom } = chooseIndoorCamera({
+      here:
+        currentStepPoint && currentStepLevel === selectedLevel
+          ? currentStepPoint
+          : null,
+      routeHere: (routeByLevel || []).filter((p) => p.level === selectedLevel),
+      floorCenter: [centerLon, centerLat],
+      floorFitZoom: fitZoom,
+      cosLat,
+      minDim,
+      focusZoom: FOCUS_ZOOM,
+      previewMinZoom: PREVIEW_MIN_ZOOM,
+    });
+
+    // A zoom already in use in this building (the student's own, or the one
+    // set on the first floor) is kept when moving to another floor.
+    const clamped = keptZoomRef.current != null ? keptZoomRef.current : camZoom;
 
     const timeout = setTimeout(() => {
       // Mark as fitted only once we actually issue the camera call.
@@ -41554,12 +41580,28 @@ export function IndoorMapView({
     if (!cameraRef.current) return;
     const cam = { heading: effectiveHeading, animationDuration: 500 };
     if (userZoomRef.current != null) cam.zoomLevel = userZoomRef.current;
+    // Walking: every Next press brings the blue dot back to the middle of
+    // the screen, however far the student had zoomed in or panned away. (Not
+    // in the preview, which has no dot, and not when looking at another
+    // floor than the one the dot is on.)
+    if (!lockHeading && currentStepPoint && currentStepLevel === selectedLevel) {
+      cam.centerCoordinate = [currentStepPoint.lon, currentStepPoint.lat];
+    }
     try {
       cameraRef.current.setCamera(cam);
     } catch {
       // Silent.
     }
-  }, [effectiveHeading, currentStepPoint?.lat, currentStepPoint?.lon]);
+    // selectedLevel / currentStepLevel: when a step takes the student to
+    // another floor, centre on the dot once that floor is showing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    effectiveHeading,
+    currentStepPoint?.lat,
+    currentStepPoint?.lon,
+    selectedLevel,
+    currentStepLevel,
+  ]);
 
   // Remember pinch-zooms. If the zoom changes by itself (not the student)
   // while they have a zoom set, put it back.
@@ -41626,6 +41668,12 @@ export function IndoorMapView({
   const showYouAreHere =
     currentStepPoint && currentStepLevel === selectedLevel;
 
+  // Where the camera is before the floor plan has loaded: on the dot when
+  // walking, on the route start in the preview.
+  const startPoint = showYouAreHere
+    ? currentStepPoint
+    : (routeByLevel || []).find((p) => p.level === selectedLevel) || null;
+
   const showSwitcher =
     (forceSwitcher || settings.showFloorSwitcher !== false) &&
     availableLevels.length > 1;
@@ -41647,8 +41695,14 @@ export function IndoorMapView({
         <Camera
           ref={cameraRef}
           defaultSettings={{
-            centerCoordinate: initialCenter,
-            zoomLevel: 18,
+            centerCoordinate: startPoint
+              ? [startPoint.lon, startPoint.lat]
+              : initialCenter,
+            zoomLevel: startPoint
+              ? showYouAreHere
+                ? FOCUS_ZOOM
+                : PREVIEW_MIN_ZOOM
+              : 18,
             heading: effectiveHeading,
           }}
         />
@@ -42075,6 +42129,1272 @@ const styles = StyleSheet.create({
   },
 });
 
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\IndoorMapView.web.jsx ---
+
+// IndoorMapView.web.jsx — WEB VERSION.
+//
+// Same file as IndoorMapView.jsx (the phone version), with only the map library
+// swapped: it imports from '@/components/maplibreWeb' (MapLibre GL JS, the
+// browser map engine) instead of '@maplibre/maplibre-react-native'. Expo picks
+// this file automatically in the browser, and the phone build ignores it.
+// If you change the phone file, make the same change here.
+//
+// ---- Original notes from IndoorMapView.jsx follow ----
+
+// IndoorMapView — draws the indoor floor plan.
+//
+// When the walking screen's current step is indoor, this component
+// replaces the outdoor tile map. It:
+//   1. Fetches the rooms and corridors for the current building+level
+//      from /api/indoor/areas (through the persistent cache).
+//   2. Renders them on a blank MapLibre map: rooms white, corridors
+//      light grey, room names as labels.
+//   3. Draws the indoor route: solid on the current floor, faint
+//      dashed on other floors.
+//   4. Marks the destination with a red dot.
+//   5. Shows a "you are here" dot on the current step's point, when
+//      the displayed floor matches the current step's floor.
+//   6. Shows a floor switcher on the right edge if the settings
+//      toggle is on, or always when `forceSwitcher` is true.
+//
+// The camera auto-fits to the room bounds on first render.
+//
+// Changes in this version:
+//   - The map is no longer unmounted while a new floor loads. The
+//     loading spinner is shown as an overlay on top of the existing
+//     map, so the Camera keeps its state.
+//   - The fit runs once per (building, level) via a ref, so re-renders
+//     and step advances don't override the student's zoom or pan.
+//   - The fit formula uses the container's real pixel size and a
+//     metres-per-pixel diagonal.
+//   - Heading is computed differently for the two modes:
+//       • Walking screen (lockHeading = false): the heading is the
+//         direction of the road the student is about to walk,
+//         rounded to a multiple of INDOOR_HEADING_SNAP_DEG (90, 45,
+//         22.5, or 0 for the exact angle). Updates on a Next press,
+//         not continuously.
+//       • Preview (lockHeading = true): the heading is the start-to-
+//         end bearing of the whole route, snapped to N or S only.
+//         Unchanged from the previous version.
+//   - `lockHeading` prop: used by the route preview. When true, the
+//     heading is computed from the whole route, so tapping a floor
+//     chip doesn't rotate the map.
+//   - forceSwitcher prop: when true, the floor switcher is shown
+//     regardless of the settings toggle.
+//   - onNoRooms is called in the catch branch too, so a network error
+//     on the floor-plan fetch falls back to the outdoor map.
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import {
+  MapView,
+  Camera,
+  ShapeSource,
+  FillLayer,
+  LineLayer,
+  SymbolLayer,
+  CircleLayer,
+} from '@/components/maplibreWeb';
+
+import { getIndoorAreas } from '@/services/api';
+import { useSettings } from '@/context/SettingsContext';
+import { bearingDeg, haversineM } from '@/utils/geo';
+import { t } from '@/i18n';
+import { COLORS, RADIUS, SPACING } from '@/constants/theme';
+import { polygonLabelInfo } from '@/utils/polygonLabel';
+import { labelMinZoom } from '@/utils/labelFit';
+import { headingAlongRoute } from '@/utils/legBearing';
+import { chooseIndoorCamera } from '@/utils/indoorCameraStart';
+import { headingLabel } from '@/utils/headingLabel';
+import {
+  INDOOR_BACKGROUND_COLOR,
+  INDOOR_INTERIOR_COLOR,
+  INDOOR_BUILDING_OUTLINE_COLOR,
+  INDOOR_BUILDING_OUTLINE_WIDTH,
+  INDOOR_STAIRS_COLOR,
+  INDOOR_STAIRS_OUTLINE_COLOR,
+  INDOOR_CORRIDOR_COLOR,
+  INDOOR_CORRIDOR_OUTLINE_COLOR,
+  INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_OUTLINE_COLOR,
+  INDOOR_ROOM_OUTLINE_WIDTH,
+  INDOOR_HEADING_SNAP_DEG,
+  INDOOR_LABEL_MIN_SIZE,
+  INDOOR_LABEL_MAX_SIZE,
+  INDOOR_LABEL_FULL_SIZE_ZOOM,
+  INDOOR_LABEL_WRAP_EM,
+  INDOOR_LABEL_FIT,
+  INDOOR_CURRENT_LEG_COLOR,
+  INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+  INDOOR_CURRENT_LEG_WIDTH,
+  INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+  INDOOR_LEG_END_DOT_RADIUS,
+  INDOOR_LEG_END_DOT_BORDER_WIDTH,
+  INDOOR_ROUTE_FADED_OPACITY,
+  INDOOR_FOCUS_ZOOM,
+  INDOOR_PREVIEW_MIN_ZOOM,
+} from '@/constants/config';
+
+const BLANK_STYLE = JSON.stringify({
+  version: 8,
+  name: 'indoor-blank',
+  glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+  sources: {},
+  layers: [
+    {
+      id: 'background',
+      type: 'background',
+      paint: { 'background-color': INDOOR_BACKGROUND_COLOR },
+    },
+  ],
+});
+
+const FILL_COLOR_EXPR = [
+  'match',
+  ['get', 'type'],
+  'corridor', INDOOR_CORRIDOR_COLOR,
+  'room', INDOOR_ROOM_COLOR,
+  INDOOR_ROOM_COLOR,
+];
+
+// A bearing needs at least this much movement to be meaningful.
+// Below it, GPS noise would dominate, so we fall back to 0.
+const MIN_HEADING_DISTANCE_M = 3;
+
+// Walking screen: the map turns so the corridor you are about to walk
+// points up the screen, but only in steps of INDOOR_HEADING_SNAP_DEG, so a
+// small bend in a corridor does not keep turning the map.
+//   90   -> N, E, S, W only (the original behaviour)
+//   45   -> also NE, SE, SW, NW (default)
+//   22.5 -> 16 directions, for buildings that sit at odd angles
+//   0    -> no snapping: the exact direction of the corridor
+// Set it in constants/config.js.
+
+function levelLabel(level) {
+  if (level === '-1') return 'B';
+  if (level === '0') return 'G';
+  return level;
+}
+
+// Snap a bearing to the nearest axis when it is close to one.
+//
+// A corridor surveyed at 86° or 93° is, on the ground, a corridor running
+// due east-west. Showing 86° tilts the whole floor plan for no reason. So a
+// bearing within AXIS_SNAP_TOLERANCE_DEG of a multiple of 90 is shown as
+// that multiple; a bearing further from an axis (a genuinely diagonal
+// corridor) is shown exactly as it is, so a real wrong angle still shows.
+const AXIS_SNAP_TOLERANCE_DEG = 15;
+
+function snapToCardinal(bearing) {
+  if (bearing == null || !Number.isFinite(bearing)) return 0;
+  const h = ((bearing % 360) + 360) % 360;
+  const nearest = (Math.round(h / 90) * 90) % 360;
+  const diff = Math.abs(((h - nearest + 540) % 360) - 180);
+  const off = Math.abs(180 - diff);
+  return off <= AXIS_SNAP_TOLERANCE_DEG ? nearest : h;
+}
+
+// Snap a bearing to N or S only. Used by the preview.
+function snapToNorthSouth(bearing) {
+  if (bearing == null || !Number.isFinite(bearing)) return 0;
+  const h = ((bearing % 360) + 360) % 360;
+  return Math.cos((h * Math.PI) / 180) >= 0 ? 0 : 180;
+}
+
+// Which compass letter is at the top of the screen for a given
+// heading.
+function firstLegBearing(points) {
+  /**
+   * Given a list of { lat, lon }, return the bearing from the first
+   * point to the first point at least MIN_HEADING_DISTANCE_M away.
+   * Returns 0 if no such point exists.
+   */
+  if (!points || points.length < 2) return null;
+  const from = points[0];
+  for (let i = 1; i < points.length; i++) {
+    const to = points[i];
+    if (
+      haversineM(from.lat, from.lon, to.lat, to.lon) >=
+      MIN_HEADING_DISTANCE_M
+    ) {
+      return bearingDeg(from.lat, from.lon, to.lat, to.lon);
+    }
+  }
+  return null;
+}
+
+// ---- Where the camera starts ---------------------------------------------
+// The map opens already zoomed in and focused on where you are (walking) or
+// where the route starts (preview), not zoomed out over the whole building.
+// Set both in constants/config.js; the numbers after ?? are used if missing.
+//   FOCUS_ZOOM        zoom when walking. 20 shows a corridor and its doors.
+//   PREVIEW_MIN_ZOOM  the preview shows the whole route on a floor if it fits
+//                     at this zoom or closer; a longer route opens at this
+//                     zoom on its start instead of zoomed out.
+const FOCUS_ZOOM = INDOOR_FOCUS_ZOOM ?? 20;
+const PREVIEW_MIN_ZOOM = INDOOR_PREVIEW_MIN_ZOOM ?? 19;
+
+// ---- Room names --------------------------------------------------------
+// A name is shown only from the zoom at which it fits inside its room, so a
+// long name never spills over the neighbouring rooms. Names are a little
+// smaller when zoomed out. All of this is set in constants/config.js; the
+// numbers after ?? are used if a setting is missing there.
+const LABEL_MIN_SIZE = INDOOR_LABEL_MIN_SIZE ?? 8;
+const LABEL_MAX_SIZE = INDOOR_LABEL_MAX_SIZE ?? 11;
+const LABEL_FULL_SIZE_ZOOM = INDOOR_LABEL_FULL_SIZE_ZOOM ?? 19;
+const LABEL_WRAP_EM = INDOOR_LABEL_WRAP_EM ?? 7;
+const LABEL_FIT = INDOOR_LABEL_FIT ?? 1.3;
+const LABEL_START_ZOOM = 16; // at or below this zoom, names use the minimum size
+const LABEL_BAND_STEP = 0.5; // names appear in half-zoom steps
+const LABEL_FROM_ZOOM = 15; // below this zoom no names are shown
+const LABEL_TO_ZOOM = 22;
+const LABEL_BANDS = [];
+for (let z = LABEL_FROM_ZOOM; z <= LABEL_TO_ZOOM; z += LABEL_BAND_STEP) {
+  LABEL_BANDS.push(z);
+}
+
+export function IndoorMapView({
+  buildingName,
+  level,
+  routeByLevel = [],
+  destination = null,
+  currentStepPoint = null,
+  nextStepPoint = null,
+  currentStepLevel = null,
+  style,
+  onNoRooms,
+  forceSwitcher = false,
+  lockHeading = false,
+}) {
+  const { settings } = useSettings();
+  const cameraRef = useRef(null);
+
+  const [selectedLevel, setSelectedLevel] = useState(level);
+
+  const [areas, setAreas] = useState(null);
+  const [availableLevels, setAvailableLevels] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // Container size, measured from onLayout, used for the fit maths.
+  const [containerSize, setContainerSize] = useState({ width: 360, height: 480 });
+
+  // Tracks which (building, level) the camera has already been fitted
+  // to. Once a floor has been fitted, we never re-fit it, so the
+  // student's zoom and pan are preserved across re-renders and step
+  // advances.
+  const fittedKeyRef = useRef(null);
+
+  // The zoom the student chose by pinching. Null until they zoom. While it
+  // is set, floor changes and Next presses keep this zoom instead of
+  // snapping back to the default fit.
+  const userZoomRef = useRef(null);
+  // The zoom currently in use in this building (the fit zoom, or the zoom
+  // the student pinched to). A new floor reuses it instead of re-fitting,
+  // so the zoom stays the same when you change floor.
+  const keptZoomRef = useRef(null);
+  const restoringZoomRef = useRef(false);
+  // Last heading we could compute, reused when no direction is available
+  // (e.g. on the final step), so the map doesn't swing back to north.
+  const lastHeadingRef = useRef(0);
+
+  // 180-degree flip. Off by default: the map is route-up (the walking
+  // direction is at the top of the screen). The corner button toggles
+  // this, which turns the map exactly half a turn.
+  const [flipped, setFlipped] = useState(false);
+
+  // When the building changes, reset the selected level to whatever
+  // the current step says, clear the fitted key so the new building's
+  // floors get fitted, and reset the flip.
+  useEffect(() => {
+    setSelectedLevel(level);
+    fittedKeyRef.current = null;
+    userZoomRef.current = null;
+    keptZoomRef.current = null;
+    setFlipped(false);
+  }, [buildingName]);
+
+  // Follow the current step's level unless the student manually
+  // switched.
+  const [manuallyChosen, setManuallyChosen] = useState(false);
+  useEffect(() => {
+    if (!manuallyChosen) {
+      setSelectedLevel(level);
+    }
+  }, [level, manuallyChosen]);
+  useEffect(() => {
+    setManuallyChosen(false);
+  }, [buildingName]);
+
+  // Fetch rooms and corridors for the selected level.
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!buildingName || selectedLevel == null) {
+      setAreas([]);
+      setLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setLoading(true);
+    setError(null);
+
+    getIndoorAreas({ buildingName, level: selectedLevel })
+      .then((data) => {
+        if (cancelled) return;
+        const list = data?.areas || [];
+        setAreas(list);
+        setAvailableLevels(data?.levels || []);
+        if (list.filter((a) => a.type !== 'level').length === 0 && onNoRooms) onNoRooms();
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err.message || 'Could not load floor plan.');
+        setAreas([]);
+        if (onNoRooms) onNoRooms();
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buildingName, selectedLevel]);
+
+  // -------------------------------------------------------------------------
+  // GeoJSON assembly
+  // -------------------------------------------------------------------------
+
+  const roomsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // One point per room, at the room's visual centre, carrying its name and
+  // the zoom from which that name fits inside the room (minZoom). Labels come
+  // from these points instead of from the room polygons, so every name sits
+  // in the middle of its room (see utils/polygonLabel.js and utils/labelFit.js).
+  const roomLabelsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'room') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      const info = polygonLabelInfo(ring);
+      if (!info) continue;
+      const minZoom = labelMinZoom(area.name, info.radiusM, {
+        latDeg: info.point[1],
+        minSize: LABEL_MIN_SIZE,
+        maxSize: LABEL_MAX_SIZE,
+        fullSizeZoom: LABEL_FULL_SIZE_ZOOM,
+        startZoom: LABEL_START_ZOOM,
+        wrapEm: LABEL_WRAP_EM,
+        fit: LABEL_FIT,
+        bandStep: LABEL_BAND_STEP,
+        fromZoom: LABEL_FROM_ZOOM,
+        toZoom: LABEL_TO_ZOOM,
+      });
+      if (minZoom === null) continue; // too small to ever hold its name
+      features.push({
+        type: 'Feature',
+        properties: { name: area.name || '', minZoom },
+        geometry: { type: 'Point', coordinates: info.point },
+      });
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  const corridorsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'corridor') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Stairs: polygons tagged indoor=stairs. Drawn in their own colour.
+  const stairsGeoJSON = useMemo(() => {
+    if (!areas || areas.length === 0) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'stairs') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push(_polygonFeature(area, ring));
+    }
+    return { type: 'FeatureCollection', features };
+  }, [areas]);
+
+  // Floor outline: polygons tagged indoor=level (one closed way around the
+  // building on each floor). Filled with the interior colour and outlined.
+  const footprintGeoJSON = useMemo(() => {
+    if (!areas) return null;
+    const features = [];
+    for (const area of areas) {
+      if (area.type !== 'level') continue;
+      const ring = _closedRing(area.boundary);
+      if (!ring) continue;
+      features.push({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'Polygon', coordinates: [ring] },
+      });
+    }
+    return features.length > 0
+      ? { type: 'FeatureCollection', features }
+      : null;
+  }, [areas]);
+
+  const { routeSolidGeoJSON, routeDashedGeoJSON } = useMemo(() => {
+    if (!routeByLevel || routeByLevel.length === 0) {
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+    if (routeByLevel.length === 1) {
+      return { routeSolidGeoJSON: null, routeDashedGeoJSON: null };
+    }
+
+    const segments = [];
+    let current = null;
+
+    for (const pt of routeByLevel) {
+      const matches = pt.level === selectedLevel;
+      if (!current || current.matches !== matches) {
+        if (current && current.points.length >= 2) segments.push(current);
+        current = { matches, points: [[pt.lon, pt.lat]] };
+      } else {
+        current.points.push([pt.lon, pt.lat]);
+      }
+    }
+    if (current && current.points.length >= 2) segments.push(current);
+
+    const solid = [];
+    const dashed = [];
+    for (const seg of segments) {
+      const feature = {
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: seg.points },
+      };
+      if (seg.matches) solid.push(feature);
+      else dashed.push(feature);
+    }
+
+    return {
+      routeSolidGeoJSON:
+        solid.length > 0 ? { type: 'FeatureCollection', features: solid } : null,
+      routeDashedGeoJSON:
+        dashed.length > 0 ? { type: 'FeatureCollection', features: dashed } : null,
+    };
+  }, [routeByLevel, selectedLevel]);
+
+  // The part of the route the student must walk during the current step:
+  // from the current step's point to the next step's point, on this floor only.
+  const currentLegGeoJSON = useMemo(() => {
+    if (!currentStepPoint || !nextStepPoint || !routeByLevel?.length) return null;
+    const same = (p, q) => p.lat === q.lat && p.lon === q.lon;
+
+    const startIdx = routeByLevel.findIndex((p) => same(p, currentStepPoint));
+    if (startIdx < 0) return null;
+    let endIdx = -1;
+    for (let i = startIdx + 1; i < routeByLevel.length; i++) {
+      if (same(routeByLevel[i], nextStepPoint)) { endIdx = i; break; }
+    }
+    if (endIdx < 0) return null;
+
+    const runs = [];
+    let cur = [];
+    for (let i = startIdx; i <= endIdx; i++) {
+      const p = routeByLevel[i];
+      if (p.level === selectedLevel) {
+        cur.push([p.lon, p.lat]);
+      } else {
+        if (cur.length >= 2) runs.push(cur);
+        cur = [];
+      }
+    }
+    if (cur.length >= 2) runs.push(cur);
+    if (runs.length === 0) return null;
+
+    return {
+      type: 'FeatureCollection',
+      features: runs.map((coordinates) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates },
+      })),
+    };
+  }, [routeByLevel, currentStepPoint, nextStepPoint, selectedLevel]);
+
+  // -------------------------------------------------------------------------
+  // Route-up heading
+  // -------------------------------------------------------------------------
+  //
+  // Two distinct behaviours, selected by `lockHeading`.
+  //
+  // Walking screen (lockHeading = false):
+  //   The heading is the direction of the road the student is about to
+  //   walk (see utils/legBearing.js), taken from `currentStepPoint`
+  //   forward, rounded to the nearest multiple of INDOOR_HEADING_SNAP_DEG
+  //   (90 = N/E/S/W, 45 = 8 directions, 22.5 = 16, 0 = exact angle,
+  //   no rounding). The heading updates
+  //   when `currentStepPoint` changes — i.e. when the student presses
+  //   Next. Between presses, the map holds still.
+  //
+  // Preview (lockHeading = true):
+  //   The heading is the start-to-end bearing of the whole route,
+  //   SNAPPED to N or S only. Tapping a floor chip does not rotate
+  //   the preview. This matches the previous version's behaviour.
+  const routeHeadingRaw = useMemo(() => {
+    const all = routeByLevel || [];
+    if (all.length < 2) return 0;
+
+    if (lockHeading) {
+      // Preview: overall direction of the trip, snapped to N or S.
+      const first = all[0];
+      const last = all[all.length - 1];
+      let raw;
+      if (
+        haversineM(first.lat, first.lon, last.lat, last.lon) >=
+        MIN_HEADING_DISTANCE_M
+      ) {
+        raw = bearingDeg(first.lat, first.lon, last.lat, last.lon);
+      } else {
+        raw = firstLegBearing(all);
+      }
+      return snapToNorthSouth(raw ?? 0);
+    }
+
+    // Walking: look at the points on the current floor from
+    // `currentStepPoint` forward, take the first real leg's bearing,
+    // then snap to the nearest cardinal.
+    let points = all.filter((p) => p.level === selectedLevel);
+    if (points.length < 2) {
+      points = all;
+    }
+
+    let startIdx = 0;
+    if (currentStepPoint) {
+      const idx = points.findIndex(
+        (p) =>
+          p.lat === currentStepPoint.lat && p.lon === currentStepPoint.lon
+      );
+      if (idx >= 0) startIdx = idx;
+    }
+
+    const slice = points.slice(startIdx);
+
+    // The very first step starts in a room. There the path begins with a
+    // short stub into the corridor, which must not decide the direction.
+    const isRouteStart = startIdx === 0;
+
+    // The direction of the road ahead (see utils/legBearing.js): along the
+    // corridor at the start, along the path until it turns on the way, and
+    // towards the destination door on the last turn.
+    const raw = headingAlongRoute(slice, { isRouteStart });
+    // No usable direction (last step, or the leg is under 3 m): keep the
+    // previous heading instead of swinging to north.
+    return raw == null ? null : snapToCardinal(raw);
+  }, [routeByLevel, selectedLevel, currentStepPoint, lockHeading]);
+
+  if (routeHeadingRaw != null) lastHeadingRef.current = routeHeadingRaw;
+  const routeHeading = routeHeadingRaw ?? lastHeadingRef.current;
+
+  // The heading actually applied to the camera: the route-up heading,
+  // plus a half turn when the student has pressed the flip button.
+  const effectiveHeading = (routeHeading + (flipped ? 180 : 0)) % 360;
+
+  // -------------------------------------------------------------------------
+  // Camera fit — once per (building, level)
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    if (loading) return;
+    if (!areas || areas.length === 0) return;
+
+    const key = `${buildingName}|${selectedLevel}`;
+    if (fittedKeyRef.current === key) return;
+
+    const points = [];
+    for (const area of areas) {
+      for (const p of area.boundary || []) {
+        points.push([p.lon, p.lat]);
+      }
+    }
+    if (points.length === 0) return;
+
+    const lons = points.map((p) => p[0]);
+    const lats = points.map((p) => p[1]);
+    const west = Math.min(...lons);
+    const east = Math.max(...lons);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+
+    const centerLon = (west + east) / 2;
+    const centerLat = (south + north) / 2;
+
+    // Diagonal in metres at the building's latitude.
+    const refLat = centerLat;
+    const cosLat = Math.cos((refLat * Math.PI) / 180);
+    const widthM = Math.abs(east - west) * 111320 * cosLat;
+    const heightM = Math.abs(north - south) * 110540;
+    const diagM = Math.hypot(widthM, heightM);
+
+    // Metres per pixel, using the smaller container dimension and a
+    // 0.9 factor so the building doesn't touch the edges.
+    const minDim = Math.min(containerSize.width, containerSize.height);
+    const mPerPx = diagM / Math.max(minDim * 0.9, 1);
+
+    // Web Mercator: metres-per-pixel at zoom z is
+    //   (78271.5 * cosLat) / 2^z.
+    const zoom = Math.log2((78271.5 * cosLat) / mPerPx);
+
+    const fitZoom = Math.max(16, Math.min(21, zoom));
+
+    // Where to look, and how close (see utils/indoorCameraStart.js).
+    const { center: camCenter, zoom: camZoom } = chooseIndoorCamera({
+      here:
+        currentStepPoint && currentStepLevel === selectedLevel
+          ? currentStepPoint
+          : null,
+      routeHere: (routeByLevel || []).filter((p) => p.level === selectedLevel),
+      floorCenter: [centerLon, centerLat],
+      floorFitZoom: fitZoom,
+      cosLat,
+      minDim,
+      focusZoom: FOCUS_ZOOM,
+      previewMinZoom: PREVIEW_MIN_ZOOM,
+    });
+
+    // A zoom already in use in this building (the student's own, or the one
+    // set on the first floor) is kept when moving to another floor.
+    const clamped = keptZoomRef.current != null ? keptZoomRef.current : camZoom;
+
+    const timeout = setTimeout(() => {
+      // Mark as fitted only once we actually issue the camera call.
+      fittedKeyRef.current = key;
+      keptZoomRef.current = clamped;
+      try {
+        cameraRef.current?.setCamera({
+          centerCoordinate: camCenter,
+          zoomLevel: clamped,
+          heading: effectiveHeading,
+          animationDuration: 400,
+        });
+      } catch {
+        // Silent.
+      }
+    }, 100);
+
+    return () => clearTimeout(timeout);
+    // effectiveHeading intentionally excluded: the fit is a one-shot
+    // per floor; heading changes are handled by the separate effect
+    // below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [areas, loading, buildingName, selectedLevel, containerSize]);
+
+  // -------------------------------------------------------------------------
+  // Heading effect — turns the map when the route direction changes
+  // -------------------------------------------------------------------------
+  //
+  // Runs whenever `effectiveHeading` changes. That happens on a Next
+  // press in walking mode (currentStepPoint moves → routeHeading
+  // recomputes → snapped heading may change), and on a flip button
+  // press. It only sets the heading, leaving centre and zoom alone.
+  //
+  // It also runs on every Next press. If the student has zoomed, their zoom
+  // is sent in the same camera call as the heading, so a turn can never
+  // bring back the default zoom.
+  useEffect(() => {
+    if (!cameraRef.current) return;
+    const cam = { heading: effectiveHeading, animationDuration: 500 };
+    if (userZoomRef.current != null) cam.zoomLevel = userZoomRef.current;
+    // Walking: every Next press brings the blue dot back to the middle of
+    // the screen, however far the student had zoomed in or panned away. (Not
+    // in the preview, which has no dot, and not when looking at another
+    // floor than the one the dot is on.)
+    if (!lockHeading && currentStepPoint && currentStepLevel === selectedLevel) {
+      cam.centerCoordinate = [currentStepPoint.lon, currentStepPoint.lat];
+    }
+    try {
+      cameraRef.current.setCamera(cam);
+    } catch {
+      // Silent.
+    }
+    // selectedLevel / currentStepLevel: when a step takes the student to
+    // another floor, centre on the dot once that floor is showing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    effectiveHeading,
+    currentStepPoint?.lat,
+    currentStepPoint?.lon,
+    selectedLevel,
+    currentStepLevel,
+  ]);
+
+  // Remember pinch-zooms. If the zoom changes by itself (not the student)
+  // while they have a zoom set, put it back.
+  const handleRegionDidChange = (feature) => {
+    const props = feature?.properties;
+    if (!props || typeof props.zoomLevel !== 'number') return;
+    if (props.isUserInteraction) {
+      userZoomRef.current = props.zoomLevel;
+      keptZoomRef.current = props.zoomLevel;
+      return;
+    }
+    const wanted = userZoomRef.current;
+    if (
+      wanted != null &&
+      !restoringZoomRef.current &&
+      Math.abs(props.zoomLevel - wanted) > 0.25
+    ) {
+      restoringZoomRef.current = true;
+      try {
+        cameraRef.current?.setCamera({
+          zoomLevel: wanted,
+          animationDuration: 250,
+        });
+      } catch {
+        // Silent.
+      }
+      setTimeout(() => {
+        restoringZoomRef.current = false;
+      }, 400);
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Render
+  // -------------------------------------------------------------------------
+
+  // First load only: nothing to show yet, so the spinner is fine and
+  // there's no camera state to preserve.
+  if (loading && !areas) {
+    return (
+      <View
+        style={[styles.container, style]}
+        onLayout={(e) => setContainerSize(e.nativeEvent.layout)}
+      >
+        <ActivityIndicator color={COLORS.primaryDark} />
+      </View>
+    );
+  }
+
+  if (error && (!areas || areas.length === 0)) {
+    return <View style={[styles.container, style]} />;
+  }
+
+  if (!areas || areas.length === 0) {
+    return <View style={[styles.container, style]} />;
+  }
+
+  const firstCentroid =
+    areas[0]?.centroid || areas[0]?.boundary?.[0] || null;
+  const initialCenter = firstCentroid
+    ? [firstCentroid.lon, firstCentroid.lat]
+    : [0, 0];
+
+  const showYouAreHere =
+    currentStepPoint && currentStepLevel === selectedLevel;
+
+  // The compass letter(s) at the top of the screen, e.g. "N", "NE", "137°".
+  const topLabel = headingLabel(effectiveHeading, INDOOR_HEADING_SNAP_DEG);
+
+  // Where the camera is before the floor plan has loaded: on the dot when
+  // walking, on the route start in the preview.
+  const startPoint = showYouAreHere
+    ? currentStepPoint
+    : (routeByLevel || []).find((p) => p.level === selectedLevel) || null;
+
+  const showSwitcher =
+    (forceSwitcher || settings.showFloorSwitcher !== false) &&
+    availableLevels.length > 1;
+
+  return (
+    <View
+      style={[styles.container, style]}
+      onLayout={(e) => setContainerSize(e.nativeEvent.layout)}
+    >
+      <MapView
+        style={styles.map}
+        mapStyle={BLANK_STYLE}
+        logoEnabled={false}
+        attributionEnabled={false}
+        compassEnabled={false}
+        rotateEnabled={false}
+        onRegionDidChange={handleRegionDidChange}
+      >
+        <Camera
+          ref={cameraRef}
+          defaultSettings={{
+            centerCoordinate: startPoint
+              ? [startPoint.lon, startPoint.lat]
+              : initialCenter,
+            zoomLevel: startPoint
+              ? showYouAreHere
+                ? FOCUS_ZOOM
+                : PREVIEW_MIN_ZOOM
+              : 18,
+            heading: effectiveHeading,
+          }}
+        />
+
+        {footprintGeoJSON ? (
+          <ShapeSource id="footprintSource" shape={footprintGeoJSON}>
+            <FillLayer
+              id="footprintFill"
+              style={{ fillColor: INDOOR_INTERIOR_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="footprintOutline"
+              style={{
+                lineColor: INDOOR_BUILDING_OUTLINE_COLOR,
+                lineWidth: INDOOR_BUILDING_OUTLINE_WIDTH,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {corridorsGeoJSON && corridorsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="corridorsSource" shape={corridorsGeoJSON}>
+            <FillLayer
+              id="corridorsFill"
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="corridorsOutline"
+              style={{
+                lineColor: INDOOR_CORRIDOR_OUTLINE_COLOR,
+                lineWidth: 0.75,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {stairsGeoJSON && stairsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="stairsSource" shape={stairsGeoJSON}>
+            <FillLayer
+              id="stairsFill"
+              style={{ fillColor: INDOOR_STAIRS_COLOR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="stairsOutline"
+              style={{
+                lineColor: INDOOR_STAIRS_OUTLINE_COLOR,
+                lineWidth: 1.25,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {roomsGeoJSON && roomsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="roomsSource" shape={roomsGeoJSON}>
+            <FillLayer
+              id="roomsFill"
+              style={{ fillColor: FILL_COLOR_EXPR, fillOpacity: 1 }}
+            />
+            <LineLayer
+              id="roomsOutline"
+              style={{
+                lineColor: INDOOR_ROOM_OUTLINE_COLOR,
+                lineWidth: INDOOR_ROOM_OUTLINE_WIDTH,
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {roomLabelsGeoJSON && roomLabelsGeoJSON.features.length > 0 ? (
+          <ShapeSource id="roomLabelsSource" shape={roomLabelsGeoJSON}>
+            {/* One layer per half-zoom step. Each shows only the names that
+                already fit at that zoom, so a hidden name never blocks a
+                visible one and no name is wider than its room. */}
+            {LABEL_BANDS.map((band, index) => (
+              <SymbolLayer
+                key={`roomsLabels-${band}`}
+                id={`roomsLabels-${band}`}
+                minZoomLevel={band}
+                maxZoomLevel={
+                  index === LABEL_BANDS.length - 1 ? 24 : band + LABEL_BAND_STEP
+                }
+                filter={['<=', ['get', 'minZoom'], band]}
+                style={{
+                  textField: ['get', 'name'],
+                  textFont: ['Noto Sans Regular'],
+                  textSize: [
+                    'interpolate',
+                    ['linear'],
+                    ['zoom'],
+                    LABEL_START_ZOOM,
+                    LABEL_MIN_SIZE,
+                    LABEL_FULL_SIZE_ZOOM,
+                    LABEL_MAX_SIZE,
+                  ],
+                  textMaxWidth: LABEL_WRAP_EM,
+                  textColor: '#334155',
+                  textHaloColor: '#ffffff',
+                  textHaloWidth: 1.5,
+                  textAllowOverlap: false,
+                  textIgnorePlacement: false,
+                  // Centred on the point and always upright, whichever way
+                  // the map is turned.
+                  textAnchor: 'center',
+                  textJustify: 'center',
+                  textRotate: 0,
+                  textRotationAlignment: 'viewport',
+                  textPitchAlignment: 'viewport',
+                }}
+              />
+            ))}
+          </ShapeSource>
+        ) : null}
+
+        {routeDashedGeoJSON ? (
+          <ShapeSource id="indoorRouteDashedSource" shape={routeDashedGeoJSON}>
+            <LineLayer
+              id="indoorRouteDashedLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 3,
+                lineCap: 'round',
+                lineJoin: 'round',
+                lineOpacity: 0.4,
+                lineDasharray: [4, 4],
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {routeSolidGeoJSON ? (
+          <ShapeSource id="indoorRouteSolidSource" shape={routeSolidGeoJSON}>
+            <LineLayer
+              id="indoorRouteSolidLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 4,
+                lineCap: 'round',
+                lineJoin: 'round',
+                lineOpacity: currentLegGeoJSON ? INDOOR_ROUTE_FADED_OPACITY : 1,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON ? (
+          <ShapeSource id="indoorCurrentLegSource" shape={currentLegGeoJSON}>
+            <LineLayer
+              id="indoorCurrentLegCasing"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_OUTLINE_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+            <LineLayer
+              id="indoorCurrentLegLine"
+              style={{
+                lineColor: INDOOR_CURRENT_LEG_COLOR,
+                lineWidth: INDOOR_CURRENT_LEG_WIDTH,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {currentLegGeoJSON && nextStepPoint ? (
+          <ShapeSource id="indoorNextStepSource" shape={pointFeature(nextStepPoint)}>
+            <CircleLayer
+              id="indoorNextStepDot"
+              style={{
+                circleRadius: INDOOR_LEG_END_DOT_RADIUS,
+                circleColor: '#ffffff',
+                circleStrokeColor: INDOOR_CURRENT_LEG_OUTLINE_COLOR,
+                circleStrokeWidth: INDOOR_LEG_END_DOT_BORDER_WIDTH,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {destination ? (
+          <ShapeSource id="indoorDestSource" shape={pointFeature(destination)}>
+            <CircleLayer
+              id="indoorDestHalo"
+              style={{ circleRadius: 11, circleColor: '#dc2626', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorDestDot"
+              style={{
+                circleRadius: 6,
+                circleColor: '#dc2626',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 2,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {showYouAreHere ? (
+          <ShapeSource id="indoorUserSource" shape={pointFeature(currentStepPoint)}>
+            <CircleLayer
+              id="indoorUserHalo"
+              style={{ circleRadius: 14, circleColor: '#2563eb', circleOpacity: 0.25 }}
+            />
+            <CircleLayer
+              id="indoorUserDot"
+              style={{
+                circleRadius: 8,
+                circleColor: '#2563eb',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 3,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+      </MapView>
+
+      {/* Spinner overlay for floor changes after the first load. */}
+      {loading && areas && areas.length > 0 ? (
+        <View style={[styles.loadingOverlay, { pointerEvents: 'none' }]}>
+          <ActivityIndicator color={COLORS.primaryDark} />
+        </View>
+      ) : null}
+
+      {/* Flip button, top-right corner. Shows the compass letter that is
+          at the top of the screen right now. Each press turns the map
+          exactly 180 degrees. */}
+      <TouchableOpacity
+        style={styles.northButton}
+        onPress={() => setFlipped((v) => !v)}
+        accessibilityRole="button"
+        accessibilityLabel={`Map top is ${topLabel}. Turn the map around`}
+      >
+        <Text
+          style={[
+            styles.northButtonText,
+            { fontSize: topLabelFontSize(topLabel) },
+          ]}
+          numberOfLines={1}
+        >
+          {topLabel}
+        </Text>
+      </TouchableOpacity>
+
+      {showSwitcher ? (
+        <View style={styles.switcherContainer}>
+          {availableLevels.map((lvl) => {
+            const active = lvl === selectedLevel;
+            const isStepLevel = lvl === currentStepLevel;
+            return (
+              <TouchableOpacity
+                key={lvl}
+                style={[
+                  styles.switcherChip,
+                  active && styles.switcherChipActive,
+                ]}
+                onPress={() => {
+                  setSelectedLevel(lvl);
+                  setManuallyChosen(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel={`Floor ${levelLabel(lvl)}`}
+                accessibilityState={{ selected: active }}
+              >
+                <Text
+                  style={[
+                    styles.switcherChipText,
+                    active && styles.switcherChipTextActive,
+                  ]}
+                >
+                  {levelLabel(lvl)}
+                </Text>
+                {isStepLevel && !active ? (
+                  <View style={styles.stepLevelDot} />
+                ) : null}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+// Browsers do not shrink text to fit like phones do, so pick a size by length.
+function topLabelFontSize(label) {
+  const n = String(label).length;
+  if (n <= 2) return 15;
+  if (n === 3) return 12;
+  return 10;
+}
+
+function pointFeature(p) {
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
+  };
+}
+
+function _closedRing(boundary) {
+  if (!boundary || boundary.length === 0) return null;
+  const ring = boundary.map((p) => [p.lon, p.lat]);
+  const first = ring[0];
+  const last = ring[ring.length - 1];
+  if (first[0] !== last[0] || first[1] !== last[1]) {
+    ring.push([first[0], first[1]]);
+  }
+  return ring;
+}
+
+function _polygonFeature(area, ring) {
+  return {
+    type: 'Feature',
+    properties: {
+      id: area.id,
+      name: area.name || '',
+      ref: area.ref || '',
+      type: area.type,
+      level: area.level,
+    },
+    geometry: {
+      type: 'Polygon',
+      coordinates: [ring],
+    },
+  };
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: INDOOR_BACKGROUND_COLOR,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  map: {
+    flex: 1,
+    width: '100%',
+  },
+  loadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(241, 245, 249, 0.35)',
+  },
+  northButton: {
+    position: 'absolute',
+    top: SPACING.md,
+    right: SPACING.md,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  northButtonText: {
+    // 16 fits "N" or "NE"; longer labels ("NNE", "137°") shrink to fit.
+    fontSize: 15,
+    paddingHorizontal: 2,
+    fontWeight: '700',
+    color: COLORS.primaryDark,
+  },
+  destMarkerOuter: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: 'rgba(220, 38, 38, 0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  destMarkerInner: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#dc2626',
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
+  userDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#2563eb',
+    borderWidth: 3,
+    borderColor: '#ffffff',
+  },
+  switcherContainer: {
+    position: 'absolute',
+    right: SPACING.md,
+    top: '40%',
+    backgroundColor: 'rgba(255, 255, 255, 0.85)',
+    borderRadius: RADIUS.md,
+    paddingVertical: SPACING.xs,
+    paddingHorizontal: 4,
+  },
+  switcherChip: {
+    width: 40,
+    height: 40,
+    borderRadius: RADIUS.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  switcherChipActive: {
+    backgroundColor: COLORS.primaryDark,
+  },
+  switcherChipText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.text,
+  },
+  switcherChipTextActive: {
+    color: '#ffffff',
+  },
+  stepLevelDot: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.primary,
+  },
+});
+
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\InstructionCard.jsx ---
 
 // The card at the bottom of the walking screen.
@@ -42469,6 +43789,646 @@ const styles = StyleSheet.create({
   labelSelected: { color: '#ffffff' },
 });
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\maplibreWeb.jsx ---
+
+// maplibreWeb.jsx — WEB ONLY.
+//
+// Your phone app draws its maps with @maplibre/maplibre-react-native, which
+// does not exist in a browser. This file gives the web app the SAME building
+// blocks (MapView, Camera, ShapeSource, FillLayer, LineLayer, CircleLayer,
+// SymbolLayer, Images, MarkerView) built on MapLibre GL JS ("maplibre-gl"),
+// the browser version of the same map engine.
+//
+// Because the names and props match, MapView.web.jsx, IndoorMapView.web.jsx
+// and OutdoorBaseMap.web.jsx are your phone files with only the import line
+// changed. Same layers, same colours, same zoom rules, same expressions.
+//
+// How it works, in short:
+//   * <MapView> creates one maplibre-gl Map inside a <div>.
+//   * Sources and layers register themselves (what SHOULD be on the map).
+//     A small "sync" step then makes the real map match, in one batch. This
+//     avoids the "layer added before its source" problem and keeps layer
+//     order identical to the order you wrote them in JSX.
+//   * Style props (fillColor, lineWidth, textField ...) are converted from the
+//     phone's camelCase names to the map spec's paint/layout names.
+//
+// This file is imported only by the *.web.jsx files, so the phone build never
+// loads it.
+
+import maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import { Asset } from 'expo-asset';
+import {
+  createContext,
+  forwardRef,
+  useContext,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { createPortal } from 'react-dom';
+import { Text, View } from 'react-native';
+
+// ---------------------------------------------------------------------------
+// Style conversion: phone names -> map spec names
+// ---------------------------------------------------------------------------
+
+// Every property that belongs in a layer's "layout". Anything else is "paint".
+const LAYOUT_KEYS = new Set([
+  'visibility',
+  'lineCap', 'lineJoin', 'lineMiterLimit', 'lineRoundLimit', 'lineSortKey',
+  'fillSortKey', 'circleSortKey',
+  'symbolPlacement', 'symbolSpacing', 'symbolAvoidEdges', 'symbolSortKey', 'symbolZOrder',
+  'iconAllowOverlap', 'iconIgnorePlacement', 'iconOptional', 'iconRotationAlignment',
+  'iconSize', 'iconTextFit', 'iconTextFitPadding', 'iconImage', 'iconRotate',
+  'iconPadding', 'iconKeepUpright', 'iconOffset', 'iconAnchor', 'iconPitchAlignment',
+  'textPitchAlignment', 'textRotationAlignment', 'textField', 'textFont', 'textSize',
+  'textMaxWidth', 'textLineHeight', 'textLetterSpacing', 'textJustify',
+  'textRadialOffset', 'textVariableAnchor', 'textAnchor', 'textMaxAngle',
+  'textWritingMode', 'textRotate', 'textPadding', 'textKeepUpright', 'textTransform',
+  'textOffset', 'textAllowOverlap', 'textIgnorePlacement', 'textOptional',
+]);
+
+const toKebab = (key) => key.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
+
+/** { fillColor, lineCap, ... } -> { layout: {...}, paint: {...} } (kebab-case). */
+export function splitStyle(style) {
+  const layout = {};
+  const paint = {};
+  for (const [key, value] of Object.entries(style || {})) {
+    if (value === undefined || value === null) continue;
+    (LAYOUT_KEYS.has(key) ? layout : paint)[toKebab(key)] = value;
+  }
+  return { layout, paint };
+}
+
+// The phone passes the blank style as a JSON string; the web wants an object.
+// A normal style URL (the online "liberty" map) is passed through unchanged.
+function parseStyle(mapStyle) {
+  if (typeof mapStyle === 'string') {
+    const text = mapStyle.trim();
+    return text.startsWith('{') ? JSON.parse(text) : text;
+  }
+  return mapStyle;
+}
+
+const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+// Small GeoJSON (a dot, a line, a circle) is compared by value so that a
+// freshly built but identical object does not redraw the map. Big collections
+// (all your roads) are compared by identity only, which is instant.
+function sameData(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const small = (d) => d.type !== 'FeatureCollection' || (d.features?.length ?? 0) <= 25;
+  if (!small(a) || !small(b)) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Contexts
+// ---------------------------------------------------------------------------
+
+const MapCtx = createContext(null);
+const SourceCtx = createContext(null);
+
+function useMapCtx() {
+  const ctx = useContext(MapCtx);
+  if (!ctx) throw new Error('Map layers, sources and markers must be inside <MapView>.');
+  return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// MapView
+// ---------------------------------------------------------------------------
+
+export function MapView({
+  style,
+  mapStyle,
+  children,
+  compassEnabled = false,
+  rotateEnabled = true,
+  onDidFinishLoadingMap,
+  onRegionDidChange,
+  // Accepted so the phone code can pass them unchanged. On the web the logo
+  // and the attribution button are never shown (your own credit line is).
+  // eslint-disable-next-line no-unused-vars
+  logoEnabled,
+  // eslint-disable-next-line no-unused-vars
+  attributionEnabled,
+}) {
+  const containerRef = useRef(null);
+  const orderRef = useRef(null); // hidden div: its child order = JSX layer order
+  const mapRef = useRef(null);
+  const [map, setMap] = useState(null);
+  const [styleVersion, setStyleVersion] = useState(0);
+  const [failed, setFailed] = useState(false);
+
+  const desired = useRef({ sources: new Map(), layers: new Map() });
+  const applied = useRef({ sources: new Map(), layers: new Map() });
+  const styleReady = useRef(false);
+  const syncQueued = useRef(false);
+  const cameraDefaults = useRef({});
+  const pendingCamera = useRef(null);
+  const currentStyle = useRef(mapStyle);
+
+  const callbacks = useRef({});
+  callbacks.current = { onDidFinishLoadingMap, onRegionDidChange };
+
+  // Stable functions, created once. They only touch refs.
+  const api = useMemo(() => {
+    // Make the real map match what the components asked for.
+    function sync() {
+      const m = mapRef.current;
+      if (!m || !styleReady.current) return;
+      const want = desired.current;
+      const have = applied.current;
+
+      // 1. Remove layers that are gone, or whose source is gone.
+      for (const id of [...have.layers.keys()]) {
+        const spec = want.layers.get(id);
+        if (!spec || !want.sources.has(spec.source)) {
+          if (m.getLayer(id)) m.removeLayer(id);
+          have.layers.delete(id);
+        }
+      }
+      // 2. Remove sources that are gone (their layers are already removed).
+      for (const id of [...have.sources.keys()]) {
+        if (!want.sources.has(id)) {
+          if (m.getSource(id)) m.removeSource(id);
+          have.sources.delete(id);
+        }
+      }
+      // 3. Add new sources, update the data of changed ones.
+      for (const [id, data] of want.sources) {
+        if (!have.sources.has(id)) {
+          m.addSource(id, { type: 'geojson', data });
+          have.sources.set(id, data);
+        } else if (!sameData(have.sources.get(id), data)) {
+          m.getSource(id).setData(data);
+          have.sources.set(id, data);
+        }
+      }
+      // 4. Layers, in JSX order. Walking from the top one down, each new
+      //    layer is inserted just under the one above it, so the stacking
+      //    matches the order you wrote them in.
+      const domOrder = orderRef.current
+        ? Array.from(orderRef.current.querySelectorAll('[data-ml-layer]')).map((n) =>
+            n.getAttribute('data-ml-layer')
+          )
+        : [];
+      const rank = new Map(domOrder.map((id, i) => [id, i]));
+      const ordered = [...want.layers.entries()]
+        .filter(([, spec]) => want.sources.has(spec.source))
+        .sort((a, b) => (rank.get(a[0]) ?? 1e9) - (rank.get(b[0]) ?? 1e9));
+
+      let beforeId;
+      for (let i = ordered.length - 1; i >= 0; i--) {
+        const [id, spec] = ordered[i];
+        let cur = have.layers.get(id);
+
+        // A layer whose type or source changed is rebuilt.
+        if (cur && (cur.type !== spec.type || cur.source !== spec.source)) {
+          if (m.getLayer(id)) m.removeLayer(id);
+          have.layers.delete(id);
+          cur = undefined;
+        }
+
+        if (!cur) {
+          const layer = {
+            id,
+            type: spec.type,
+            source: spec.source,
+            layout: spec.layout,
+            paint: spec.paint,
+          };
+          if (spec.filter) layer.filter = spec.filter;
+          if (spec.minzoom != null) layer.minzoom = spec.minzoom;
+          if (spec.maxzoom != null) layer.maxzoom = spec.maxzoom;
+          m.addLayer(layer, beforeId && m.getLayer(beforeId) ? beforeId : undefined);
+        } else {
+          if (!same(cur.filter, spec.filter)) m.setFilter(id, spec.filter ?? null);
+          if (cur.minzoom !== spec.minzoom || cur.maxzoom !== spec.maxzoom) {
+            m.setLayerZoomRange(id, spec.minzoom ?? 0, spec.maxzoom ?? 24);
+          }
+          for (const key of new Set([...Object.keys(cur.paint), ...Object.keys(spec.paint)])) {
+            if (!same(cur.paint[key], spec.paint[key])) {
+              m.setPaintProperty(id, key, spec.paint[key] ?? null);
+            }
+          }
+          for (const key of new Set([...Object.keys(cur.layout), ...Object.keys(spec.layout)])) {
+            if (!same(cur.layout[key], spec.layout[key])) {
+              m.setLayoutProperty(id, key, spec.layout[key] ?? null);
+            }
+          }
+        }
+        have.layers.set(id, spec);
+        beforeId = id;
+      }
+    }
+
+    // Many components register in the same moment; do one sync for all.
+    function requestSync() {
+      if (syncQueued.current) return;
+      syncQueued.current = true;
+      queueMicrotask(() => {
+        syncQueued.current = false;
+        try {
+          sync();
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn('[map] sync failed:', e && e.message);
+        }
+      });
+    }
+
+    function applyCamera(cam) {
+      const m = mapRef.current;
+      if (!m) {
+        // The map is not created yet: remember, and apply it as soon as it is.
+        pendingCamera.current = { ...(pendingCamera.current || {}), ...cam, animationDuration: 0 };
+        return;
+      }
+      const opts = {};
+      if (cam.centerCoordinate) opts.center = cam.centerCoordinate;
+      if (cam.zoomLevel != null) opts.zoom = cam.zoomLevel;
+      if (cam.heading != null) opts.bearing = cam.heading;
+      const duration = cam.animationDuration || 0;
+      if (duration > 0) m.easeTo({ ...opts, duration });
+      else m.jumpTo(opts);
+    }
+
+    return {
+      requestSync,
+      sync,
+      applyCamera,
+      setSource(id, data) {
+        desired.current.sources.set(id, data);
+        requestSync();
+      },
+      removeSource(id) {
+        desired.current.sources.delete(id);
+        requestSync();
+      },
+      setLayer(id, spec) {
+        desired.current.layers.set(id, spec);
+        requestSync();
+      },
+      removeLayer(id) {
+        desired.current.layers.delete(id);
+        requestSync();
+      },
+    };
+  }, []);
+
+  // Create the map once.
+  useEffect(() => {
+    const cam = cameraDefaults.current || {};
+    let m;
+    try {
+      m = new maplibregl.Map({
+        container: containerRef.current,
+        style: parseStyle(currentStyle.current),
+        center: cam.centerCoordinate || [0, 0],
+        zoom: cam.zoomLevel ?? 1,
+        bearing: cam.heading ?? 0,
+        pitch: 0,
+        maxPitch: 0, // the campus map is flat, like on the phone
+        attributionControl: false,
+      });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('[map] could not start the map (WebGL missing?):', e && e.message);
+      setFailed(true);
+      return undefined;
+    }
+    mapRef.current = m;
+
+    if (pendingCamera.current) {
+      api.applyCamera(pendingCamera.current);
+      pendingCamera.current = null;
+    }
+
+    let loadReported = false;
+    const reportLoaded = () => {
+      if (loadReported) return;
+      loadReported = true;
+      callbacks.current.onDidFinishLoadingMap?.();
+    };
+    let fallbackTimer = null;
+
+    m.on('style.load', () => {
+      // A new style starts empty: forget what was on the old one and re-add.
+      applied.current.sources.clear();
+      applied.current.layers.clear();
+      styleReady.current = true;
+      setStyleVersion((v) => v + 1);
+      api.sync();
+      // Safety net: if 'load' is slow to fire, report ready after a moment.
+      if (!fallbackTimer) fallbackTimer = setTimeout(reportLoaded, 4000);
+    });
+    m.on('load', reportLoaded);
+    m.on('moveend', (e) => {
+      callbacks.current.onRegionDidChange?.({
+        properties: {
+          zoomLevel: m.getZoom(),
+          heading: m.getBearing(),
+          isUserInteraction: !!e.originalEvent,
+        },
+      });
+    });
+    m.on('error', (e) => {
+      // eslint-disable-next-line no-console
+      console.warn('[map]', (e && e.error && e.error.message) || e);
+    });
+
+    // Keep the canvas the right size when the layout changes.
+    let observer = null;
+    if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
+      observer = new ResizeObserver(() => m.resize());
+      observer.observe(containerRef.current);
+    }
+
+    setMap(m);
+
+    return () => {
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      if (observer) observer.disconnect();
+      styleReady.current = false;
+      applied.current.sources.clear();
+      applied.current.layers.clear();
+      mapRef.current = null;
+      m.remove();
+      setMap(null);
+    };
+  }, [api]);
+
+  // The style changed (for example, your own map failed and we switch to the
+  // online map picture).
+  useEffect(() => {
+    if (!map || currentStyle.current === mapStyle) return;
+    currentStyle.current = mapStyle;
+    styleReady.current = false;
+    map.setStyle(parseStyle(mapStyle), { diff: false });
+  }, [map, mapStyle]);
+
+  // Rotation by hand (two fingers / right-drag). The indoor map turns it off.
+  useEffect(() => {
+    if (!map) return;
+    if (rotateEnabled) {
+      map.dragRotate.enable();
+      map.touchZoomRotate.enableRotation();
+    } else {
+      map.dragRotate.disable();
+      map.touchZoomRotate.disableRotation();
+    }
+  }, [map, rotateEnabled]);
+
+  // The compass button (walking screen).
+  useEffect(() => {
+    if (!map || !compassEnabled) return undefined;
+    const control = new maplibregl.NavigationControl({
+      showZoom: false,
+      showCompass: true,
+      visualizePitch: false,
+    });
+    map.addControl(control, 'top-right');
+    return () => {
+      try {
+        map.removeControl(control);
+      } catch {
+        // The map is already gone.
+      }
+    };
+  }, [map, compassEnabled]);
+
+  const ctx = useMemo(() => ({ map, styleVersion, api, cameraDefaults }), [map, styleVersion, api]);
+
+  if (failed) {
+    return (
+      <View style={[style, { alignItems: 'center', justifyContent: 'center', padding: 16 }]}>
+        <Text style={{ color: '#4a574f', textAlign: 'center' }}>
+          This browser could not start the map. Try Chrome, Edge, Firefox or Safari, and make sure
+          hardware acceleration is on.
+        </Text>
+      </View>
+    );
+  }
+
+  return (
+    <MapCtx.Provider value={ctx}>
+      <View style={style}>
+        <div
+          ref={containerRef}
+          style={{ position: 'absolute', top: 0, right: 0, bottom: 0, left: 0 }}
+        />
+        {/* Never shown. Its only job is to keep the layers in JSX order. */}
+        <div ref={orderRef} style={{ display: 'none' }}>
+          {children}
+        </div>
+      </View>
+    </MapCtx.Provider>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+
+// ref.setCamera({ centerCoordinate, zoomLevel, heading, animationDuration })
+export const Camera = forwardRef(function Camera({ defaultSettings }, ref) {
+  const { api, cameraDefaults } = useMapCtx();
+
+  // Layout effects of children run before the parent's effects, so the map
+  // (created in MapView's effect) sees these settings.
+  useLayoutEffect(() => {
+    cameraDefaults.current = defaultSettings || {};
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useImperativeHandle(ref, () => ({
+    setCamera: (cam) => api.applyCamera(cam || {}),
+  }), [api]);
+
+  return null;
+});
+
+// ---------------------------------------------------------------------------
+// Sources and layers
+// ---------------------------------------------------------------------------
+
+export function ShapeSource({ id, shape, children }) {
+  const { api } = useMapCtx();
+
+  useEffect(() => {
+    if (!shape) return undefined;
+    api.setSource(id, shape);
+    return () => api.removeSource(id);
+  }, [api, id, shape]);
+
+  return <SourceCtx.Provider value={shape ? id : null}>{children}</SourceCtx.Provider>;
+}
+
+function makeLayer(type, displayName) {
+  function Layer({ id, style, filter, minZoomLevel, maxZoomLevel }) {
+    const { api } = useMapCtx();
+    const sourceId = useContext(SourceCtx);
+
+    // Rebuild only when something really changed (props are new objects on
+    // every render, so compare by value).
+    const signature = JSON.stringify([
+      sourceId,
+      filter ?? null,
+      minZoomLevel ?? null,
+      maxZoomLevel ?? null,
+      style ?? null,
+    ]);
+
+    useEffect(() => {
+      if (!sourceId) return undefined;
+      const { layout, paint } = splitStyle(style);
+      api.setLayer(id, {
+        type,
+        source: sourceId,
+        filter: filter ?? null,
+        minzoom: minZoomLevel,
+        maxzoom: maxZoomLevel,
+        layout,
+        paint,
+      });
+      return () => api.removeLayer(id);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [api, id, signature]);
+
+    return <span data-ml-layer={id} />;
+  }
+  Layer.displayName = displayName;
+  return Layer;
+}
+
+export const FillLayer = makeLayer('fill', 'FillLayer');
+export const LineLayer = makeLayer('line', 'LineLayer');
+export const CircleLayer = makeLayer('circle', 'CircleLayer');
+export const SymbolLayer = makeLayer('symbol', 'SymbolLayer');
+
+// ---------------------------------------------------------------------------
+// Images (the map symbols: parking, library, ...)
+// ---------------------------------------------------------------------------
+
+function imageUri(src) {
+  if (!src) return null;
+  if (typeof src === 'string') return src;
+  if (typeof src === 'object' && src.uri) return src.uri;
+  try {
+    return Asset.fromModule(src).uri; // a require('./x.png') on the web
+  } catch {
+    return null;
+  }
+}
+
+function loadHtmlImage(uri) {
+  return new Promise((resolve, reject) => {
+    const img = new window.Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`Could not load map image: ${uri}`));
+    img.src = uri;
+  });
+}
+
+const TRANSPARENT = { width: 1, height: 1, data: new Uint8Array(4) };
+
+export function Images({ images }) {
+  const { map, styleVersion } = useMapCtx();
+  // Reload only when the set of pictures really changes, not on every render.
+  const imagesKey = JSON.stringify(images ?? null);
+
+  useEffect(() => {
+    // styleVersion is 0 until the map's style has loaded; wait for that.
+    if (!map || !images || styleVersion === 0) return undefined;
+    let cancelled = false;
+    const names = Object.keys(images);
+
+    // A symbol layer may ask for an icon a moment before it has downloaded.
+    // Give it an empty placeholder so the map stays quiet, then swap it.
+    const onMissing = (e) => {
+      if (names.includes(e.id) && !map.hasImage(e.id)) map.addImage(e.id, TRANSPARENT);
+    };
+    map.on('styleimagemissing', onMissing);
+
+    names.forEach(async (name) => {
+      const uri = imageUri(images[name]);
+      if (!uri) return;
+      try {
+        const img = await loadHtmlImage(uri);
+        if (cancelled) return;
+        if (map.hasImage(name)) map.updateImage(name, img);
+        else map.addImage(name, img);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('[map]', e && e.message);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      map.off('styleimagemissing', onMissing);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, styleVersion, imagesKey]);
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// MarkerView (the green start dot and the red destination dot)
+// ---------------------------------------------------------------------------
+
+// {x, y} anchor (0, 0.5 or 1) -> the name maplibre-gl uses.
+function anchorName(anchor) {
+  const x = anchor?.x ?? 0.5;
+  const y = anchor?.y ?? 0.5;
+  const col = x < 0.25 ? 'left' : x > 0.75 ? 'right' : '';
+  const row = y < 0.25 ? 'top' : y > 0.75 ? 'bottom' : '';
+  if (row && col) return `${row}-${col}`;
+  return row || col || 'center';
+}
+
+export function MarkerView({ coordinate, anchor, children }) {
+  const { map } = useMapCtx();
+  const [element] = useState(() => document.createElement('div'));
+  const markerRef = useRef(null);
+  const [lon, lat] = coordinate;
+  const anchorKey = anchorName(anchor);
+
+  useEffect(() => {
+    if (!map) return undefined;
+    const marker = new maplibregl.Marker({ element, anchor: anchorKey })
+      .setLngLat([lon, lat])
+      .addTo(map);
+    markerRef.current = marker;
+    return () => {
+      marker.remove();
+      markerRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, element, anchorKey]);
+
+  useEffect(() => {
+    if (markerRef.current) markerRef.current.setLngLat([lon, lat]);
+  }, [lon, lat]);
+
+  return createPortal(children, element);
+}
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\MapView.jsx ---
 
 // MapView.jsx — MapLibre version with rotation and recentering.
@@ -42540,6 +44500,7 @@ import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
 import { IndoorMapView } from '@/components/IndoorMapView';
 import { OutdoorBaseMap } from '@/components/OutdoorBaseMap';
 import { haversineM, bearingDeg } from '@/utils/geo';
+import { rememberPreviewHeading, startHeadingFor } from '@/utils/walkStartHeading';
 import {
   CAMERA_MIN_INTERVAL_MS,
   CAMERA_MIN_MOVE_M,
@@ -42797,6 +44758,20 @@ export function RouteMap({
       ? null
       : (previewBaseHeading + (flipped ? 180 : 0)) % 360;
 
+  // The preview remembers the heading it shows (including a flip), so the
+  // walking screen can open facing the same way.
+  useEffect(() => {
+    if (followBearing || mapHeading == null) return;
+    rememberPreviewHeading(routeCoords, mapHeading);
+  }, [followBearing, mapHeading, routeCoords]);
+
+  // Walking screen: the heading to start with, before the compass or GPS has
+  // one. The same direction the preview showed, not north.
+  const walkStartHeading = useMemo(
+    () => (followBearing ? startHeadingFor(routeCoords) : null),
+    [followBearing, routeCoords]
+  );
+
   // Fit parameters, computed once per route. Used by the fit effect
   // once mapReady is true.
   const fit = useMemo(() => {
@@ -42886,6 +44861,20 @@ export function RouteMap({
     routeCoords.length,
   ]);
 
+  // Walking screen: face the preview's direction as soon as the native map is
+  // ready, and keep it until the compass or GPS gives a real heading (the
+  // follow camera below takes over then).
+  useEffect(() => {
+    if (mode !== 'outdoor' || !followBearing) return;
+    if (!mapReady || !cameraRef.current) return;
+    if (bearing != null || walkStartHeading == null) return;
+    try {
+      cameraRef.current.setCamera({ heading: walkStartHeading, animationDuration: 0 });
+    } catch {
+      // Silent.
+    }
+  }, [mode, followBearing, mapReady, bearing, walkStartHeading]);
+
   // Follow camera (walking screen only). Throttled: at most one
   // update every CAMERA_MIN_INTERVAL_MS, and only when the student
   // has moved at least CAMERA_MIN_MOVE_M or the heading has changed
@@ -42917,19 +44906,24 @@ export function RouteMap({
       return;
     }
 
+    // Live heading if there is one, else the last one used, else the
+    // direction the preview showed. Never north just because the student has
+    // not started moving yet.
+    const heading = bearing ?? last.heading ?? walkStartHeading;
+
     lastCamRef.current = {
       t: now,
       lat: userLocation.lat,
       lon: userLocation.lon,
-      heading: bearing ?? last.heading,
+      heading,
     };
 
     const update = {
       centerCoordinate: [userLocation.lon, userLocation.lat],
       animationDuration: 600,
     };
-    if (bearing != null) {
-      update.heading = bearing;
+    if (heading != null) {
+      update.heading = heading;
     }
 
     try {
@@ -42937,7 +44931,7 @@ export function RouteMap({
     } catch {
       // Silent.
     }
-  }, [userLocation, bearing, followBearing, mode]);
+  }, [userLocation, bearing, followBearing, mode, walkStartHeading]);
 
   if (mode === 'indoor') {
     if (indoorNoRooms) {
@@ -42986,7 +44980,7 @@ export function RouteMap({
           defaultSettings={{
             centerCoordinate: initialCenter,
             zoomLevel: fit ? fit.zoom : 16,
-            heading: mapHeading != null ? mapHeading : 0,
+            heading: mapHeading != null ? mapHeading : (walkStartHeading ?? 0),
           }}
         />
 
@@ -43078,6 +45072,721 @@ export function RouteMap({
           config.js (OUTDOOR_MAP_ATTRIBUTION); '' hides it. */}
       {useOwnBaseMap && baseMap && ATTRIBUTION_TEXT ? (
         <View style={styles.attribution} pointerEvents="none">
+          <Text style={styles.attributionText}>{ATTRIBUTION_TEXT}</Text>
+        </View>
+      ) : null}
+
+      {/* Preview flip button. Shows which compass direction is at the
+          top of the screen right now. One press turns the map 180°. */}
+      {showFlipButton ? (
+        <TouchableOpacity
+          style={styles.flipButton}
+          onPress={() => setFlipped((v) => !v)}
+          accessibilityRole="button"
+          accessibilityLabel={
+            topLabel === 'N' ? 'Flip map to south-up' : 'Flip map to north-up'
+          }
+        >
+          <Text style={styles.flipButtonText}>{topLabel}</Text>
+        </TouchableOpacity>
+      ) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  attribution: {
+    position: 'absolute',
+    left: 6,
+    bottom: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    backgroundColor: 'rgba(255, 255, 255, 0.7)',
+  },
+  attributionText: {
+    fontSize: 10,
+    color: '#444444',
+  },
+  wrapper: {
+    overflow: 'hidden',
+  },
+  map: {
+    flex: 1,
+  },
+  marker: {
+    padding: 4,
+  },
+  markerDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
+  flipButton: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  flipButtonText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.primaryDark,
+  },
+});
+
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\MapView.web.jsx ---
+
+// MapView.web.jsx — WEB VERSION.
+//
+// Same file as MapView.jsx (the phone version), with only the map library
+// swapped: it imports from '@/components/maplibreWeb' (MapLibre GL JS, the
+// browser map engine) instead of '@maplibre/maplibre-react-native'. Expo picks
+// this file automatically in the browser, and the phone build ignores it.
+// If you change the phone file, make the same change here.
+//
+// ---- Original notes from MapView.jsx follow ----
+
+// MapView.jsx — MapLibre version with rotation and recentering.
+//
+// Two modes:
+//   - outdoor: the tile map (as before).
+//   - indoor:  the floor plan (IndoorMapView), which fetches rooms
+//              and corridors for the current building+level. If the
+//              API returns no rooms (unsurveyed building), we fall
+//              back to IndoorMapPlaceholder.
+//
+// What's drawn on the outdoor map, bottom to top:
+//
+//   1. The route line.
+//   2. The start and destination markers.
+//   3. The accuracy circle — a polygon whose radius is the reported
+//      GPS accuracy in metres. It's drawn under the dot so the dot
+//      stays legible. Its presence tells the student that the dot
+//      sitting a few metres off the line is the phone's uncertainty,
+//      not the app being wrong.
+//   4. The heading cone — a small triangle from the dot's position
+//      in the direction of travel.
+//   5. The dot — a CircleLayer (halo + dot).
+//
+// The dot is a CircleLayer rather than a MarkerView because a
+// MarkerView is a React Native view on top of the map, and the
+// native layer can lag or hold position while the camera is
+// animating or rotating. A CircleLayer is drawn by MapLibre itself
+// and can't lag.
+//
+// The camera is throttled: at most one update every
+// CAMERA_MIN_INTERVAL_MS, and only when the student has moved at
+// least CAMERA_MIN_MOVE_M or the heading has changed by at least
+// CAMERA_MIN_HEADING_DEG. This stops the camera animation from
+// being restarted several times a second around corners.
+//
+// Route-up preview
+// ----------------
+// When this component is used as a preview (followBearing = false),
+// the initial fit turns the map so the route runs from bottom to top
+// of the screen. This is a one-shot turn, not a continuous follow.
+// The walking screen passes followBearing = true, so it skips the
+// preview heading entirely and follows the walker's compass.
+//
+// The preview gets its own N/S flip button (top-right). It shows
+// which compass direction is at the top of the screen right now.
+// One press turns the map 180°.
+//
+// The fit runs only after `onDidFinishLoadingMap` fires, so a
+// setCamera call isn't dropped while the native map is still
+// loading.
+//
+// Walking screen is untouched by all of this: it passes
+// followBearing = true and the whole preview block is skipped.
+
+import { useMemo, useRef, useEffect, useState } from 'react';
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  MapView,
+  Camera,
+  ShapeSource,
+  LineLayer,
+  FillLayer,
+  CircleLayer,
+  MarkerView,
+} from '@/components/maplibreWeb';
+
+import { IndoorMapPlaceholder } from '@/components/IndoorMapPlaceholder';
+import { IndoorMapView } from '@/components/IndoorMapView';
+import { OutdoorBaseMap } from '@/components/OutdoorBaseMap';
+import { haversineM, bearingDeg } from '@/utils/geo';
+import { rememberPreviewHeading, startHeadingFor } from '@/utils/walkStartHeading';
+import {
+  CAMERA_MIN_INTERVAL_MS,
+  CAMERA_MIN_MOVE_M,
+  CAMERA_MIN_HEADING_DEG,
+  OUTDOOR_BASEMAP,
+  OUTDOOR_MAP_ATTRIBUTION,
+} from '@/constants/config';
+import { COLORS } from '@/constants/theme';
+import { OUTDOOR_BLANK_STYLE } from '@/constants/outdoorMapStyle';
+import { loadBaseMap } from '@/services/basemap';
+
+// The online map picture. Used when OUTDOOR_BASEMAP is 'openfreemap', and as
+// the fallback when your own map could not be loaded (no network and no saved
+// copy, or the server has no map file).
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
+
+// Which outdoor map to draw: 'own' = built from your map.osm (see
+// OutdoorBaseMap), 'openfreemap' = the online map picture. Set in config.js.
+const USE_OWN_BASEMAP = (OUTDOOR_BASEMAP ?? 'own') === 'own';
+// Credit line shown on your own map. Leave it as '' to hide it.
+const ATTRIBUTION_TEXT = OUTDOOR_MAP_ATTRIBUTION ?? '© OpenStreetMap contributors';
+const DEFAULT_CENTER = [39.2000, -6.7500];
+
+const CAMPUS_BOUNDS = {
+  minLon: 33.30,
+  maxLon: 33.55,
+  minLat: -9.10,
+  maxLat: -8.75,
+};
+
+// Above this accuracy (in metres) the accuracy circle stops being
+// useful — it covers a whole block. We still draw the dot, just
+// without the circle.
+const ACCURACY_CIRCLE_MAX_M = 60;
+
+// The preview fit pulls back by this many zoom levels when the map
+// is rotated, because a diagonal route can push its ends toward the
+// screen edges once the map is turned.
+const PREVIEW_HEADING_ZOOM_OFFSET = 0.5;
+
+function isWithinCampus(lon, lat) {
+  return (
+    lon >= CAMPUS_BOUNDS.minLon &&
+    lon <= CAMPUS_BOUNDS.maxLon &&
+    lat >= CAMPUS_BOUNDS.minLat &&
+    lat <= CAMPUS_BOUNDS.maxLat
+  );
+}
+
+function angularDifference(a, b) {
+  const d = Math.abs(a - b) % 360;
+  return Math.min(d, 360 - d);
+}
+
+// A GeoJSON point for the user's position.
+function userPointGeoJSON(userLocation) {
+  if (!userLocation) return null;
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Point',
+      coordinates: [userLocation.lon, userLocation.lat],
+    },
+  };
+}
+
+// A GeoJSON polygon approximating a circle of radius `radiusM`
+// around `userLocation`. 32 vertices is plenty for a small circle
+// and keeps the payload tiny.
+function accuracyCircleGeoJSON(userLocation, radiusM) {
+  if (!userLocation || radiusM == null || radiusM <= 0) return null;
+  if (radiusM > ACCURACY_CIRCLE_MAX_M) return null;
+
+  const METERS_PER_DEG_LAT = 111000;
+  const METERS_PER_DEG_LON =
+    111000 * Math.cos((userLocation.lat * Math.PI) / 180);
+
+  const steps = 32;
+  const ring = [];
+  for (let i = 0; i < steps; i++) {
+    const angle = (i / steps) * Math.PI * 2;
+    const dLat = (radiusM * Math.cos(angle)) / METERS_PER_DEG_LAT;
+    const dLon = (radiusM * Math.sin(angle)) / METERS_PER_DEG_LON;
+    ring.push([userLocation.lon + dLon, userLocation.lat + dLat]);
+  }
+  ring.push(ring[0]);
+
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Polygon',
+      coordinates: [ring],
+    },
+  };
+}
+
+// A small cone pointing in the direction of travel. About 12 m long
+// and 8 m wide at the far end.
+function userHeadingGeoJSON(userLocation, heading) {
+  if (!userLocation || heading == null) return null;
+  const METERS_PER_DEG_LAT = 111000;
+  const METERS_PER_DEG_LON =
+    111000 * Math.cos((userLocation.lat * Math.PI) / 180);
+
+  const rad = (heading * Math.PI) / 180;
+  const forwardLat =
+    userLocation.lat + (12 * Math.cos(rad)) / METERS_PER_DEG_LAT;
+  const forwardLon =
+    userLocation.lon + (12 * Math.sin(rad)) / METERS_PER_DEG_LON;
+
+  const leftAngle = rad - Math.PI / 6;
+  const rightAngle = rad + Math.PI / 6;
+  const leftLat =
+    userLocation.lat + (8 * Math.cos(leftAngle)) / METERS_PER_DEG_LAT;
+  const leftLon =
+    userLocation.lon + (8 * Math.sin(leftAngle)) / METERS_PER_DEG_LON;
+  const rightLat =
+    userLocation.lat + (8 * Math.cos(rightAngle)) / METERS_PER_DEG_LAT;
+  const rightLon =
+    userLocation.lon + (8 * Math.sin(rightAngle)) / METERS_PER_DEG_LON;
+
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[
+        [userLocation.lon, userLocation.lat],
+        [leftLon, leftLat],
+        [forwardLon, forwardLat],
+        [rightLon, rightLat],
+        [userLocation.lon, userLocation.lat],
+      ]],
+    },
+  };
+}
+
+export function RouteMap({
+  geometry = [],
+  markers = [],
+  userLocation = null,
+  accuracyM = null,
+  bearing = null,
+  followBearing = false,
+  mode = 'outdoor',
+  destinationName = null,
+  indoorBuildingName = null,
+  indoorLevel = null,
+  indoorGeometry = [],
+  indoorGeometryByLevel = [],
+  indoorDestination = null,
+  currentStepPoint = null,
+  nextStepPoint = null,
+  currentStepLevel = null,
+  style,
+}) {
+  const cameraRef = useRef(null);
+
+  const [indoorNoRooms, setIndoorNoRooms] = useState(false);
+
+  // Preview-only: gate the initial fit on the native map being
+  // loaded, so setCamera({ heading }) isn't dropped while the map is
+  // still initialising. On the walking screen (followBearing = true)
+  // this state is set but never used.
+  const [mapReady, setMapReady] = useState(false);
+
+  // Your own base map (roads, buildings...). null until loaded; if it cannot
+  // be had at all, baseMapFailed switches to the online map picture instead.
+  const [baseMap, setBaseMap] = useState(null);
+  const [baseMapFailed, setBaseMapFailed] = useState(false);
+  useEffect(() => {
+    if (!USE_OWN_BASEMAP) return undefined;
+    let cancelled = false;
+    loadBaseMap().then((data) => {
+      if (cancelled) return;
+      if (data) setBaseMap(data);
+      else setBaseMapFailed(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const useOwnBaseMap = USE_OWN_BASEMAP && !baseMapFailed;
+
+  // Preview-only: 0°/180° flip. Chosen from the route's overall
+  // bearing, toggled by the button. Irrelevant on the walking screen.
+  const [flipped, setFlipped] = useState(false);
+
+  useEffect(() => {
+    setIndoorNoRooms(false);
+  }, [indoorBuildingName, indoorLevel]);
+
+  // Reset the flip when the route changes, so a new route starts on
+  // its own preferred side rather than inheriting the previous flip.
+  useEffect(() => {
+    setFlipped(false);
+  }, [geometry]);
+
+  const routeCoords = useMemo(
+    () => geometry.map((p) => [p.lon, p.lat]),
+    [geometry]
+  );
+
+  const lineGeoJSON = useMemo(() => {
+    if (routeCoords.length < 2) return null;
+    return {
+      type: 'Feature',
+      properties: {},
+      geometry: {
+        type: 'LineString',
+        coordinates: routeCoords,
+      },
+    };
+  }, [routeCoords]);
+
+  const userDot = useMemo(
+    () => userPointGeoJSON(userLocation),
+    [userLocation]
+  );
+
+  const userAccuracyCircle = useMemo(
+    () => accuracyCircleGeoJSON(userLocation, accuracyM),
+    [userLocation, accuracyM]
+  );
+
+  const userHeading = useMemo(
+    () => userHeadingGeoJSON(userLocation, bearing),
+    [userLocation, bearing]
+  );
+
+  // The route's overall bearing, from first point to last. Null when
+  // the walking screen is using this map (followBearing is true), or
+  // when the route is too short for a meaningful bearing.
+  const previewHeading = useMemo(() => {
+    if (followBearing) return null;
+    if (routeCoords.length < 2) return null;
+    const first = routeCoords[0];             // [lon, lat]
+    const last = routeCoords[routeCoords.length - 1];
+    return bearingDeg(first[1], first[0], last[1], last[0]);
+  }, [routeCoords, followBearing]);
+
+  // The base orientation for the preview, snapped to 0 or 180.
+  // Same idea as the indoor map's baseHeading: only two values, so
+  // the map never sits at a skew angle.
+  const previewBaseHeading = useMemo(() => {
+    if (previewHeading == null) return null;
+    return Math.cos((previewHeading * Math.PI) / 180) >= 0 ? 0 : 180;
+  }, [previewHeading]);
+
+  // Effective heading, including the flip.
+  const mapHeading =
+    previewBaseHeading == null
+      ? null
+      : (previewBaseHeading + (flipped ? 180 : 0)) % 360;
+
+  // The preview remembers the heading it shows (including a flip), so the
+  // walking screen can open facing the same way.
+  useEffect(() => {
+    if (followBearing || mapHeading == null) return;
+    rememberPreviewHeading(routeCoords, mapHeading);
+  }, [followBearing, mapHeading, routeCoords]);
+
+  // Walking screen: the heading to start with, before the compass or GPS has
+  // one. The same direction the preview showed, not north.
+  const walkStartHeading = useMemo(
+    () => (followBearing ? startHeadingFor(routeCoords) : null),
+    [followBearing, routeCoords]
+  );
+
+  // Fit parameters, computed once per route. Used by the fit effect
+  // once mapReady is true.
+  const fit = useMemo(() => {
+    if (routeCoords.length < 2) return null;
+    const valid = routeCoords.filter(
+      (c) =>
+        Array.isArray(c) &&
+        Number.isFinite(c[0]) &&
+        Number.isFinite(c[1]) &&
+        isWithinCampus(c[0], c[1])
+    );
+    if (valid.length === 0) return null;
+
+    const lons = valid.map((c) => c[0]);
+    const lats = valid.map((c) => c[1]);
+    const west = Math.min(...lons);
+    const east = Math.max(...lons);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+
+    const centerLon = (west + east) / 2;
+    const centerLat = (south + north) / 2;
+    const span = Math.max(east - west, north - south);
+
+    let zoom = 16;
+    if (span > 0) {
+      zoom = 16 + Math.log2(0.005 / span);
+    }
+    zoom = Math.max(14, Math.min(18, zoom));
+
+    return { center: [centerLon, centerLat], zoom };
+  }, [routeCoords]);
+
+  // Camera throttle state — used only on the walking screen.
+  const lastCamRef = useRef({
+    t: 0,
+    lat: null,
+    lon: null,
+    heading: null,
+  });
+
+  // Preview fit. Only runs when followBearing is false, when the
+  // native map has finished loading, and when we have a fit and a
+  // heading.
+  useEffect(() => {
+    if (mode !== 'outdoor') return;
+    if (followBearing) return;
+    if (!mapReady) return;
+    if (!cameraRef.current) return;
+    if (!fit) return;
+
+    const cam = {
+      centerCoordinate: fit.center,
+      zoomLevel:
+        mapHeading != null
+          ? fit.zoom - PREVIEW_HEADING_ZOOM_OFFSET
+          : fit.zoom,
+      animationDuration: 500,
+    };
+    if (mapHeading != null) {
+      cam.heading = mapHeading;
+    }
+
+    try {
+      cameraRef.current.setCamera(cam);
+    } catch {
+      // Silent.
+    }
+  }, [
+    mode,
+    followBearing,
+    mapReady,
+    fit,
+    mapHeading,
+    previewBaseHeading,
+    flipped,
+    routeCoords.length,
+  ]);
+
+  // Walking screen: face the preview's direction as soon as the native map is
+  // ready, and keep it until the compass or GPS gives a real heading (the
+  // follow camera below takes over then).
+  useEffect(() => {
+    if (mode !== 'outdoor' || !followBearing) return;
+    if (!mapReady || !cameraRef.current) return;
+    if (bearing != null || walkStartHeading == null) return;
+    try {
+      cameraRef.current.setCamera({ heading: walkStartHeading, animationDuration: 0 });
+    } catch {
+      // Silent.
+    }
+  }, [mode, followBearing, mapReady, bearing, walkStartHeading]);
+
+  // Follow camera (walking screen only). Throttled: at most one
+  // update every CAMERA_MIN_INTERVAL_MS, and only when the student
+  // has moved at least CAMERA_MIN_MOVE_M or the heading has changed
+  // by at least CAMERA_MIN_HEADING_DEG.
+  useEffect(() => {
+    if (mode !== 'outdoor') return;
+    if (!followBearing) return;
+    if (!cameraRef.current) return;
+    if (!userLocation) return;
+    if (!isWithinCampus(userLocation.lon, userLocation.lat)) return;
+
+    const now = Date.now();
+    const last = lastCamRef.current;
+
+    const movedM =
+      last.lat != null && last.lon != null
+        ? haversineM(last.lat, last.lon, userLocation.lat, userLocation.lon)
+        : Infinity;
+
+    const headingChanged =
+      last.heading != null && bearing != null
+        ? angularDifference(last.heading, bearing)
+        : Infinity;
+
+    if (
+      now - last.t < CAMERA_MIN_INTERVAL_MS ||
+      (movedM < CAMERA_MIN_MOVE_M && headingChanged < CAMERA_MIN_HEADING_DEG)
+    ) {
+      return;
+    }
+
+    // Live heading if there is one, else the last one used, else the
+    // direction the preview showed. Never north just because the student has
+    // not started moving yet.
+    const heading = bearing ?? last.heading ?? walkStartHeading;
+
+    lastCamRef.current = {
+      t: now,
+      lat: userLocation.lat,
+      lon: userLocation.lon,
+      heading,
+    };
+
+    const update = {
+      centerCoordinate: [userLocation.lon, userLocation.lat],
+      animationDuration: 600,
+    };
+    if (heading != null) {
+      update.heading = heading;
+    }
+
+    try {
+      cameraRef.current.setCamera(update);
+    } catch {
+      // Silent.
+    }
+  }, [userLocation, bearing, followBearing, mode, walkStartHeading]);
+
+  if (mode === 'indoor') {
+    if (indoorNoRooms) {
+      return (
+        <IndoorMapPlaceholder
+          destinationName={destinationName}
+          style={style}
+        />
+      );
+    }
+    return (
+      <IndoorMapView
+        buildingName={indoorBuildingName}
+        level={indoorLevel}
+        routeByLevel={indoorGeometryByLevel}
+        destination={indoorDestination}
+        currentStepPoint={currentStepPoint}
+        nextStepPoint={nextStepPoint}
+        currentStepLevel={currentStepLevel}
+        style={style}
+        onNoRooms={() => setIndoorNoRooms(true)}
+      />
+    );
+  }
+
+  const initialCenter = fit ? fit.center : DEFAULT_CENTER;
+
+  // The button label: N or S, whichever is currently at the top of
+  // the screen. Only shown in preview mode.
+  const showFlipButton =
+    !followBearing && mode === 'outdoor' && mapHeading != null;
+  const topLabel = mapHeading === 0 ? 'N' : 'S';
+
+  return (
+    <View style={[styles.wrapper, style]}>
+      <MapView
+        style={styles.map}
+        mapStyle={useOwnBaseMap ? OUTDOOR_BLANK_STYLE : MAP_STYLE}
+        logoEnabled={false}
+        attributionEnabled={false}
+        compassEnabled={followBearing}
+        onDidFinishLoadingMap={() => setMapReady(true)}
+      >
+        <Camera
+          ref={cameraRef}
+          defaultSettings={{
+            centerCoordinate: initialCenter,
+            zoomLevel: fit ? fit.zoom : 16,
+            heading: mapHeading != null ? mapHeading : (walkStartHeading ?? 0),
+          }}
+        />
+
+        {/* The base map goes first, so everything below is drawn on top of it. */}
+        {useOwnBaseMap && baseMap ? <OutdoorBaseMap data={baseMap} /> : null}
+
+        {lineGeoJSON ? (
+          <ShapeSource id="routeSource" shape={lineGeoJSON}>
+            <LineLayer
+              id="routeLine"
+              style={{
+                lineColor: '#2563eb',
+                lineWidth: 4,
+                lineCap: 'round',
+                lineJoin: 'round',
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {markers.map((marker, i) => (
+          <MarkerView
+            key={i}
+            coordinate={[marker.lon, marker.lat]}
+            anchor={{ x: 0.5, y: 1.0 }}
+          >
+            <View style={styles.marker}>
+              <View
+                style={[
+                  styles.markerDot,
+                  { backgroundColor: i === 0 ? '#16a34a' : '#dc2626' },
+                ]}
+              />
+            </View>
+          </MarkerView>
+        ))}
+
+        {/* Accuracy circle — under the heading cone and the dot. */}
+        {userAccuracyCircle ? (
+          <ShapeSource id="userAccuracySource" shape={userAccuracyCircle}>
+            <FillLayer
+              id="userAccuracyFill"
+              style={{
+                fillColor: '#2563eb',
+                fillOpacity: 0.12,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* Heading cone. */}
+        {userHeading ? (
+          <ShapeSource id="userHeadingSource" shape={userHeading}>
+            <FillLayer
+              id="userHeadingFill"
+              style={{
+                fillColor: '#2563eb',
+                fillOpacity: 0.25,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+
+        {/* The dot — halo, then core. */}
+        {userDot ? (
+          <ShapeSource id="userSource" shape={userDot}>
+            <CircleLayer
+              id="userHalo"
+              style={{
+                circleRadius: 13,
+                circleColor: '#2563eb',
+                circleOpacity: 0.25,
+              }}
+            />
+            <CircleLayer
+              id="userDot"
+              style={{
+                circleRadius: 7,
+                circleColor: '#2563eb',
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 2,
+              }}
+            />
+          </ShapeSource>
+        ) : null}
+      </MapView>
+
+      {/* Credit for the map data, shown on your own map. Set the text in
+          config.js (OUTDOOR_MAP_ATTRIBUTION); '' hides it. */}
+      {useOwnBaseMap && baseMap && ATTRIBUTION_TEXT ? (
+        <View style={[styles.attribution, { pointerEvents: 'none' }]}>
           <Text style={styles.attributionText}>{ATTRIBUTION_TEXT}</Text>
         </View>
       ) : null}
@@ -43660,6 +46369,285 @@ export function OutdoorBaseMap({ data }) {
     </>
   );
 }
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\OutdoorBaseMap.web.jsx ---
+
+// OutdoorBaseMap.web.jsx — WEB VERSION.
+//
+// Same file as OutdoorBaseMap.jsx (the phone version), with only the map library
+// swapped: it imports from '@/components/maplibreWeb' (MapLibre GL JS, the
+// browser map engine) instead of '@maplibre/maplibre-react-native'. Expo picks
+// this file automatically in the browser, and the phone build ignores it.
+// If you change the phone file, make the same change here.
+//
+// ---- Original notes from OutdoorBaseMap.jsx follow ----
+
+// OutdoorBaseMap: draws the outdoor map from your own map.osm data
+// (ground, grass, pitches, parking, roads, paths, buildings, trees, symbols
+// and names) instead of using a map picture from a tile service.
+//
+// Rendered inside the outdoor <MapView>. It adds layers only; the route line,
+// the blue dot, the camera and the heading are drawn by MapView as before and
+// sit on top, because these layers are added first.
+//
+// Layer order, bottom to top:
+//   land use -> grass -> water -> sports -> parking -> roads -> paths
+//   -> buildings -> trees -> symbols -> names
+//
+// Symbols come first among the labels, so a symbol is never hidden by a name.
+
+import { useMemo } from 'react';
+import {
+  Images,
+  ShapeSource,
+  FillLayer,
+  LineLayer,
+  CircleLayer,
+  SymbolLayer,
+} from '@/components/maplibreWeb';
+
+import {
+  OUTDOOR_COLORS as C,
+  LANDUSE_COLORS,
+  GREEN_COLORS,
+  SPORTS_FILL,
+  SPORTS_LINE,
+  POI_TEXT_COLORS,
+  kindColor,
+  OUTDOOR_LABEL_MIN_ZOOM,
+  OUTDOOR_SYMBOL_MIN_ZOOM,
+  OUTDOOR_TREE_MIN_ZOOM,
+} from '@/constants/outdoorMapStyle';
+import { POI_IMAGES } from '@/constants/poiIcons';
+import { labelPointsFor } from '@/utils/basemapLabels';
+
+// Line widths grow with the zoom, so a road stays road-shaped from the whole
+// campus down to a few metres.
+const ROAD_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 14, 0.8, 17, 4, 19, 12, 21, 36];
+const ROAD_CASING_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 14, 1.4, 17, 6, 19, 16, 21, 44];
+const MINOR_ROAD_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 15, 0.6, 17, 2.4, 19, 7, 21, 22];
+const MINOR_ROAD_CASING_WIDTH = ['interpolate', ['exponential', 1.6], ['zoom'], 15, 1.2, 17, 3.6, 19, 9.5, 21, 28];
+// Footpaths: wider than before so the white dots read clearly on the milk ground.
+const PATH_WIDTH = ['interpolate', ['linear'], ['zoom'], 15, 1, 17, 2.4, 19, 4.6, 21, 9];
+const WATERWAY_WIDTH = ['interpolate', ['linear'], ['zoom'], 14, 0.8, 18, 4, 21, 14];
+const NAME_SIZE = ['interpolate', ['linear'], ['zoom'], 16, 10, 19, 12];
+const ICON_SIZE = ['interpolate', ['linear'], ['zoom'], 15, 0.2, 17, 0.28, 19, 0.38, 21, 0.5];
+const TREE_RADIUS = ['interpolate', ['linear'], ['zoom'], 17, 1.5, 19, 3.5, 21, 8];
+
+// Small roads are drawn narrower than main ones.
+const MINOR_ROADS = ['service', 'living_street', 'pedestrian', 'track'];
+const isKind = (...kinds) => ['in', ['get', 'kind'], ['literal', kinds]];
+const isMinor = isKind(...MINOR_ROADS);
+const roadFillColor = ['match', ['get', 'kind'], 'pedestrian', C.roadPedestrian, C.road];
+
+const EMPTY = { type: 'FeatureCollection', features: [] };
+
+function nameStyle(color, extra = {}) {
+  return {
+    textField: ['get', 'name'],
+    textFont: ['Noto Sans Regular'],
+    textSize: NAME_SIZE,
+    textMaxWidth: 7,
+    textColor: color,
+    textHaloColor: C.halo,
+    textHaloWidth: 1.5,
+    textAnchor: 'center',
+    textJustify: 'center',
+    textAllowOverlap: false,
+    textRotationAlignment: 'viewport',
+    textPitchAlignment: 'viewport',
+    ...extra,
+  };
+}
+
+const POI_TEXT_COLOR = kindColor(POI_TEXT_COLORS, 'icon');
+
+export function OutdoorBaseMap({ data }) {
+  const layers = data?.layers ?? {};
+  const get = (name) => layers[name] ?? EMPTY;
+
+  // Names sit at the middle of their shape. Shapes that carry a symbol
+  // (library, dispensary, parking...) show their name under the symbol
+  // instead, so they are left out here.
+  const buildingNames = useMemo(() => labelPointsFor(get('buildings')), [data]);
+  const sportsNames = useMemo(() => labelPointsFor(get('sports')), [data]);
+  const greenNames = useMemo(() => labelPointsFor(get('green')), [data]);
+  const landNames = useMemo(() => labelPointsFor(get('landuse')), [data]);
+
+  return (
+    <>
+      <Images images={POI_IMAGES} />
+
+      <ShapeSource id="base-landuse" shape={get('landuse')}>
+        <FillLayer
+          id="base-landuse-fill"
+          style={{ fillColor: kindColor(LANDUSE_COLORS), fillOpacity: 1 }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-green" shape={get('green')}>
+        <FillLayer
+          id="base-green-fill"
+          style={{ fillColor: kindColor(GREEN_COLORS), fillOpacity: 1 }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-water" shape={get('water')}>
+        <FillLayer id="base-water-fill" style={{ fillColor: C.water, fillOpacity: 1 }} />
+      </ShapeSource>
+      <ShapeSource id="base-waterways" shape={get('waterways')}>
+        <LineLayer
+          id="base-waterways-line"
+          style={{ lineColor: C.water, lineWidth: WATERWAY_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-sports" shape={get('sports')}>
+        <FillLayer
+          id="base-sports-fill"
+          style={{ fillColor: kindColor(SPORTS_FILL), fillOpacity: 1 }}
+        />
+        <LineLayer
+          id="base-sports-line"
+          style={{ lineColor: kindColor(SPORTS_LINE), lineWidth: 1, lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-parking" shape={get('parking')}>
+        <FillLayer id="base-parking-fill" style={{ fillColor: C.parkingFill, fillOpacity: 1 }} />
+        <LineLayer
+          id="base-parking-line"
+          style={{ lineColor: C.parkingLine, lineWidth: 1, lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-roads" shape={get('roads')}>
+        {/* All the grey edges first, then all the roads on top, so junctions are clean. */}
+        <LineLayer
+          id="base-roads-casing-minor"
+          filter={['all', isMinor, ['!=', ['get', 'kind'], 'track']]}
+          style={{ lineColor: C.roadCasing, lineWidth: MINOR_ROAD_CASING_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-casing"
+          filter={['!', isMinor]}
+          style={{ lineColor: C.roadCasing, lineWidth: ROAD_CASING_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-fill-minor"
+          filter={['all', isMinor, ['!=', ['get', 'kind'], 'track']]}
+          style={{ lineColor: roadFillColor, lineWidth: MINOR_ROAD_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-fill"
+          filter={['!', isMinor]}
+          style={{ lineColor: roadFillColor, lineWidth: ROAD_WIDTH, lineCap: 'round', lineJoin: 'round' }}
+        />
+        <LineLayer
+          id="base-roads-track"
+          filter={isKind('track')}
+          style={{ lineColor: C.track, lineWidth: PATH_WIDTH, lineDasharray: [3, 1.5], lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-paths" shape={get('paths')}>
+        {/* Footpaths are drawn as white dots, steps as short white dashes. */}
+        <LineLayer
+          id="base-paths-walk"
+          filter={['!', isKind('steps')]}
+          style={{ lineColor: C.path, lineWidth: PATH_WIDTH, lineDasharray: [0.1, 2], lineCap: 'round' }}
+        />
+        <LineLayer
+          id="base-paths-steps"
+          filter={isKind('steps')}
+          style={{ lineColor: C.path, lineWidth: PATH_WIDTH, lineDasharray: [0.8, 0.6] }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-buildings" shape={get('buildings')}>
+        <FillLayer id="base-buildings-fill" style={{ fillColor: C.buildingFill, fillOpacity: 1 }} />
+        <LineLayer
+          id="base-buildings-line"
+          style={{ lineColor: C.buildingLine, lineWidth: 1, lineJoin: 'round' }}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-trees" shape={get('trees')}>
+        <CircleLayer
+          id="base-trees-dot"
+          minZoomLevel={OUTDOOR_TREE_MIN_ZOOM}
+          style={{
+            circleRadius: TREE_RADIUS,
+            circleColor: C.treeFill,
+            circleStrokeColor: C.treeLine,
+            circleStrokeWidth: 0.75,
+          }}
+        />
+      </ShapeSource>
+
+      {/* Symbols and their names (symbols have priority over the names below). */}
+      <ShapeSource id="base-pois" shape={get('pois')}>
+        <SymbolLayer
+          id="base-pois-icon"
+          minZoomLevel={OUTDOOR_SYMBOL_MIN_ZOOM}
+          filter={['has', 'icon']}
+          style={{
+            iconImage: ['get', 'icon'],
+            iconSize: ICON_SIZE,
+            iconAllowOverlap: false,
+            textOptional: true,
+            ...nameStyle(POI_TEXT_COLOR, {
+              textAnchor: 'top',
+              textOffset: [0, 1.1],
+              textOptional: true,
+            }),
+          }}
+        />
+        <SymbolLayer
+          id="base-pois-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          filter={['!', ['has', 'icon']]}
+          style={nameStyle(C.text)}
+        />
+      </ShapeSource>
+
+      <ShapeSource id="base-landuse-names" shape={landNames}>
+        <SymbolLayer
+          id="base-landuse-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM - 1}
+          style={nameStyle(C.landText, {
+            textSize: ['interpolate', ['linear'], ['zoom'], 15, 12, 19, 17],
+            textMaxWidth: 10,
+            textLetterSpacing: 0.12,
+          })}
+        />
+      </ShapeSource>
+      <ShapeSource id="base-sports-names" shape={sportsNames}>
+        <SymbolLayer
+          id="base-sports-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          style={nameStyle(C.areaText)}
+        />
+      </ShapeSource>
+      <ShapeSource id="base-green-names" shape={greenNames}>
+        <SymbolLayer
+          id="base-green-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          style={nameStyle(C.areaText)}
+        />
+      </ShapeSource>
+      <ShapeSource id="base-building-names" shape={buildingNames}>
+        <SymbolLayer
+          id="base-building-names-text"
+          minZoomLevel={OUTDOOR_LABEL_MIN_ZOOM}
+          style={nameStyle(C.text)}
+        />
+      </ShapeSource>
+    </>
+  );
+}
+
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\PhotoCarousel.jsx ---
@@ -45494,7 +48482,11 @@ export const OUTDOOR_BASEMAP = "own";
 
 // Credit line on your own map. If any of map.osm came from OpenStreetMap,
 // keep this. Set it to "" only if every part of the file is your own drawing.
-export const OUTDOOR_MAP_ATTRIBUTION = "© OpenStreetMap contributors";
+export const OUTDOOR_MAP_ATTRIBUTION = "© Prince Co.LMT";
+
+export const INDOOR_FOCUS_ZOOM = 20; // walking: zoom on the blue dot
+export const INDOOR_PREVIEW_MIN_ZOOM = 19; // preview: never opens further out than this
+
 
 
 
@@ -48152,10 +51144,12 @@ global.fetch = jest.fn(() =>
       "name": "mobile",
       "version": "0.5.0",
       "dependencies": {
+        "@expo/metro-runtime": "~57.0.17",
         "@expo/vector-icons": "^15.0.2",
         "@maplibre/maplibre-react-native": "10",
         "@react-native-async-storage/async-storage": "2.2.0",
         "expo": "~57.0.24",
+        "expo-asset": "~57.0.20",
         "expo-camera": "~57.0.6",
         "expo-clipboard": "~57.0.2",
         "expo-constants": "~57.0.19",
@@ -48167,12 +51161,14 @@ global.fetch = jest.fn(() =>
         "expo-sensors": "~57.0.3",
         "expo-speech": "~57.0.3",
         "expo-status-bar": "~57.0.1",
+        "maplibre-gl": "^5.24.0",
         "react": "19.2.3",
         "react-dom": "19.2.3",
         "react-native": "0.86.3",
         "react-native-reanimated": "4.5.1",
         "react-native-safe-area-context": "~5.7.0",
         "react-native-screens": "~4.26.0",
+        "react-native-web": "^0.21.2",
         "react-native-worklets": "0.10.1"
       },
       "devDependencies": {
@@ -49943,12 +52939,12 @@ global.fetch = jest.fn(() =>
       }
     },
     "node_modules/@expo/image-utils": {
-      "version": "0.11.5",
-      "resolved": "https://registry.npmjs.org/@expo/image-utils/-/image-utils-0.11.5.tgz",
-      "integrity": "sha512-KPQBTpmpAfy/Vu9y4wPW808/qtZxjYmyJg8cm2QCPAupp+qEWA3b5zmk0ulOwQ9OgeHxuCPgUqWgkwHFo7UsrQ==",
+      "version": "0.11.6",
+      "resolved": "https://registry.npmjs.org/@expo/image-utils/-/image-utils-0.11.6.tgz",
+      "integrity": "sha512-rmMpn7QGp6pUGRCQ3vvB9RP/vqq2q/PpToRh4dL/FbhSZOLZ1YTotpuLHf71FGOEfgKil/4PCd3hkWe/CCeiEg==",
       "license": "MIT",
       "dependencies": {
-        "@expo/require-utils": "^57.0.5",
+        "@expo/require-utils": "^57.0.6",
         "@expo/spawn-async": "^1.8.0",
         "chalk": "^4.0.0",
         "getenv": "^2.0.0",
@@ -50091,9 +53087,9 @@ global.fetch = jest.fn(() =>
       }
     },
     "node_modules/@expo/metro-runtime": {
-      "version": "57.0.16",
-      "resolved": "https://registry.npmjs.org/@expo/metro-runtime/-/metro-runtime-57.0.16.tgz",
-      "integrity": "sha512-x43WgZoICpp37BhDV7vixe0bNxbVPPGaBLHYc98ZJ8MU+UC2dk39Y2XvkfYMRRbAUSIkCIJiwdERnptlPg0Ckw==",
+      "version": "57.0.17",
+      "resolved": "https://registry.npmjs.org/@expo/metro-runtime/-/metro-runtime-57.0.17.tgz",
+      "integrity": "sha512-fiWYLaMDV8hoIpyPztRFPhGbHCHWlVfRTac3jZV7tP+fYCpo1QmgsuL23ubnoWqDZhFuRDNk+hQ4y21DMmxEFA==",
       "license": "MIT",
       "dependencies": {
         "@expo/log-box": "^57.0.4",
@@ -50449,9 +53445,9 @@ global.fetch = jest.fn(() =>
       }
     },
     "node_modules/@expo/require-utils": {
-      "version": "57.0.5",
-      "resolved": "https://registry.npmjs.org/@expo/require-utils/-/require-utils-57.0.5.tgz",
-      "integrity": "sha512-kTAXj9lDFEIPMsbAOGCGbjBbMF0oi7CqkYM79KOX0DDD9wSwXmlKL1z2h8OwsrBf7mbOo2DjlRvZu4BEjrIxGw==",
+      "version": "57.0.6",
+      "resolved": "https://registry.npmjs.org/@expo/require-utils/-/require-utils-57.0.6.tgz",
+      "integrity": "sha512-PKWfFdMgwWrlSP6NGplCi2nK0dEM5MeJ2Cj1ijr5VWTmZ+pKsJsJw2dWkBtlFDyxMY8eUjCPZ7hoqFEnbc0Pcw==",
       "license": "MIT",
       "dependencies": {
         "@babel/code-frame": "^7.20.0",
@@ -51215,6 +54211,87 @@ global.fetch = jest.fn(() =>
         "@jridgewell/sourcemap-codec": "^1.4.14"
       }
     },
+    "node_modules/@mapbox/jsonlint-lines-primitives": {
+      "version": "2.0.3",
+      "resolved": "https://registry.npmjs.org/@mapbox/jsonlint-lines-primitives/-/jsonlint-lines-primitives-2.0.3.tgz",
+      "integrity": "sha512-0SElaV0uMxEnxzBhhX9WTuPyUeMsAN/SS0i16tjuba4/mio63MG9khjC1a0JAiPGXAwvwm4UfHJURCN7nyudQg==",
+      "license": "MIT",
+      "engines": {
+        "node": ">= 22"
+      }
+    },
+    "node_modules/@mapbox/point-geometry": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@mapbox/point-geometry/-/point-geometry-1.1.0.tgz",
+      "integrity": "sha512-YGcBz1cg4ATXDCM/71L9xveh4dynfGmcLDqufR+nQQy3fKwsAZsWd/x4621/6uJaeB9mwOHE6hPeDgXz9uViUQ==",
+      "license": "ISC"
+    },
+    "node_modules/@mapbox/tiny-sdf": {
+      "version": "2.3.0",
+      "resolved": "https://registry.npmjs.org/@mapbox/tiny-sdf/-/tiny-sdf-2.3.0.tgz",
+      "integrity": "sha512-gBvcNDBBB66bgQYvnaJ6Jk+VCaMmVq5+IZR2kWPisT88Z8s0kBQt6hfVi8QgRW8Vpg0UWZzBA4ZSyzHHC+VeRA==",
+      "license": "BSD-2-Clause"
+    },
+    "node_modules/@mapbox/unitbezier": {
+      "version": "0.0.1",
+      "resolved": "https://registry.npmjs.org/@mapbox/unitbezier/-/unitbezier-0.0.1.tgz",
+      "integrity": "sha512-nMkuDXFv60aBr9soUG5q+GvZYL+2KZHVvsqFCzqnkGEf46U2fvmytHaEVc1/YZbiLn8X+eR3QzX1+dwDO1lxlw==",
+      "license": "BSD-2-Clause"
+    },
+    "node_modules/@mapbox/vector-tile": {
+      "version": "2.0.5",
+      "resolved": "https://registry.npmjs.org/@mapbox/vector-tile/-/vector-tile-2.0.5.tgz",
+      "integrity": "sha512-pXj8m7KTsqZt+1jsE0xIpGvqTSbblfkuEJL/NJmNePMtEwxO8V3XMDo9WMSfDeqHvCtBI9Lmt4mGcGR10zecmw==",
+      "license": "BSD-3-Clause",
+      "dependencies": {
+        "@mapbox/point-geometry": "~1.1.0",
+        "@types/geojson": "^7946.0.16",
+        "pbf": "^4.0.2"
+      }
+    },
+    "node_modules/@mapbox/whoots-js": {
+      "version": "3.1.0",
+      "resolved": "https://registry.npmjs.org/@mapbox/whoots-js/-/whoots-js-3.1.0.tgz",
+      "integrity": "sha512-Es6WcD0nO5l+2BOQS4uLfNPYQaNDfbot3X1XUoloz+x0mPDS3eeORZJl06HXjwBG1fOGwCRnzK88LMdxKRrd6Q==",
+      "license": "ISC",
+      "engines": {
+        "node": ">=6.0.0"
+      }
+    },
+    "node_modules/@maplibre/geojson-vt": {
+      "version": "6.3.0",
+      "resolved": "https://registry.npmjs.org/@maplibre/geojson-vt/-/geojson-vt-6.3.0.tgz",
+      "integrity": "sha512-3Zw2jsU9pIJG3G2CQFbLjWj2MlAHodhD7cSY+15iywUuLmmkgzcKRnueVRZ4AcC/5wOtfhidcJAAzBpoBNs3Xg==",
+      "license": "ISC",
+      "dependencies": {
+        "kdbush": "^4.1.0"
+      }
+    },
+    "node_modules/@maplibre/maplibre-gl-style-spec": {
+      "version": "24.10.0",
+      "resolved": "https://registry.npmjs.org/@maplibre/maplibre-gl-style-spec/-/maplibre-gl-style-spec-24.10.0.tgz",
+      "integrity": "sha512-lichxSiagMEBBrqHF0trtMQH9RKh+9jUlIJl0qW0QHvt2H/tbvUWdE+ZzI2Jd0/pT7j/iavLonlPu7EQ/ixTOw==",
+      "license": "ISC",
+      "dependencies": {
+        "@mapbox/jsonlint-lines-primitives": "~2.0.2",
+        "@mapbox/unitbezier": "^1.0.0",
+        "json-stringify-pretty-compact": "^4.0.0",
+        "minimist": "^1.2.8",
+        "quickselect": "^3.0.0",
+        "tinyqueue": "^3.0.0"
+      },
+      "bin": {
+        "gl-style-format": "dist/gl-style-format.mjs",
+        "gl-style-migrate": "dist/gl-style-migrate.mjs",
+        "gl-style-validate": "dist/gl-style-validate.mjs"
+      }
+    },
+    "node_modules/@maplibre/maplibre-gl-style-spec/node_modules/@mapbox/unitbezier": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@mapbox/unitbezier/-/unitbezier-1.0.0.tgz",
+      "integrity": "sha512-fqd515fjBmANKGGsQ286E2Wvj/XvDFpGzwJxq4CI6jMQue6Oy04uCKp+JWKF00xRTmk6cEu1jPJ9p3xqH8YWqQ==",
+      "license": "BSD-2-Clause"
+    },
     "node_modules/@maplibre/maplibre-react-native": {
       "version": "10.4.2",
       "resolved": "https://registry.npmjs.org/@maplibre/maplibre-react-native/-/maplibre-react-native-10.4.2.tgz",
@@ -51248,6 +54325,38 @@ global.fetch = jest.fn(() =>
         "@types/react": {
           "optional": true
         }
+      }
+    },
+    "node_modules/@maplibre/mlt": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/@maplibre/mlt/-/mlt-1.3.0.tgz",
+      "integrity": "sha512-7M2O7ABM80Oi8XPkfkrjKB8mOBIxGoVgkA52Mu4RMWoBvvMdagQ522+WxVYujZsMpqIr3BpzrTbXrm4k8lCzCQ==",
+      "license": "(MIT OR Apache-2.0)",
+      "dependencies": {
+        "@mapbox/point-geometry": "^1.1.0"
+      }
+    },
+    "node_modules/@maplibre/vt-pbf": {
+      "version": "4.3.3",
+      "resolved": "https://registry.npmjs.org/@maplibre/vt-pbf/-/vt-pbf-4.3.3.tgz",
+      "integrity": "sha512-dEe5XUd64RQbxNxy2OzIkJnwNDWjVmSXjCd0A7zLirm7QJ/WWbmtDFIkfsiM4yt1cplqzG6oSivRYeWx1SM1yg==",
+      "license": "MIT",
+      "dependencies": {
+        "@mapbox/point-geometry": "^1.1.0",
+        "@types/geojson": "^7946.0.16",
+        "pbf": "^5.1.2"
+      }
+    },
+    "node_modules/@maplibre/vt-pbf/node_modules/pbf": {
+      "version": "5.1.2",
+      "resolved": "https://registry.npmjs.org/pbf/-/pbf-5.1.2.tgz",
+      "integrity": "sha512-mnvGdvOrIvJOBGUEdGkrVXjN8E/VkIJCkf2eS1DH2yv82ORUlLttmDt0rWY38yYZmVwciZwBUvHM20qxBZf40w==",
+      "license": "BSD-3-Clause",
+      "dependencies": {
+        "resolve-protobuf-schema": "^2.1.0"
+      },
+      "bin": {
+        "pbf": "bin/pbf"
       }
     },
     "node_modules/@napi-rs/wasm-runtime": {
@@ -54490,6 +57599,15 @@ global.fetch = jest.fn(() =>
         "node": "^14.15.0 || ^16.10.0 || >=18.0.0"
       }
     },
+    "node_modules/cross-fetch": {
+      "version": "3.2.0",
+      "resolved": "https://registry.npmjs.org/cross-fetch/-/cross-fetch-3.2.0.tgz",
+      "integrity": "sha512-Q+xVJLoGOeIMXZmbUK4HYk+69cQH6LudR0Vu/pRm2YlU/hDV9CiS0gKUMaWY5f2NeUH9C1nV3bsTlCo0FsTV1Q==",
+      "license": "MIT",
+      "dependencies": {
+        "node-fetch": "^2.7.0"
+      }
+    },
     "node_modules/cross-spawn": {
       "version": "7.0.6",
       "resolved": "https://registry.npmjs.org/cross-spawn/-/cross-spawn-7.0.6.tgz",
@@ -54502,6 +57620,15 @@ global.fetch = jest.fn(() =>
       },
       "engines": {
         "node": ">= 8"
+      }
+    },
+    "node_modules/css-in-js-utils": {
+      "version": "3.1.0",
+      "resolved": "https://registry.npmjs.org/css-in-js-utils/-/css-in-js-utils-3.1.0.tgz",
+      "integrity": "sha512-fJAcud6B3rRu+KHYk+Bwf+WFL2MDCJJ1XG9x137tJQ0xYxor7XziQtuGFbWNdqrvF4Tk26O3H73nfVqXt/fW1A==",
+      "license": "MIT",
+      "dependencies": {
+        "hyphenate-style-name": "^1.0.3"
       }
     },
     "node_modules/cssom": {
@@ -54883,6 +58010,12 @@ global.fetch = jest.fn(() =>
       "engines": {
         "node": ">= 0.4"
       }
+    },
+    "node_modules/earcut": {
+      "version": "3.2.4",
+      "resolved": "https://registry.npmjs.org/earcut/-/earcut-3.2.4.tgz",
+      "integrity": "sha512-FHc6yNpnTORB0tM5kmZ03iD2mDuNakDE2lvf4Hw1XkfxtEHIGVi01B/GqUSwx+NcC1WGjidAfpTXzeALtPtfpg==",
+      "license": "ISC"
     },
     "node_modules/ee-first": {
       "version": "1.1.1",
@@ -56078,13 +59211,13 @@ global.fetch = jest.fn(() =>
       }
     },
     "node_modules/expo-asset": {
-      "version": "57.0.18",
-      "resolved": "https://registry.npmjs.org/expo-asset/-/expo-asset-57.0.18.tgz",
-      "integrity": "sha512-zDIQkUr0NM2S7YRj98Zohf/OBuM1q0o4ctxLz1C1oe4/33lHNLjp+2v3qUtBWVwn0zKka8UGADmS8M+83Wi6pw==",
+      "version": "57.0.20",
+      "resolved": "https://registry.npmjs.org/expo-asset/-/expo-asset-57.0.20.tgz",
+      "integrity": "sha512-xm1p3Squ/dCzipISO1TE5+kDsIFEUc6DxEtRe2rRgPMDLPi6AumLlrNorFxetiP6zrvxK23xzVlNng/g7o/+aA==",
       "license": "MIT",
       "dependencies": {
-        "@expo/image-utils": "^0.11.5",
-        "expo-constants": "~57.0.19"
+        "@expo/image-utils": "^0.11.6",
+        "expo-constants": "~57.0.22"
       },
       "peerDependencies": {
         "expo": "*",
@@ -56124,9 +59257,9 @@ global.fetch = jest.fn(() =>
       }
     },
     "node_modules/expo-constants": {
-      "version": "57.0.19",
-      "resolved": "https://registry.npmjs.org/expo-constants/-/expo-constants-57.0.19.tgz",
-      "integrity": "sha512-3eK1kZRwCdMizQLlM/PPlPwjaPnB5qKvdRDMBMnB1ZxmvWJBf9TB4uEO4DMMfIPaFUxYFs29dsR5fPr1gh3FTQ==",
+      "version": "57.0.22",
+      "resolved": "https://registry.npmjs.org/expo-constants/-/expo-constants-57.0.22.tgz",
+      "integrity": "sha512-+mBjnzMWMKIrQa7BP7LTDRC0W7cI+q12/sZns4HzVQJGzgGoAdRJSTEKiObxIw/3EswKXlESkRob8upiL95Q4A==",
       "license": "MIT",
       "dependencies": {
         "@expo/env": "~2.4.3"
@@ -56701,6 +59834,36 @@ global.fetch = jest.fn(() =>
         "bser": "2.1.1"
       }
     },
+    "node_modules/fbjs": {
+      "version": "3.0.5",
+      "resolved": "https://registry.npmjs.org/fbjs/-/fbjs-3.0.5.tgz",
+      "integrity": "sha512-ztsSx77JBtkuMrEypfhgc3cI0+0h+svqeie7xHbh1k/IKdcydnvadp/mUaGgjAOXQmQSxsqgaRhS3q9fy+1kxg==",
+      "license": "MIT",
+      "dependencies": {
+        "cross-fetch": "^3.1.5",
+        "fbjs-css-vars": "^1.0.0",
+        "loose-envify": "^1.0.0",
+        "object-assign": "^4.1.0",
+        "promise": "^7.1.1",
+        "setimmediate": "^1.0.5",
+        "ua-parser-js": "^1.0.35"
+      }
+    },
+    "node_modules/fbjs-css-vars": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/fbjs-css-vars/-/fbjs-css-vars-1.0.2.tgz",
+      "integrity": "sha512-b2XGFAFdWZWg0phtAWLHCk836A1Xann+I+Dgd3Gk64MHKZO44FfoD1KxyvbSh0qZsIoXQGGlVztIY+oitJPpRQ==",
+      "license": "MIT"
+    },
+    "node_modules/fbjs/node_modules/promise": {
+      "version": "7.3.1",
+      "resolved": "https://registry.npmjs.org/promise/-/promise-7.3.1.tgz",
+      "integrity": "sha512-nolQXZ/4L+bP/UGlkfaIujX9BKxGwmQ9OT4mOt5yvy8iK1h3wqTEJCijzGANTCCl9nWjY41juyAn2K3Q1hLLTg==",
+      "license": "MIT",
+      "dependencies": {
+        "asap": "~2.0.3"
+      }
+    },
     "node_modules/fdir": {
       "version": "6.5.0",
       "resolved": "https://registry.npmjs.org/fdir/-/fdir-6.5.0.tgz",
@@ -57084,6 +60247,12 @@ global.fetch = jest.fn(() =>
         "node": ">=6"
       }
     },
+    "node_modules/gl-matrix": {
+      "version": "3.4.4",
+      "resolved": "https://registry.npmjs.org/gl-matrix/-/gl-matrix-3.4.4.tgz",
+      "integrity": "sha512-latSnyDNt/8zYUB6VIJ6PCh2jBjJX6gnDsoCZ7LyW7GkqrD51EWwa9qCoGixj8YqBtETQK/xY7OmpTF8xz1DdQ==",
+      "license": "MIT"
+    },
     "node_modules/glob": {
       "version": "13.0.6",
       "resolved": "https://registry.npmjs.org/glob/-/glob-13.0.6.tgz",
@@ -57431,6 +60600,12 @@ global.fetch = jest.fn(() =>
         "node": ">=10.17.0"
       }
     },
+    "node_modules/hyphenate-style-name": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/hyphenate-style-name/-/hyphenate-style-name-1.1.0.tgz",
+      "integrity": "sha512-WDC/ui2VVRrz3jOVi+XtjqkDjiVjTtFaAGiW37k6b+ohyQ5wYDOGkvCZa8+H0nx3gyvv0+BST9xuOgIyGQ00gw==",
+      "license": "BSD-3-Clause"
+    },
     "node_modules/iconv-lite": {
       "version": "0.6.3",
       "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.6.3.tgz",
@@ -57538,6 +60713,15 @@ global.fetch = jest.fn(() =>
       "resolved": "https://registry.npmjs.org/inherits/-/inherits-2.0.4.tgz",
       "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
       "license": "ISC"
+    },
+    "node_modules/inline-style-prefixer": {
+      "version": "7.0.1",
+      "resolved": "https://registry.npmjs.org/inline-style-prefixer/-/inline-style-prefixer-7.0.1.tgz",
+      "integrity": "sha512-lhYo5qNTQp3EvSSp3sRvXMbVQTLrvGV6DycRMJ5dm2BLMiJ30wpXKdDdgX+GmJZ5uQMucwRKHamXSst3Sj/Giw==",
+      "license": "MIT",
+      "dependencies": {
+        "css-in-js-utils": "^3.1.0"
+      }
     },
     "node_modules/internal-slot": {
       "version": "1.1.0",
@@ -59547,6 +62731,12 @@ global.fetch = jest.fn(() =>
       "dev": true,
       "license": "MIT"
     },
+    "node_modules/json-stringify-pretty-compact": {
+      "version": "4.0.0",
+      "resolved": "https://registry.npmjs.org/json-stringify-pretty-compact/-/json-stringify-pretty-compact-4.0.0.tgz",
+      "integrity": "sha512-3CNZ2DnrpByG9Nqj6Xo8vqbjT4F6N+tb4Gb28ESAZjYZ5yqvmc56J+/kuIwkaAMOyblTQhUW7PxMkUb8Q36N3Q==",
+      "license": "MIT"
+    },
     "node_modules/json5": {
       "version": "2.2.3",
       "resolved": "https://registry.npmjs.org/json5/-/json5-2.2.3.tgz",
@@ -59574,6 +62764,12 @@ global.fetch = jest.fn(() =>
       "engines": {
         "node": ">=4.0"
       }
+    },
+    "node_modules/kdbush": {
+      "version": "4.1.0",
+      "resolved": "https://registry.npmjs.org/kdbush/-/kdbush-4.1.0.tgz",
+      "integrity": "sha512-e9vurzrXJQrFX6ckpHP3bvj5l+9CnYzkxDNnNQ1h2QTqdWsUAJgXiKdGNcOa1EY85dU8KbQ+z/FdQdB7P+9yfQ==",
+      "license": "ISC"
     },
     "node_modules/keyv": {
       "version": "4.5.4",
@@ -60111,6 +63307,40 @@ global.fetch = jest.fn(() =>
       "license": "BSD-3-Clause",
       "dependencies": {
         "tmpl": "1.0.5"
+      }
+    },
+    "node_modules/maplibre-gl": {
+      "version": "5.24.0",
+      "resolved": "https://registry.npmjs.org/maplibre-gl/-/maplibre-gl-5.24.0.tgz",
+      "integrity": "sha512-ALyFxgtd5R+65UqZ/++lOqwWcC0SNho9c27fYSyLmG7AfnAul2o46F05aDJGPbFU57wos9dgcIySHs0Xe6ia3A==",
+      "license": "BSD-3-Clause",
+      "dependencies": {
+        "@mapbox/jsonlint-lines-primitives": "^2.0.2",
+        "@mapbox/point-geometry": "^1.1.0",
+        "@mapbox/tiny-sdf": "^2.1.0",
+        "@mapbox/unitbezier": "^0.0.1",
+        "@mapbox/vector-tile": "^2.0.4",
+        "@mapbox/whoots-js": "^3.1.0",
+        "@maplibre/geojson-vt": "^6.1.0",
+        "@maplibre/maplibre-gl-style-spec": "^24.8.1",
+        "@maplibre/mlt": "^1.1.8",
+        "@maplibre/vt-pbf": "^4.3.0",
+        "@types/geojson": "^7946.0.16",
+        "earcut": "^3.0.2",
+        "gl-matrix": "^3.4.4",
+        "kdbush": "^4.0.2",
+        "murmurhash-js": "^1.0.0",
+        "pbf": "^4.0.1",
+        "potpack": "^2.1.0",
+        "quickselect": "^3.0.0",
+        "tinyqueue": "^3.0.0"
+      },
+      "engines": {
+        "node": ">=16.14.0",
+        "npm": ">=8.1.0"
+      },
+      "funding": {
+        "url": "https://github.com/maplibre/maplibre-gl-js?sponsor=1"
       }
     },
     "node_modules/marky": {
@@ -61036,7 +64266,6 @@ global.fetch = jest.fn(() =>
       "version": "1.2.8",
       "resolved": "https://registry.npmjs.org/minimist/-/minimist-1.2.8.tgz",
       "integrity": "sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==",
-      "dev": true,
       "license": "MIT",
       "funding": {
         "url": "https://github.com/sponsors/ljharb"
@@ -61073,6 +64302,12 @@ global.fetch = jest.fn(() =>
       "version": "1.0.2",
       "resolved": "https://registry.npmjs.org/multitars/-/multitars-1.0.2.tgz",
       "integrity": "sha512-6GwVw5eLi9sThdtlS4PKwC7yRLaf45pYhIEzKBHdKxi+YOXGKFX8acIniH+Uh/+k9mS2lQOupTccjoe5r0/1IQ==",
+      "license": "MIT"
+    },
+    "node_modules/murmurhash-js": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/murmurhash-js/-/murmurhash-js-1.0.0.tgz",
+      "integrity": "sha512-TvmkNhkv8yct0SVBSy+o8wYzXjE4Zz3PCesbfs8HiCXXdcTuocApFv11UWlNFWKYsP2okqrhb7JNlSm9InBhIw==",
       "license": "MIT"
     },
     "node_modules/nanoid": {
@@ -61149,6 +64384,48 @@ global.fetch = jest.fn(() =>
       },
       "funding": {
         "url": "https://github.com/sponsors/ljharb"
+      }
+    },
+    "node_modules/node-fetch": {
+      "version": "2.7.0",
+      "resolved": "https://registry.npmjs.org/node-fetch/-/node-fetch-2.7.0.tgz",
+      "integrity": "sha512-c4FRfUm/dbcWZ7U+1Wq0AwCyFL+3nt2bEw05wfxSz+DWpWsitgmSgYmy2dQdWyKC1694ELPqMs/YzUSNozLt8A==",
+      "license": "MIT",
+      "dependencies": {
+        "whatwg-url": "^5.0.0"
+      },
+      "engines": {
+        "node": "4.x || >=6.0.0"
+      },
+      "peerDependencies": {
+        "encoding": "^0.1.0"
+      },
+      "peerDependenciesMeta": {
+        "encoding": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/node-fetch/node_modules/tr46": {
+      "version": "0.0.3",
+      "resolved": "https://registry.npmjs.org/tr46/-/tr46-0.0.3.tgz",
+      "integrity": "sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw==",
+      "license": "MIT"
+    },
+    "node_modules/node-fetch/node_modules/webidl-conversions": {
+      "version": "3.0.1",
+      "resolved": "https://registry.npmjs.org/webidl-conversions/-/webidl-conversions-3.0.1.tgz",
+      "integrity": "sha512-2JAn3z8AR6rjK8Sm8orRC0h/bcl/DqL7tRPdGZ4I1CjdF+EaMLmYxBHyXuKL849eucPFhvBoxMsflfOb8kxaeQ==",
+      "license": "BSD-2-Clause"
+    },
+    "node_modules/node-fetch/node_modules/whatwg-url": {
+      "version": "5.0.0",
+      "resolved": "https://registry.npmjs.org/whatwg-url/-/whatwg-url-5.0.0.tgz",
+      "integrity": "sha512-saE57nupxk6v3HY35+jzBwYa0rKSy0XR8JSxZPwgLr7ys0IBzhGviA1/TUGJLmSVqs8pb9AnvICXEuOHLprYTw==",
+      "license": "MIT",
+      "dependencies": {
+        "tr46": "~0.0.3",
+        "webidl-conversions": "^3.0.0"
       }
     },
     "node_modules/node-forge": {
@@ -61268,7 +64545,6 @@ global.fetch = jest.fn(() =>
       "version": "4.1.1",
       "resolved": "https://registry.npmjs.org/object-assign/-/object-assign-4.1.1.tgz",
       "integrity": "sha512-rJgTQnkUnH1sFw8yT6VSU3zD3sWmu6sZhIseY8VX+GRu3P6F7Fu+JNDoXfklElbLJSnc3FUQHVe4cU5hj+BcUg==",
-      "dev": true,
       "license": "MIT",
       "engines": {
         "node": ">=0.10.0"
@@ -61789,6 +65065,18 @@ global.fetch = jest.fn(() =>
         "node": "20 || >=22"
       }
     },
+    "node_modules/pbf": {
+      "version": "4.0.2",
+      "resolved": "https://registry.npmjs.org/pbf/-/pbf-4.0.2.tgz",
+      "integrity": "sha512-J0ajxARhZfpUEebxYs1vhMGMuLSXtBe1e+fFPDrf2uA2hgo+UshKfNUWOz92HJNz6/NFEXseQPddnHkTreWRqg==",
+      "license": "BSD-3-Clause",
+      "dependencies": {
+        "resolve-protobuf-schema": "^2.1.0"
+      },
+      "bin": {
+        "pbf": "bin/pbf"
+      }
+    },
     "node_modules/picocolors": {
       "version": "1.1.1",
       "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
@@ -61900,6 +65188,18 @@ global.fetch = jest.fn(() =>
       "engines": {
         "node": "^10 || ^12 || >=14"
       }
+    },
+    "node_modules/postcss-value-parser": {
+      "version": "4.2.0",
+      "resolved": "https://registry.npmjs.org/postcss-value-parser/-/postcss-value-parser-4.2.0.tgz",
+      "integrity": "sha512-1NNCs6uurfkVbeXG4S8JFT9t19m45ICnif8zWLd5oPSZ50QnwMfK+H3jv408d4jw/7Bttv5axS5IiHoLaVNHeQ==",
+      "license": "MIT"
+    },
+    "node_modules/potpack": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/potpack/-/potpack-2.1.0.tgz",
+      "integrity": "sha512-pcaShQc1Shq0y+E7GqJqvZj8DTthWV1KeHGdi0Z6IAin2Oi3JnLCOfwnCo84qc+HAp52wT9nK9H7FAJp5a44GQ==",
+      "license": "ISC"
     },
     "node_modules/prelude-ls": {
       "version": "1.2.1",
@@ -62035,6 +65335,12 @@ global.fetch = jest.fn(() =>
       "dev": true,
       "license": "MIT"
     },
+    "node_modules/protocol-buffers-schema": {
+      "version": "3.6.1",
+      "resolved": "https://registry.npmjs.org/protocol-buffers-schema/-/protocol-buffers-schema-3.6.1.tgz",
+      "integrity": "sha512-VG2K63Igkiv9p76tk1lilczEK1cT+kCjKtkdhw1dQZV3k3IXJbd3o6Ho8b9zJZaHSnT2hKe4I+ObmX9w6m5SmQ==",
+      "license": "MIT"
+    },
     "node_modules/psl": {
       "version": "1.15.0",
       "resolved": "https://registry.npmjs.org/psl/-/psl-1.15.0.tgz",
@@ -62124,6 +65430,12 @@ global.fetch = jest.fn(() =>
       "funding": {
         "url": "https://github.com/sponsors/sindresorhus"
       }
+    },
+    "node_modules/quickselect": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/quickselect/-/quickselect-3.0.0.tgz",
+      "integrity": "sha512-XdjUArbK4Bm5fLLvlm5KpTFOiOThgfWWI4axAZDWg4E/0mKdZyI9tNEfds27qCi1ze/vwTR16kvmmGhRra3c2g==",
+      "license": "ISC"
     },
     "node_modules/range-parser": {
       "version": "1.2.1",
@@ -62360,6 +65672,38 @@ global.fetch = jest.fn(() =>
         "react": "*",
         "react-native": "*"
       }
+    },
+    "node_modules/react-native-web": {
+      "version": "0.21.4",
+      "resolved": "https://registry.npmjs.org/react-native-web/-/react-native-web-0.21.4.tgz",
+      "integrity": "sha512-77B6KlalB4osNIck91TNFixPkYPsTbuNEvw8P7IV+4v4/5wZSBRKZnw0Zhx6YjuauDTz71gc8IW+fVhcBMjr5A==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.18.6",
+        "@react-native/normalize-colors": "^0.74.1",
+        "fbjs": "^3.0.4",
+        "inline-style-prefixer": "^7.0.1",
+        "memoize-one": "^6.0.0",
+        "nullthrows": "^1.1.1",
+        "postcss-value-parser": "^4.2.0",
+        "styleq": "^0.1.3"
+      },
+      "peerDependencies": {
+        "react": "^18.0.0 || ^19.0.0",
+        "react-dom": "^18.0.0 || ^19.0.0"
+      }
+    },
+    "node_modules/react-native-web/node_modules/@react-native/normalize-colors": {
+      "version": "0.74.89",
+      "resolved": "https://registry.npmjs.org/@react-native/normalize-colors/-/normalize-colors-0.74.89.tgz",
+      "integrity": "sha512-qoMMXddVKVhZ8PA1AbUCk83trpd6N+1nF2A6k1i6LsQObyS92fELuk8kU/lQs6M7BsMHwqyLCpQJ1uFgNvIQXg==",
+      "license": "MIT"
+    },
+    "node_modules/react-native-web/node_modules/memoize-one": {
+      "version": "6.0.0",
+      "resolved": "https://registry.npmjs.org/memoize-one/-/memoize-one-6.0.0.tgz",
+      "integrity": "sha512-rkpe71W0N0c0Xz6QD0eJETuWAJGnJ9afsl1srmwPrI+yBCkge5EycXXbYRyvL29zZVUWQCY7InPRCv3GDXuZNw==",
+      "license": "MIT"
     },
     "node_modules/react-native-worklets": {
       "version": "0.10.1",
@@ -62783,6 +66127,15 @@ global.fetch = jest.fn(() =>
         "url": "https://github.com/privatenumber/resolve-pkg-maps?sponsor=1"
       }
     },
+    "node_modules/resolve-protobuf-schema": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/resolve-protobuf-schema/-/resolve-protobuf-schema-2.1.0.tgz",
+      "integrity": "sha512-kI5ffTiZWmJaS/huM8wZfEMer1eRd7oJQhDuxeCLe3t7N7mX3z94CN0xPxBQxFYQTSNz9T0i+v6inKqSdK8xrQ==",
+      "license": "MIT",
+      "dependencies": {
+        "protocol-buffers-schema": "^3.3.1"
+      }
+    },
     "node_modules/resolve-workspace-root": {
       "version": "2.0.1",
       "resolved": "https://registry.npmjs.org/resolve-workspace-root/-/resolve-workspace-root-2.0.1.tgz",
@@ -63134,6 +66487,12 @@ global.fetch = jest.fn(() =>
       "engines": {
         "node": ">= 0.4"
       }
+    },
+    "node_modules/setimmediate": {
+      "version": "1.0.5",
+      "resolved": "https://registry.npmjs.org/setimmediate/-/setimmediate-1.0.5.tgz",
+      "integrity": "sha512-MATJdZp8sLqDl/68LfQmbP8zKPLQNV6BIZoIgrscFDQ+RsvK/BxeDQOgyxKKoh0y/8h3BqVFnCqQ/gd+reiIXA==",
+      "license": "MIT"
     },
     "node_modules/setprototypeof": {
       "version": "1.2.0",
@@ -63708,6 +67067,12 @@ global.fetch = jest.fn(() =>
       "integrity": "sha512-0MP/Cxx5SzeeZ10p/bZI0S6MpgD+yxAhi1BOQ34jgnMXsCq3j1t6tQnZu+KdlL7dvJTLT3g9xN8tl10TqgFMcg==",
       "license": "MIT"
     },
+    "node_modules/styleq": {
+      "version": "0.1.3",
+      "resolved": "https://registry.npmjs.org/styleq/-/styleq-0.1.3.tgz",
+      "integrity": "sha512-3ZUifmCDCQanjeej1f6kyl/BeP/Vae5EYkQ9iJfUm/QwZvlgnZzyflqAsAWYURdtea8Vkvswu2GrC57h3qffcA==",
+      "license": "MIT"
+    },
     "node_modules/supports-color": {
       "version": "7.2.0",
       "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-7.2.0.tgz",
@@ -63943,6 +67308,12 @@ global.fetch = jest.fn(() =>
       "funding": {
         "url": "https://github.com/sponsors/SuperchupuDev"
       }
+    },
+    "node_modules/tinyqueue": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/tinyqueue/-/tinyqueue-3.0.0.tgz",
+      "integrity": "sha512-gRa9gwYU3ECmQYv3lslts5hxuIa90veaEcxDYuu3QGOIAEM2mOZkVHp48ANJuu1CURtRdHKUBY5Lm1tHV+sD4g==",
+      "license": "ISC"
     },
     "node_modules/tmpl": {
       "version": "1.0.5",
@@ -64186,6 +67557,32 @@ global.fetch = jest.fn(() =>
       },
       "engines": {
         "node": ">=14.17"
+      }
+    },
+    "node_modules/ua-parser-js": {
+      "version": "1.0.41",
+      "resolved": "https://registry.npmjs.org/ua-parser-js/-/ua-parser-js-1.0.41.tgz",
+      "integrity": "sha512-LbBDqdIC5s8iROCUjMbW1f5dJQTEFB1+KO9ogbvlb3nm9n4YHa5p4KTvFPWvh2Hs8gZMBuiB1/8+pdfe/tDPug==",
+      "funding": [
+        {
+          "type": "opencollective",
+          "url": "https://opencollective.com/ua-parser-js"
+        },
+        {
+          "type": "paypal",
+          "url": "https://paypal.me/faisalman"
+        },
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/faisalman"
+        }
+      ],
+      "license": "MIT",
+      "bin": {
+        "ua-parser-js": "script/cli.js"
+      },
+      "engines": {
+        "node": "*"
       }
     },
     "node_modules/unbox-primitive": {
@@ -64947,10 +68344,12 @@ global.fetch = jest.fn(() =>
   "version": "0.5.0",
   "main": "expo-router/entry",
   "dependencies": {
+    "@expo/metro-runtime": "~57.0.17",
     "@expo/vector-icons": "^15.0.2",
     "@maplibre/maplibre-react-native": "10",
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "~57.0.24",
+    "expo-asset": "~57.0.20",
     "expo-camera": "~57.0.6",
     "expo-clipboard": "~57.0.2",
     "expo-constants": "~57.0.19",
@@ -64962,12 +68361,14 @@ global.fetch = jest.fn(() =>
     "expo-sensors": "~57.0.3",
     "expo-speech": "~57.0.3",
     "expo-status-bar": "~57.0.1",
+    "maplibre-gl": "^5.24.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.86.3",
     "react-native-reanimated": "4.5.1",
     "react-native-safe-area-context": "~5.7.0",
     "react-native-screens": "~4.26.0",
+    "react-native-web": "^0.21.2",
     "react-native-worklets": "0.10.1"
   },
   "scripts": {
@@ -66855,6 +70256,74 @@ export function headingLabel(heading, snapDeg) {
   return `${Math.round(h) % 360}°`;
 }
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\indoorCameraStart.js ---
+
+// Where the indoor map's camera starts, and how close.
+//
+//   Walking: on the blue dot, at focusZoom.
+//   Preview, or a floor you are not on: the route on that floor if it fits
+//     at previewMinZoom or closer; otherwise its start at previewMinZoom.
+//   No route on the floor: the middle of the floor at the whole-floor zoom
+//     (the old behaviour).
+//
+// Pure maths, so it can be tested. Used by components/IndoorMapView.jsx.
+
+/**
+ * @param {object} p
+ * @param {{lat:number, lon:number}|null} p.here   the blue dot, if it is on this floor
+ * @param {Array<{lat:number, lon:number}>} p.routeHere  the route points on this floor
+ * @param {[number, number]} p.floorCenter  [lon, lat] of the whole floor
+ * @param {number} p.floorFitZoom  zoom that fits the whole floor
+ * @param {number} p.cosLat  cos(latitude), for metres per degree
+ * @param {number} p.minDim  the smaller screen dimension of the map, in px
+ * @param {number} p.focusZoom
+ * @param {number} p.previewMinZoom
+ * @returns {{ center: [number, number], zoom: number }}
+ */
+export function chooseIndoorCamera({
+  here,
+  routeHere,
+  floorCenter,
+  floorFitZoom,
+  cosLat,
+  minDim,
+  focusZoom,
+  previewMinZoom,
+}) {
+  if (here) {
+    return { center: [here.lon, here.lat], zoom: focusZoom };
+  }
+
+  if (routeHere && routeHere.length > 0) {
+    let west = Infinity, east = -Infinity, south = Infinity, north = -Infinity;
+    for (const p of routeHere) {
+      west = Math.min(west, p.lon);
+      east = Math.max(east, p.lon);
+      south = Math.min(south, p.lat);
+      north = Math.max(north, p.lat);
+    }
+    const diagM = Math.hypot(
+      Math.abs(east - west) * 111320 * cosLat,
+      Math.abs(north - south) * 110540
+    );
+    // Web Mercator: metres per pixel at zoom z is (78271.5 * cosLat) / 2^z.
+    // 0.8 leaves a margin so the route does not touch the edges.
+    const metresPerPx = Math.max(diagM, 1) / Math.max(minDim * 0.8, 1);
+    const routeFitZoom = Math.log2((78271.5 * cosLat) / metresPerPx);
+
+    if (routeFitZoom >= previewMinZoom) {
+      return {
+        center: [(west + east) / 2, (south + north) / 2],
+        zoom: Math.min(routeFitZoom, focusZoom + 0.5),
+      };
+    }
+    return { center: [routeHere[0].lon, routeHere[0].lat], zoom: previewMinZoom };
+  }
+
+  return { center: floorCenter, zoom: floorFitZoom };
+}
+
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\indoorRoute.js ---
 
 // Helpers for indoor routes.
@@ -67599,6 +71068,64 @@ export function parseQrCode(raw) {
 
   const last = text.split('/').pop();
   return CODE_RE.test(last) ? last : null;
+}
+
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\walkStartHeading.js ---
+
+// Which way the outdoor map faces when the walking screen opens, before the
+// compass or GPS has any direction to give.
+//
+// The route preview turns the map to face the route (north-up or south-up, and
+// the student may flip it). The walking screen used to open facing north until
+// the student started moving, so a student who started walking the wrong way
+// had nothing to correct them. Now the walking screen opens facing the SAME
+// way the preview did, and switches to the live heading once there is one.
+//
+// The preview remembers its heading here. If the walking screen is opened
+// without a preview (or for a different route), the heading is worked out the
+// same way the preview does it: from the route's first point to its last.
+
+import { bearingDeg } from '@/utils/geo';
+
+let remembered = { key: null, heading: null };
+
+// First and last point to about 100 m, so a route recomputed a few metres
+// away is still the same route.
+export function routeKey(coords) {
+  if (!coords || coords.length < 2) return null;
+  const first = coords[0];
+  const last = coords[coords.length - 1];
+  const r = (n) => Number(n).toFixed(3);
+  return `${r(first[0])},${r(first[1])}>${r(last[0])},${r(last[1])}`;
+}
+
+/** The preview's base heading for a route: 0 (north up) or 180 (south up). */
+export function routeBaseHeading(coords) {
+  if (!coords || coords.length < 2) return null;
+  const first = coords[0]; // [lon, lat]
+  const last = coords[coords.length - 1];
+  const bearing = bearingDeg(first[1], first[0], last[1], last[0]);
+  return Math.cos((bearing * Math.PI) / 180) >= 0 ? 0 : 180;
+}
+
+/** Called by the preview whenever the map heading it shows changes. */
+export function rememberPreviewHeading(coords, heading) {
+  if (heading == null) return;
+  remembered = { key: routeKey(coords), heading };
+}
+
+/** The heading the walking screen should start with, or null for no route. */
+export function startHeadingFor(coords) {
+  const key = routeKey(coords);
+  if (key === null) return null;
+  if (remembered.key === key && remembered.heading != null) return remembered.heading;
+  return routeBaseHeading(coords);
+}
+
+/** For tests. */
+export function forgetPreviewHeading() {
+  remembered = { key: null, heading: null };
 }
 
 
