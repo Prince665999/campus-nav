@@ -4,6 +4,9 @@ import {
   currentStepIndex,
   distanceRemaining,
   distanceToNextStep,
+  resolveStepIndex,
+  STEP_SWITCH_LOOKAHEAD_M,
+  STEP_BACKTRACK_M,
   createOffRouteDetector,
   progressFraction,
   OFF_ROUTE_THRESHOLD_M,
@@ -62,6 +65,64 @@ describe('distanceToNextStep', () => {
 
   test('on the last step, gives distance to arrival', () => {
     expect(distanceToNextStep(steps, 3, 180)).toBe(20);
+  });
+});
+
+describe('distanceToNextStep with a total distance', () => {
+  test('last step measures to the route total, not its own at_m', () => {
+    // The last step BEGINS at 200 m; the route ends at 252 m.
+    expect(distanceToNextStep(steps, 3, 210, 252)).toBe(42);
+  });
+});
+
+// Steps as the backend now sends them: at_m is where each leg BEGINS.
+//   leg 0:   0 -  18 m  "Head north, continue 18 m, then turn left"
+//   leg 1:  18 -  98 m  "Continue 80 m, then turn right"
+//   leg 2:  98 - 148 m  "Continue 50 m, then turn left"
+//   leg 3: 148 - 200 m  "Continue 52 m and you'll arrive"
+const legSteps = [
+  { at_m: 0, instruction: 'leg0' },
+  { at_m: 18, instruction: 'leg1' },
+  { at_m: 98, instruction: 'leg2' },
+  { at_m: 148, instruction: 'leg3' },
+];
+
+describe('resolveStepIndex', () => {
+  test('short first leg: the second instruction appears once the first turn is made', () => {
+    // Regression: with a short first leg the card stayed on step 0
+    // until the walker was far into leg 2.
+    expect(resolveStepIndex(legSteps, 10, 0)).toBe(0);
+    expect(resolveStepIndex(legSteps, 25, 0)).toBe(1);
+  });
+
+  test('every instruction is shown during its own leg, never one behind', () => {
+    expect(resolveStepIndex(legSteps, 60, 1)).toBe(1);
+    expect(resolveStepIndex(legSteps, 110, 1)).toBe(2);
+    expect(resolveStepIndex(legSteps, 160, 2)).toBe(3);
+  });
+
+  test('switches slightly early to absorb GPS and voice delay', () => {
+    expect(resolveStepIndex(legSteps, 18 - STEP_SWITCH_LOOKAHEAD_M, 0)).toBe(1);
+    expect(resolveStepIndex(legSteps, 18 - STEP_SWITCH_LOOKAHEAD_M - 1, 0)).toBe(0);
+  });
+
+  test('skipped corners catch up in one jump', () => {
+    // A shortcut or GPS gap carries the walker across two corners
+    // between fixes: land on the step they are on, not the next one.
+    expect(resolveStepIndex(legSteps, 120, 0)).toBe(2);
+  });
+
+  test('snap flicker at a corner does not move the index backwards', () => {
+    expect(resolveStepIndex(legSteps, 14, 1)).toBe(1);
+    expect(resolveStepIndex(legSteps, 18 - STEP_BACKTRACK_M + 1, 1)).toBe(1);
+  });
+
+  test('walking genuinely back past the threshold allows an earlier step', () => {
+    expect(resolveStepIndex(legSteps, 80 - STEP_BACKTRACK_M - 5, 2)).toBe(1);
+  });
+
+  test('empty steps returns -1', () => {
+    expect(resolveStepIndex([], 10, 0)).toBe(-1);
   });
 });
 

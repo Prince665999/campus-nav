@@ -87,3 +87,42 @@ def merge_opening_step(steps):
         "instruction": merged_text,
     }
     return [merged, *rest]
+
+
+def anchor_steps_to_leg_start(steps):
+    """
+    Make every step's `at_m` the distance where its LEG BEGINS.
+
+    The engine writes "Continue for 80 meters, then turn right" on the
+    step whose at_m is the turn node: the END of that 80 m leg. The
+    walking screen switches to a step when the walker reaches its at_m,
+    so each instruction only appeared after the walker had already
+    walked the leg it describes. `merge_opening_step` fixed this for
+    the first step only; every later step stayed one leg behind
+    (instruction N shown during leg N+1).
+
+    This function applies the fix to all of them:
+
+        engine:  [start@0, t1@T1, t2@T2, ..., arrive@total]
+        result:  [(start+t1)@0, t2@T1, t3@T2, ..., arrive@Tlast]
+
+    Step k now begins at the turn that ends the previous leg, so it is
+    shown as soon as the walker makes that turn. `distance_m`, `kind`
+    and every instruction are unchanged.
+
+    The last step ("...and you'll arrive") begins at the final turn.
+    Its distance-to-go must therefore be measured to the route's total
+    length, not to its own at_m; the app does this.
+    """
+    if not steps or len(steps) < 2:
+        return steps
+
+    merged = merge_opening_step(steps)
+
+    # merged[0] came from steps[0] + steps[1] and stays at 0.0.
+    # merged[k] for k >= 1 is the engine's steps[k + 1], whose leg
+    # starts at the previous engine step's at_m, i.e. steps[k].
+    out = [merged[0]]
+    for k in range(1, len(merged)):
+        out.append({**merged[k], "at_m": steps[k]["at_m"]})
+    return out

@@ -52,7 +52,7 @@ import {
 import { snapToRoute, haversineM } from '@/utils/geo';
 import {
   createOffRouteDetector,
-  currentStepIndex,
+  resolveStepIndex,
   distanceRemaining,
   distanceToNextStep,
   progressFraction,
@@ -97,7 +97,9 @@ export function useWalkingProgress(route) {
   const [distanceFromStart, setDistanceFromStart] = useState(0);
   const [offRoute, setOffRoute] = useState(false);
   const [gpsStale, setGpsStale] = useState(false);
+  const [stepIndexState, setStepIndexState] = useState(0);
 
+  const stepsRef = useRef([]);
   const detectorRef = useRef(createOffRouteDetector());
   const lastSegmentIndexRef = useRef(null);
   const lastSnapDistanceRef = useRef(0);
@@ -111,10 +113,12 @@ export function useWalkingProgress(route) {
       route && route.geometry && route.geometry.length > 1
         ? route.geometry
         : null;
+    stepsRef.current = route?.steps || [];
   }, [route]);
 
   // Reset smoothing and snap continuity when the route changes.
   useEffect(() => {
+    setStepIndexState(0);
     smoothRef.current = null;
     lastSegmentIndexRef.current = null;
     lastSnapDistanceRef.current = 0;
@@ -190,6 +194,19 @@ export function useWalkingProgress(route) {
               const isOffRoute = detectorRef.current.record(snapped.offRouteM);
               setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
             }
+
+            // Step progress is updated here, on every fix we snapped,
+            // not only on fixes that pass the display gate below. A
+            // corner is passed in a second or two; waiting for a "good
+            // enough to draw" fix could skip the step change entirely
+            // until the walker was well past it.
+            setStepIndexState((prevIdx) =>
+              resolveStepIndex(
+                stepsRef.current,
+                snapped.distanceFromStartM,
+                prevIdx
+              )
+            );
           }
         }
 
@@ -292,14 +309,15 @@ export function useWalkingProgress(route) {
   const totalDistance = route?.distance_m || 0;
   const steps = route?.steps || [];
 
-  const stepIndex = currentStepIndex(steps, distanceFromStart);
+  const stepIndex = steps.length === 0 ? -1 : Math.min(stepIndexState, steps.length - 1);
   const step = stepIndex >= 0 ? steps[stepIndex] : null;
 
   const remaining = distanceRemaining(totalDistance, distanceFromStart);
   const nextStepDistance = distanceToNextStep(
     steps,
     stepIndex,
-    distanceFromStart
+    distanceFromStart,
+    totalDistance
   );
   const progress = progressFraction(totalDistance, distanceFromStart);
 

@@ -411,6 +411,116 @@ def build_graph(nodes, ways):
     return graph, footpath_edges, edge_tags
 
 
+# ---------- Snapping a live position onto the path network ----------
+#
+# A footpath is a chain of nodes joined by straight edges. A student
+# standing on a long edge may be 30 m from the nearest node, and that
+# node can be BEHIND them. Snapping to the nearest NODE therefore puts
+# the start of the route on a junction or a corner, away from where the
+# student really is, and can even send them backwards first.
+#
+# The helpers below snap to the nearest POINT ON AN EDGE instead, and
+# insert that point into a temporary copy of the graph as a virtual
+# start node. The graph itself is never modified.
+
+VIRTUAL_START_ID = "__virtual_start__"
+
+# If the snapped point is this close to a real node, just use the node.
+VIRTUAL_SNAP_MIN_M = 1.5
+
+
+def nearest_point_on_graph(graph, nodes, lat, lon, edge_filter=None):
+    """
+    Closest point to (lat, lon) on ANY edge of the graph.
+
+    Adjacency entries may be (neighbour, distance) as in the outdoor
+    graph, or (neighbour, distance, edge_info) as in the merged
+    indoor/outdoor graph. `edge_filter(a, entry)`, if given, can skip
+    edges (the merged graph uses it to ignore indoor and connector
+    edges).
+
+    Returns a dict:
+        a, b          the edge's two node ids
+        t             0..1, how far from a toward b the point lies
+        edge_len_m    length of the edge
+        lat, lon      the snapped point
+        distance_m    how far (lat, lon) is from the snapped point
+        info          the edge's info dict (merged graph) or None
+    or None if the graph has no edges.
+    """
+    best = None
+    seen = set()
+    p = (lat, lon)
+
+    for a, neighbours in graph.items():
+        na = nodes.get(a)
+        if na is None:
+            continue
+        for entry in neighbours:
+            if edge_filter is not None and not edge_filter(a, entry):
+                continue
+            b, edge_len = entry[0], entry[1]
+            key = (a, b) if str(a) < str(b) else (b, a)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            nb = nodes.get(b)
+            if nb is None:
+                continue
+
+            dist, t, _side = point_segment_info(
+                p, (na["lat"], na["lon"]), (nb["lat"], nb["lon"])
+            )
+            if best is None or dist < best["distance_m"]:
+                best = {
+                    "a": a,
+                    "b": b,
+                    "t": t,
+                    "edge_len_m": edge_len,
+                    "lat": na["lat"] + (nb["lat"] - na["lat"]) * t,
+                    "lon": na["lon"] + (nb["lon"] - na["lon"]) * t,
+                    "distance_m": dist,
+                    "info": entry[2] if len(entry) > 2 else None,
+                }
+
+    return best
+
+
+def with_virtual_start(graph, nodes, snap, name="your current location"):
+    """
+    Build a temporary graph in which the snapped point is a real node.
+
+    Returns (graph2, nodes2, start_id). If the snap lands within
+    VIRTUAL_SNAP_MIN_M of an existing node, that node is used and the
+    original graph and nodes are returned unchanged.
+
+    The copies are shallow: only the two adjacency lists touched are
+    replaced, so this is cheap and the caller's graph is never mutated.
+    """
+    a, b, t, length = snap["a"], snap["b"], snap["t"], snap["edge_len_m"]
+    da = t * length
+    db = (1.0 - t) * length
+
+    if da <= VIRTUAL_SNAP_MIN_M:
+        return graph, nodes, a
+    if db <= VIRTUAL_SNAP_MIN_M:
+        return graph, nodes, b
+
+    g = dict(graph)
+    g[a] = list(graph[a]) + [(VIRTUAL_START_ID, da)]
+    g[b] = list(graph[b]) + [(VIRTUAL_START_ID, db)]
+    g[VIRTUAL_START_ID] = [(a, da), (b, db)]
+
+    n = dict(nodes)
+    n[VIRTUAL_START_ID] = {
+        "lat": snap["lat"],
+        "lon": snap["lon"],
+        "tags": {"name": name},
+    }
+    return g, n, VIRTUAL_START_ID
+
+
 def named_nodes(nodes):
     """dict of id -> node data, only for nodes with a 'name' tag."""
     return {nid: d for nid, d in nodes.items() if d["tags"].get("name")}

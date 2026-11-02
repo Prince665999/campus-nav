@@ -204,6 +204,106 @@ def _resolve_coord_start(
     return best_id, "your current location"
 
 
+# The id of the temporary node that stands for the walker's exact
+# position on a path. It starts with "o" so everything that tells indoor
+# from outdoor by the prefix treats it as outdoor.
+VIRTUAL_OUTDOOR_START_ID = "o__virtual_start__"
+
+
+def _is_outdoor_walk_edge(bundle):
+    """Edge filter: plain outdoor footpath edges only."""
+    outdoor_ids = bundle["outdoor_node_ids"]
+
+    def keep(a, entry):
+        info = entry[2] if len(entry) > 2 else None
+        return (
+            bool(info)
+            and info.get("outdoor") is True
+            and not info.get("connector")
+            and a in outdoor_ids
+            and entry[0] in outdoor_ids
+        )
+
+    return keep
+
+
+def _snap_live_fix_to_outdoor_edge(lat, lon, bundle, accuracy_m=None):
+    """
+    Snap a live GPS fix to the nearest POINT on an outdoor footpath.
+
+    Returns a snap dict (see campus_graph.nearest_point_on_graph), or
+    None if the fix is too far from every outdoor path to trust. Uses
+    the same distance limit as the outdoor engine.
+    """
+    from backend.core.campus_graph import nearest_point_on_graph
+    from .routing_service import _snap_limit_m
+
+    if accuracy_m is not None:
+        logger.info(
+            "Composer: routing from live fix at (%.5f, %.5f) accuracy %.1fm",
+            lat, lon, accuracy_m,
+        )
+
+    snap = nearest_point_on_graph(
+        bundle["graph"], bundle["nodes"], lat, lon,
+        edge_filter=_is_outdoor_walk_edge(bundle),
+    )
+    if snap is None or snap["distance_m"] > _snap_limit_m(accuracy_m):
+        logger.info(
+            "Composer: live fix is too far from any outdoor path "
+            "(nearest %.1fm) — refusing to route from it",
+            snap["distance_m"] if snap else float("inf"),
+        )
+        return None
+    return snap
+
+
+def _start_node_for_snap(snap):
+    """
+    (node_id, snap_or_None) for a snapped start.
+
+    If the snap lands within VIRTUAL_SNAP_MIN_M of a real node, that
+    node IS the start (no virtual node, so no zero-length edge that
+    would invent a bearing). Otherwise the start is the virtual node.
+    """
+    from backend.core.campus_graph import VIRTUAL_SNAP_MIN_M
+
+    da = snap["t"] * snap["edge_len_m"]
+    db = (1.0 - snap["t"]) * snap["edge_len_m"]
+    if da <= VIRTUAL_SNAP_MIN_M:
+        return snap["a"], None
+    if db <= VIRTUAL_SNAP_MIN_M:
+        return snap["b"], None
+    return VIRTUAL_OUTDOOR_START_ID, snap
+
+
+def _with_virtual_outdoor_start(graph, nodes, snap):
+    """
+    Copy of the merged graph and nodes in which the snapped point is a
+    real node, joined to both ends of the edge it sits on.
+
+    The copies are shallow: only the two adjacency lists touched are
+    replaced. The shared bundle is never modified.
+    """
+    a, b, t, length = snap["a"], snap["b"], snap["t"], snap["edge_len_m"]
+    da = t * length
+    db = (1.0 - t) * length
+    info = snap["info"]
+
+    g = dict(graph)
+    g[a] = list(graph[a]) + [(VIRTUAL_OUTDOOR_START_ID, da, info)]
+    g[b] = list(graph[b]) + [(VIRTUAL_OUTDOOR_START_ID, db, info)]
+    g[VIRTUAL_OUTDOOR_START_ID] = [(a, da, info), (b, db, info)]
+
+    n = dict(nodes)
+    n[VIRTUAL_OUTDOOR_START_ID] = {
+        "lat": snap["lat"],
+        "lon": snap["lon"],
+        "tags": {},
+    }
+    return g, n
+
+
 # ---------------------------------------------------------------------------
 # Composer
 # ---------------------------------------------------------------------------
@@ -260,20 +360,23 @@ def compose_route(
     if from_place is not None:
         from_ep = _classify_endpoint(from_place)
     elif from_lat is not None and from_lon is not None:
-        node_id, display_name = _resolve_coord_start(
-            from_lat, from_lon, bundle,
-            is_live_fix=True,
-            accuracy_m=from_accuracy_m,
+        # Start from the point on the footpath nearest the student, not
+        # from the nearest junction/node (which can be 20-40 m away and
+        # behind them). See _with_virtual_outdoor_start.
+        snap = _snap_live_fix_to_outdoor_edge(
+            from_lat, from_lon, bundle, accuracy_m=from_accuracy_m
         )
-        if node_id is None:
+        if snap is None:
             raise UnreliableLocationError()
+        start_id, virtual_snap = _start_node_for_snap(snap)
         from_ep = {
             "engine": "indoor",
             "place_id": None,
             "kind": "outdoor",
-            "node_id": node_id,
-            "osm_id": node_id[1:] if node_id.startswith("o") else node_id,
-            "name": display_name,
+            "node_id": start_id,
+            "osm_id": start_id[1:] if start_id.startswith("o") else start_id,
+            "name": "your current location",
+            "snap": virtual_snap,
         }
     else:
         raise RouteCompositionError(
@@ -368,6 +471,13 @@ def _resolve_path_for_outdoor_route(
     from .routing_service import _resolve_endpoint
     from backend.core.campus_graph import a_star
 
+    # The route engine already knows the exact path it walked, including
+    # a virtual start on the nearest path edge for a live GPS start.
+    # Re-deriving it here from the nearest NODE would give a different
+    # path, so use the engine's when it exists.
+    if getattr(route, "node_path", None):
+        return list(route.node_path)
+
     from_node, _ = _resolve_endpoint(
         session, graph, nodes,
         place_id=from_place_id,
@@ -403,6 +513,14 @@ def _route_via_indoor_engine(from_ep, to_ep):
 
     from_id = from_ep["node_id"]
     to_id = to_ep["node_id"]
+
+    # A live GPS start carries the exact point on the footpath the
+    # student is standing on. Put that point into a temporary copy of
+    # the graph; everything below then works on that copy exactly as it
+    # would on the shared graph.
+    snap = from_ep.get("snap")
+    if snap is not None:
+        graph, nodes = _with_virtual_outdoor_start(graph, nodes, snap)
 
     if from_id not in graph:
         raise RouteCompositionError(
@@ -464,7 +582,9 @@ def _route_via_indoor_engine(from_ep, to_ep):
         "from_name": from_ep["name"],
         "to_name": to_ep["name"],
         "legs": legs,
-        "node_path": path,
+        # The virtual start is not in the OSM data; narration looks
+        # every node up there, so it only receives real nodes.
+        "node_path": [n for n in path if n != VIRTUAL_OUTDOOR_START_ID],
     }
 
 
@@ -944,4 +1064,3 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
             continue
         step["level"] = level_at[gi] or "0"
         step["building_name"] = building_at[gi]
-
