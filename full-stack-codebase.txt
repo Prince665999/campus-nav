@@ -1354,106 +1354,6 @@ export default function DashboardPage() {
   );
 }
 
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\app\knowledge\page.js ---
-
-// Knowledge base admin page.
-//
-// Upload documents, view what's been uploaded, and test retrieval.
-
-'use client';
-
-import { useCallback, useEffect, useState } from 'react';
-
-import { api } from '@/lib/api';
-import { FileUploader } from '@/components/FileUploader';
-import { DocumentList } from '@/components/DocumentList';
-import { SearchTester } from '@/components/SearchTester';
-
-export default function KnowledgePage() {
-  const [documents, setDocuments] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.listKnowledgeDocuments();
-      setDocuments(data);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const handleDelete = useCallback(
-    async (doc) => {
-      if (
-        !confirm(
-          `Delete "${doc.filename}"? Its ${doc.chunk_count} chunks will be removed from the knowledge base.`
-        )
-      ) {
-        return;
-      }
-      try {
-        await api.deleteKnowledgeDocument(doc.id);
-        setDocuments((prev) => prev.filter((d) => d.id !== doc.id));
-      } catch (err) {
-        alert(err.message);
-      }
-    },
-    []
-  );
-
-  return (
-    <>
-      <h1 className="page-title">Knowledge Base</h1>
-      <p className="page-subtitle">
-        Upload documents the campus AI can answer questions from — the
-        handbook, almanac, rules, history, anything students ask about.
-      </p>
-
-      {error ? <div className="error-box">{error}</div> : null}
-
-      <div style={{ marginBottom: 32 }}>
-        <h2 style={{ fontSize: 18, marginTop: 0, marginBottom: 16 }}>
-          Upload
-        </h2>
-        <FileUploader onUploaded={load} />
-      </div>
-
-      <div style={{ marginBottom: 32 }}>
-        <div
-          className="row-between"
-          style={{ marginBottom: 16 }}
-        >
-          <h2 style={{ fontSize: 18, margin: 0 }}>Documents</h2>
-          <button
-            className="btn btn-secondary"
-            onClick={load}
-            disabled={loading}
-            style={{ fontSize: 13, padding: '6px 14px' }}
-          >
-            {loading ? 'Refreshing…' : 'Refresh'}
-          </button>
-        </div>
-        {loading && documents.length === 0 ? (
-          <div className="loading">Loading…</div>
-        ) : (
-          <DocumentList documents={documents} onDelete={handleDelete} />
-        )}
-      </div>
-
-      <SearchTester />
-    </>
-  );
-}
-
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\app\layout.js ---
 
 // Root layout for the admin site. Every page renders inside this.
@@ -4179,126 +4079,6 @@ export function DiffViewer({ diff }) {
   );
 }
 
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\components\DocumentList.js ---
-
-// A table of uploaded knowledge documents.
-
-'use client';
-
-import { formatDateTime } from '@/lib/format';
-import { StatusBadge } from '@/components/StatusBadge';
-
-export function DocumentList({ documents, onDelete }) {
-  if (!documents || documents.length === 0) {
-    return (
-      <div className="empty-state">
-        No documents uploaded yet. Upload a PDF or text file above to
-        start building the knowledge base.
-      </div>
-    );
-  }
-
-  return (
-    <div
-      style={{
-        background: 'var(--bg-elevated)',
-        border: '1px solid var(--border)',
-        borderRadius: 'var(--radius)',
-        overflow: 'hidden',
-      }}
-    >
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-        <thead>
-          <tr
-            style={{
-              background: 'var(--border-subtle)',
-              textAlign: 'left',
-              fontSize: 13,
-              color: 'var(--text-muted)',
-              textTransform: 'uppercase',
-              letterSpacing: 0.5,
-            }}
-          >
-            <th style={{ padding: '12px 16px', fontWeight: 600 }}>File</th>
-            <th style={{ padding: '12px 16px', fontWeight: 600, width: 100 }}>
-              Size
-            </th>
-            <th style={{ padding: '12px 16px', fontWeight: 600, width: 100 }}>
-              Chunks
-            </th>
-            <th style={{ padding: '12px 16px', fontWeight: 600, width: 120 }}>
-              Status
-            </th>
-            <th style={{ padding: '12px 16px', fontWeight: 600, width: 180 }}>
-              Uploaded
-            </th>
-            <th style={{ padding: '12px 16px', fontWeight: 600, width: 90 }}>
-              {' '}
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {documents.map((doc) => (
-            <tr
-              key={doc.id}
-              style={{ borderTop: '1px solid var(--border-subtle)' }}
-            >
-              <td style={{ padding: '12px 16px' }}>
-                <div style={{ fontWeight: 500 }}>{doc.filename}</div>
-                {doc.error_message ? (
-                  <div
-                    style={{
-                      fontSize: 12,
-                      color: 'var(--danger)',
-                      marginTop: 4,
-                    }}
-                  >
-                    {doc.error_message}
-                  </div>
-                ) : null}
-              </td>
-              <td style={{ padding: '12px 16px', fontSize: 13 }}>
-                {formatBytes(doc.size_bytes)}
-              </td>
-              <td style={{ padding: '12px 16px', fontSize: 13 }}>
-                {doc.chunk_count}
-              </td>
-              <td style={{ padding: '12px 16px' }}>
-                <StatusBadge status={doc.status} />
-              </td>
-              <td
-                style={{
-                  padding: '12px 16px',
-                  fontSize: 13,
-                  color: 'var(--text-muted)',
-                }}
-              >
-                {formatDateTime(doc.created_at)}
-              </td>
-              <td style={{ padding: '12px 16px', textAlign: 'right' }}>
-                <button
-                  className="btn btn-danger"
-                  style={{ fontSize: 12, padding: '4px 10px' }}
-                  onClick={() => onDelete(doc)}
-                >
-                  Delete
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function formatBytes(bytes) {
-  if (!bytes) return '0 B';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\components\FileUploader.js ---
 
 // A drag-and-drop file uploader with a fallback click-to-choose.
@@ -4720,7 +4500,6 @@ const NAV_ITEMS = [
   { href: '/place-editor', label: 'Places', icon: 'pin' },
   { href: '/timetable', label: 'Timetable', icon: 'calendar' },
   { href: '/timetable-import', label: 'Import CSV', icon: 'upload' },
-  { href: '/knowledge', label: 'Knowledge', icon: 'book' },
   { href: '/route-tester', label: 'Route Tester', icon: 'compass' },
   { href: '/reimport-view', label: 'Re-import', icon: 'refresh' },
   { href: '/roles', label: 'Roles', icon: 'people' },
@@ -4914,6 +4693,7 @@ export function Sidebar() {
     </aside>
   );
 }
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\components\StatCard.js ---
 
@@ -5139,11 +4919,6 @@ export const api = {
   deleteUser: (id) =>
     request(`/api/admin/users/${id}`, { method: 'DELETE' }),
 
-  // ---------- Knowledge base ----------
-  listKnowledgeDocuments: () => request('/api/admin/knowledge'),
-  deleteKnowledgeDocument: (id) =>
-    request(`/api/admin/knowledge/${id}`, { method: 'DELETE' }),
-
   // ---------- Timetable ----------
   // Programs are read through the admin endpoint (identical shape to
   // the public one, but consistent with the rest of the admin site).
@@ -5177,6 +4952,7 @@ export const api = {
     });
   },
 };
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\admin\site\lib\auth.js ---
 
@@ -11712,7 +11488,6 @@ from .rate_limit import limiter, rate_limit_exceeded_handler
 from .routers import (
     areas,
     chat,
-    chat_doc,
     favorites,
     health,
     indoor,
@@ -11728,7 +11503,6 @@ from .routers import (
 )
 from .routers.admin import (
     auth as admin_auth,
-    knowledge as admin_knowledge,
     map_health as admin_map_health,
     media as admin_media,
     places as admin_places,
@@ -11828,7 +11602,6 @@ def create_app() -> FastAPI:
     app.include_router(reports.router)
     app.include_router(chat.router)
     app.include_router(wifi.router)
-    app.include_router(chat_doc.router)
     app.include_router(timetable.router)
 
     # Admin auth — NOT behind the guard, because login itself can't
@@ -11861,9 +11634,6 @@ def create_app() -> FastAPI:
         admin_users.router, prefix=admin_prefix, dependencies=admin_deps
     )
     app.include_router(
-        admin_knowledge.router, prefix=admin_prefix, dependencies=admin_deps
-    )
-    app.include_router(
         admin_timetable.router, prefix=admin_prefix, dependencies=admin_deps
     )
 
@@ -11886,6 +11656,7 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
 
 
 
@@ -12234,56 +12005,6 @@ class IndoorPathEdge(Base, TimestampMixin):
             f"<IndoorPathEdge {self.node_a_osm}--{self.node_b_osm} "
             f"{self.length_m:.1f}m {self.kind}>"
         )
-
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\knowledge_document.py ---
-
-"""
-knowledge_document.py
-
-Tracks documents uploaded to the knowledge base. The actual content
-lives in ChromaDB; this table holds the metadata — filename, when it
-was uploaded, how many chunks it produced, and its status.
-
-Why a separate table from the chunks: the chunks live in Chroma, the
-document record lives in SQLite. That way the admin site can list,
-search, and delete documents without touching the vector store, and
-Chroma can be rebuilt from the source PDFs if it ever needs to be.
-"""
-
-from sqlalchemy import Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
-
-from .base import Base, TimestampMixin
-
-
-class KnowledgeDocument(Base, TimestampMixin):
-    __tablename__ = "knowledge_documents"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-
-    # Original filename, for display.
-    filename: Mapped[str] = mapped_column(String(255), nullable=False)
-
-    # Where the file lives on disk (under KNOWLEDGE_UPLOAD_DIR).
-    stored_path: Mapped[str] = mapped_column(String(512), nullable=False)
-
-    # File size in bytes.
-    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
-
-    # How many chunks were extracted. Zero if processing failed.
-    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
-
-    # Processing status: "processing", "ready", "failed".
-    status: Mapped[str] = mapped_column(String(32), default="processing")
-
-    # If processing failed, why.
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # Free-text notes the admin can add.
-    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    def __repr__(self):
-        return f"<KnowledgeDocument id={self.id} filename={self.filename!r}>"
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\models\media.py ---
 
@@ -12978,7 +12699,6 @@ from .base import Base, TimestampMixin
 from .favorite import Favorite
 from .indoor_area import IndoorArea
 from .indoor_path_edge import IndoorPathEdge
-from .knowledge_document import KnowledgeDocument
 from .media import Media
 from .path_edge import PathEdge
 from .place import Place
@@ -13003,11 +12723,11 @@ __all__ = [
     "Report",
     "RouteCache",
     "AdminUser",
-    "KnowledgeDocument",
     "Program",
     "ProgramYear",
     "TimetableEntry",
 ]
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\rate_limit.py ---
 
@@ -13145,176 +12865,6 @@ def whoami(
         role=user.role,
         email=user.email_hash[:12] + "…",
     )
-
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\admin\knowledge.py ---
-
-"""
-knowledge.py
-
-Admin endpoints for the knowledge base.
-
-  GET    /api/admin/knowledge             — list documents
-  POST   /api/admin/knowledge/upload      — upload a PDF or text file
-  DELETE /api/admin/knowledge/{id}        — delete a document
-  GET    /api/admin/knowledge/search?q=   — test retrieval
-"""
-
-import uuid
-from pathlib import Path
-
-from fastapi import APIRouter, Depends, File, Query, UploadFile
-from sqlalchemy.orm import Session
-
-from ...dependencies import db_session
-from ...errors import BadRequestError, NotFoundError
-from ...models.knowledge_document import KnowledgeDocument
-from ...schemas.knowledge import (
-    KnowledgeDocumentItem,
-    KnowledgeSearchResult,
-    KnowledgeUploadResponse,
-)
-from ...services import knowledge_service
-from ...settings import KNOWLEDGE_MAX_UPLOAD_BYTES, KNOWLEDGE_UPLOAD_DIR
-
-router = APIRouter(prefix="/knowledge", tags=["admin:knowledge"])
-
-
-def _to_item(doc: KnowledgeDocument) -> KnowledgeDocumentItem:
-    return KnowledgeDocumentItem(
-        id=doc.id,
-        filename=doc.filename,
-        size_bytes=doc.size_bytes,
-        chunk_count=doc.chunk_count,
-        status=doc.status,
-        error_message=doc.error_message,
-        notes=doc.notes,
-        created_at=doc.created_at,
-    )
-
-
-@router.get("", response_model=list[KnowledgeDocumentItem])
-def list_documents(session: Session = Depends(db_session)):
-    """List every uploaded document, newest first."""
-    docs = (
-        session.query(KnowledgeDocument)
-        .order_by(KnowledgeDocument.created_at.desc())
-        .all()
-    )
-    return [_to_item(d) for d in docs]
-
-
-@router.post("/upload", response_model=KnowledgeUploadResponse, status_code=201)
-async def upload_document(
-    file: UploadFile = File(...),
-    session: Session = Depends(db_session),
-):
-    """
-    Upload a PDF or text file. The file is stored, then processed:
-    text and tables are extracted, chunked, embedded, and stored in
-    Chroma.
-    """
-    contents = await file.read()
-
-    if len(contents) > KNOWLEDGE_MAX_UPLOAD_BYTES:
-        mb = KNOWLEDGE_MAX_UPLOAD_BYTES // (1024 * 1024)
-        raise BadRequestError(f"File is larger than {mb} MB")
-
-    suffix = Path(file.filename).suffix.lower()
-    if suffix not in (".pdf", ".txt", ".md"):
-        raise BadRequestError(
-            "Only .pdf, .txt, and .md files are supported."
-        )
-
-    # Save the file under a unique name so two uploads of "almanac.pdf"
-    # don't collide.
-    stored_name = f"{uuid.uuid4().hex}{suffix}"
-    stored_path = KNOWLEDGE_UPLOAD_DIR / stored_name
-    stored_path.write_bytes(contents)
-
-    doc = KnowledgeDocument(
-        filename=file.filename,
-        stored_path=str(stored_path),
-        size_bytes=len(contents),
-        status="processing",
-    )
-    session.add(doc)
-    session.flush()
-
-    # Process synchronously. For small documents this is fine. For
-    # large ones (>20 MB) a background task would be better, but
-    # that's a later improvement.
-    try:
-        chunks = knowledge_service.extract(stored_path)
-        chunk_count = knowledge_service.store_chunks(chunks, doc.id)
-        doc.chunk_count = chunk_count
-        doc.status = "ready"
-    except Exception as e:
-        doc.status = "failed"
-        doc.error_message = str(e)
-        session.flush()
-        raise BadRequestError(f"Processing failed: {e}") from e
-
-    session.flush()
-
-    return KnowledgeUploadResponse(
-        id=doc.id,
-        filename=doc.filename,
-        chunk_count=doc.chunk_count,
-        status=doc.status,
-    )
-
-
-@router.delete("/{document_id}", status_code=204)
-def delete_document(
-    document_id: int,
-    session: Session = Depends(db_session),
-):
-    """
-    Delete a document and its chunks. Removes the file from disk, the
-    chunks from Chroma, and the row from the database.
-    """
-    doc = (
-        session.query(KnowledgeDocument)
-        .filter_by(id=document_id)
-        .one_or_none()
-    )
-    if doc is None:
-        raise NotFoundError(f"Document {document_id} not found")
-
-    # Remove chunks from Chroma.
-    knowledge_service.delete_document(document_id)
-
-    # Remove the file from disk.
-    try:
-        Path(doc.stored_path).unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    session.delete(doc)
-    return None
-
-
-@router.get("/search", response_model=list[KnowledgeSearchResult])
-def search(
-    q: str = Query(..., min_length=1),
-    top_k: int = Query(5, gt=0, le=20),
-):
-    """
-    Test retrieval. Returns the chunks the knowledge base would use
-    to answer a question.
-    """
-    results = knowledge_service.retrieve(q, top_k=top_k)
-    return [
-        KnowledgeSearchResult(
-            text=r["text"],
-            source_file=r["metadata"].get("source_file", ""),
-            page_number=r["metadata"].get("page_number", 0),
-            section_heading=r["metadata"].get("section_heading", ""),
-            type=r["metadata"].get("type", ""),
-            score=r["score"],
-        )
-        for r in results
-    ]
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\admin\map_health.py ---
 
@@ -14350,146 +13900,6 @@ def _load_nearby_places(
     except Exception as e:
         logger.warning("Nearby places lookup failed: %s", e)
         return None
-
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\chat_doc.py ---
-
-"""
-chat_doc.py
-
-Document chat endpoints:
-
-  POST /api/chat/doc/session
-  DELETE /api/chat/doc/session/{id}
-  POST /api/chat/doc
-  GET  /api/chat/doc/search?q=
-
-The document chat answers university questions using the knowledge
-base. It has no route context. Walk questions belong to /api/chat.
-"""
-
-import logging
-import uuid
-
-from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy.orm import Session
-
-from .. import cache
-from ..dependencies import db_session
-from ..rate_limit import limiter
-from ..schemas.chat import StartChatSessionResponse
-from ..schemas.chat_doc import (
-    DocChatRequest,
-    DocChatResponse,
-    DocSearchResult,
-)
-from ..services import chat_doc_service, knowledge_service
-from ..settings import RATE_LIMIT_CHAT
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/api/chat/doc", tags=["chat:doc"])
-
-MAX_HISTORY_TURNS = 10
-SESSION_TTL_S = 60 * 60
-
-
-def _history_key(session_id: str) -> str:
-    return f"chat:doc:{session_id}"
-
-
-def _load_history(session_id: str) -> list:
-    if not session_id:
-        return []
-    raw = cache.get(_history_key(session_id))
-    if not raw or not isinstance(raw, list):
-        return []
-    return raw
-
-
-def _save_history(session_id: str, history: list):
-    if not session_id:
-        return
-    cache.set(
-        _history_key(session_id),
-        history[-MAX_HISTORY_TURNS * 2 :],
-        ttl_s=SESSION_TTL_S,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Session lifecycle
-# ---------------------------------------------------------------------------
-
-@router.post("/session", response_model=StartChatSessionResponse)
-@limiter.limit(RATE_LIMIT_CHAT)
-def start_session(request: Request):
-    return StartChatSessionResponse(session_id=str(uuid.uuid4()))
-
-
-@router.delete("/session/{session_id}", status_code=204)
-def end_session(session_id: str):
-    cache.delete(_history_key(session_id))
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Chat
-# ---------------------------------------------------------------------------
-
-@router.post("", response_model=DocChatResponse)
-@limiter.limit(RATE_LIMIT_CHAT)
-def chat(
-    request: Request,
-    body: DocChatRequest,
-    session: Session = Depends(db_session),
-):
-    """
-    Answer a question about the university using the knowledge base.
-    """
-    session_id = body.session_id
-    history = _load_history(session_id) if session_id else []
-
-    reply, used_knowledge = chat_doc_service.answer_doc_question(body.message)
-
-    if session_id:
-        history.append({"role": "user", "content": body.message})
-        history.append({"role": "assistant", "content": reply})
-        _save_history(session_id, history)
-
-    return DocChatResponse(
-        reply=reply,
-        session_id=session_id,
-        used_knowledge=used_knowledge,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Direct search (for debugging and the admin site)
-# ---------------------------------------------------------------------------
-
-@router.get("/search", response_model=list[DocSearchResult])
-@limiter.limit(RATE_LIMIT_CHAT)
-def search(
-    request: Request,
-    q: str = Query(..., min_length=1),
-    top_k: int = Query(5, gt=0, le=20),
-):
-    """
-    Test retrieval directly. Returns the chunks the chat would use.
-    Useful for the admin site's knowledge base page.
-    """
-    results = knowledge_service.retrieve(q, top_k=top_k)
-    return [
-        DocSearchResult(
-            text=r["text"],
-            source_file=r["metadata"].get("source_file", ""),
-            page_number=r["metadata"].get("page_number", 0),
-            section_heading=r["metadata"].get("section_heading", ""),
-            type=r["metadata"].get("type", ""),
-            score=r["score"],
-        )
-        for r in results
-    ]
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\routers\favorites.py ---
 
@@ -15745,40 +15155,6 @@ class ChatResponse(BaseModel):
 class StartChatSessionResponse(BaseModel):
     session_id: str
 
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\chat_doc.py ---
-
-"""
-chat_doc.py
-
-Request and response shapes for the document chat endpoints.
-"""
-
-from pydantic import BaseModel, Field
-
-
-class DocChatRequest(BaseModel):
-    """Body for POST /api/chat/doc."""
-
-    message: str = Field(..., min_length=1, max_length=1000)
-    session_id: str | None = None
-
-
-class DocChatResponse(BaseModel):
-    reply: str
-    session_id: str | None = None
-    used_knowledge: bool = False
-
-
-class DocSearchResult(BaseModel):
-    """Result of a direct search against the knowledge base."""
-
-    text: str
-    source_file: str
-    page_number: int
-    section_heading: str
-    type: str
-    score: float
-
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\common.py ---
 
 """
@@ -15942,45 +15318,6 @@ class IndoorAreasResponse(BaseModel):
     # Every level this building has polygons on, sorted ascending.
     # Includes the requested level. Used by the floor switcher.
     levels: list[str] = Field(default_factory=list)
-
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\knowledge.py ---
-
-"""
-knowledge.py
-
-Request and response shapes for the knowledge base endpoints.
-"""
-
-from datetime import datetime
-
-from pydantic import BaseModel
-
-
-class KnowledgeDocumentItem(BaseModel):
-    id: int
-    filename: str
-    size_bytes: int
-    chunk_count: int
-    status: str
-    error_message: str | None = None
-    notes: str | None = None
-    created_at: datetime
-
-
-class KnowledgeUploadResponse(BaseModel):
-    id: int
-    filename: str
-    chunk_count: int
-    status: str
-
-
-class KnowledgeSearchResult(BaseModel):
-    text: str
-    source_file: str
-    page_number: int
-    section_heading: str
-    type: str
-    score: float
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\schemas\media.py ---
 
@@ -17107,199 +16444,6 @@ def stats() -> dict:
     except Exception:
         return {"available": False, "keys": 0}
 
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\chat_doc_service.py ---
-
-"""
-chat_doc_service.py
-
-The document chat service. Answers questions about the university
-using the knowledge base — the documents uploaded to the admin site.
-
-This service does not touch routes. Walk questions belong to
-chat_service.py. If a student asks about the walk here, the answer
-is "ask that in Walking Mode."
-"""
-
-import logging
-
-import re
-
-from . import date_query, knowledge_service, llm_client
-
-logger = logging.getLogger(__name__)
-
-
-_DOC_SYSTEM_PROMPT = """You are an information assistant for a university campus.
-
-You will be given excerpts from university documents — the handbook, almanac, rules, history, or any other uploaded material — and a question.
-
-Answer only from those excerpts. Never invent a fact, a date, a rule, or a place.
-
-If the answer isn't in the excerpts, say so plainly. "I don't know that one — check the official notice board" is a fine answer.
-
-The almanac lists only the dates that have an event. If a note in the excerpts says no entry was found for the date the student asked about, say plainly that you can't find anything listed for that date, so probably nothing is scheduled, and suggest checking the official notice board.
-
-For anything time-sensitive (exam dates, holidays, deadlines, term dates), always add a short reminder: "check the official notice board to confirm."
-
-Keep answers short — one to three sentences.
-
-Be warm and conversational. Plain prose only. No markdown.
-"""
-
-
-def _format_chunks(chunks: list) -> str:
-    if not chunks:
-        return ""
-
-    lines = ["UNIVERSITY DOCUMENT EXCERPTS:"]
-    for chunk in chunks:
-        source = chunk["metadata"].get("source_file", "?")
-        page = chunk["metadata"].get("page_number", "?")
-        heading = chunk["metadata"].get("section_heading", "")
-        header = f"[{source}, page {page}"
-        if heading:
-            header += f", {heading}"
-        header += "]"
-        lines.append(header)
-        lines.append("  " + chunk["text"])
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# The most day-chunks we will add for a month question ("what is in May").
-_MAX_MONTH_CHUNKS = 31
-
-_ISO_IN_TEXT = re.compile(r"\((\d{4}-\d{2}-\d{2})\)")
-
-
-def _chunk_date(chunk) -> str:
-    """The ISO date a chunk is about, e.g. "2026-05-01", for sorting."""
-    match = _ISO_IN_TEXT.search(chunk["text"])
-    return match.group(1) if match else ""
-
-
-def _date_chunks(question: str):
-    """
-    Chunks that match a date written in the question, found by exact text.
-    Returns (chunks, note). `note` is a sentence for the model when a
-    specific day was asked about but nothing is listed for it, else None.
-    """
-    day_needles, month_needles = date_query.find_date_needles(question)
-    chunks = []
-
-    try:
-        for needle in day_needles:
-            chunks.extend(knowledge_service.retrieve_containing(needle, limit=5))
-        for needle in month_needles:
-            found = knowledge_service.retrieve_containing(
-                needle, limit=_MAX_MONTH_CHUNKS
-            )
-            # Put the days in calendar order.
-            found.sort(key=_chunk_date)
-            chunks.extend(found)
-    except Exception as e:
-        logger.warning("Date lookup failed: %s", e)
-        return [], None
-
-    note = None
-    if day_needles and not chunks:
-        note = (
-            "Note: the documents were searched for the exact date the "
-            "student asked about and no entry was found for it."
-        )
-    return chunks, note
-
-
-def _merge(primary: list, secondary: list, limit: int) -> list:
-    """primary first, then secondary, without repeating a chunk."""
-    seen, merged = set(), []
-    for chunk in primary + secondary:
-        if chunk["text"] in seen:
-            continue
-        seen.add(chunk["text"])
-        merged.append(chunk)
-    return merged[:limit]
-
-
-def answer_doc_question(question: str, top_k: int = 5) -> tuple[str, bool]:
-    """
-    Answer a question about the university using the knowledge base.
-
-    Returns (reply, used_knowledge). `used_knowledge` is True when at
-    least one chunk was retrieved.
-    """
-    if not question or not question.strip():
-        return "Ask me anything about the university.", False
-
-    # Retrieve chunks.
-    chunks = []
-    try:
-        chunks = knowledge_service.retrieve(question, top_k=top_k)
-    except Exception as e:
-        logger.warning("Knowledge retrieval failed: %s", e)
-
-    # A date in the question is matched by exact text, because searching
-    # by meaning cannot tell one almanac day from another.
-    date_chunks, date_note = _date_chunks(question)
-    if date_chunks:
-        limit = max(top_k, len(date_chunks) + 2)
-        chunks = _merge(date_chunks, chunks, limit)
-
-    if not chunks and not date_note:
-        return (
-            "I don't have anything about that in the documents I've "
-            "been given. Try rephrasing, or check the official notice "
-            "board.",
-            False,
-        )
-
-    # No LLM? Return the top chunk as plain text. Honest and useful.
-    if not llm_client.is_available():
-        if not chunks:
-            return (
-                "I can't find an entry for that date in the documents. "
-                "Check the official notice board to confirm.",
-                False,
-            )
-        top = chunks[0]
-        source = top["metadata"].get("source_file", "the documents")
-        return (
-            f"From {source}: {top['text']}",
-            True,
-        )
-
-    context = _format_chunks(chunks)
-    if date_note:
-        context = f"{context}\n\n{date_note}" if context else date_note
-    response = llm_client.chat(
-        [
-            {"role": "system", "content": _DOC_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"{context}\n\nStudent asked: {question}",
-            },
-        ],
-        temperature=0.4,
-        max_tokens=400,
-    )
-
-    if response:
-        return response.strip(), True
-
-    # LLM call failed. Return the top chunk as plain text.
-    if not chunks:
-        return (
-            "I can't find an entry for that date in the documents. "
-            "Check the official notice board to confirm.",
-            False,
-        )
-    top = chunks[0]
-    source = top["metadata"].get("source_file", "the documents")
-    return (f"From {source}: {top['text']}", True)
-
-
-
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\chat_service.py ---
 
 """
@@ -17309,9 +16453,8 @@ The route chat service. Answers questions about the walk the student
 is currently on, using the route timeline, the narration they heard,
 and the places near their current position.
 
-This service does not touch the knowledge base. University questions
-belong to chat_doc_service.py, and the two are deliberately separate
-so neither can accidentally answer from the other's source.
+It answers only from the walk's own data; there is no document or
+embedding search anywhere in the app.
 """
 
 import json
@@ -17589,161 +16732,6 @@ def answer_route_question(question: str, route_context: dict) -> str:
         route_context["current_step_index"],
         question,
     )
-
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\date_query.py ---
-
-"""
-date_query.py
-
-Finds dates in a student's question and turns them into text snippets that
-can be looked up directly in the knowledge base.
-
-Why this exists: the knowledge base is searched by meaning (embeddings).
-Embeddings are poor at exact dates, so "what is happening on Friday 1 May
-2026" used to return five unrelated almanac days and the assistant said it
-saw no event. The almanac text contains each date in ISO form, e.g.
-"(2026-05-01)", so a plain text lookup for that string finds the right day
-every time.
-
-Understands (English and Swahili):
-  "1 May 2026", "1st of May", "May 1", "friday may 1 of 2026", "1 Mei",
-  "2026-05-01", "01/05/2026" (day/month/year), "today"/"leo",
-  "tomorrow"/"kesho", "yesterday"/"jana", and month-only questions such as
-  "what is in May" / "events during Oktoba".
-
-Pure functions, no database, so they are easy to test.
-"""
-
-import re
-from datetime import date, timedelta
-
-_MONTHS = {
-    # English
-    "january": 1, "jan": 1,
-    "february": 2, "feb": 2,
-    "march": 3, "mar": 3,
-    "april": 4, "apr": 4,
-    "may": 5,
-    "june": 6, "jun": 6,
-    "july": 7, "jul": 7,
-    "august": 8, "aug": 8,
-    "september": 9, "sep": 9, "sept": 9,
-    "october": 10, "oct": 10,
-    "november": 11, "nov": 11,
-    "december": 12, "dec": 12,
-    # Swahili
-    "januari": 1,
-    "februari": 2,
-    "machi": 3,
-    "aprili": 4,
-    "mei": 5,
-    "juni": 6,
-    "julai": 7,
-    "agosti": 8, "ago": 8,
-    "septemba": 9,
-    "oktoba": 10, "okt": 10,
-    "novemba": 11,
-    "desemba": 12, "des": 12,
-}
-
-_MONTH_RE = "|".join(sorted(_MONTHS, key=len, reverse=True))
-_YEAR = r"(20\d{2})"
-_ORD = r"(?:st|nd|rd|th)?"
-
-_RE_ISO = re.compile(rf"\b{_YEAR}-(\d{{1,2}})-(\d{{1,2}})\b")
-_RE_DAY_MONTH = re.compile(
-    rf"\b(\d{{1,2}}){_ORD}\s*(?:of\s+|ya\s+)?({_MONTH_RE})\b"
-    rf"(?:\s*,?\s*(?:of\s+)?{_YEAR})?",
-    re.I,
-)
-_RE_MONTH_DAY = re.compile(
-    rf"\b({_MONTH_RE})\s+(\d{{1,2}}){_ORD}\b(?!\s*:)"
-    rf"(?:\s*,?\s*(?:of\s+)?{_YEAR})?",
-    re.I,
-)
-_RE_NUMERIC = re.compile(r"\b(\d{1,2})[/.](\d{1,2})[/.](20\d{2}|\d{2})\b")
-_RE_MONTH_ONLY = re.compile(
-    rf"\b(?:in|during|for|of|within|mwezi(?:\s+wa)?)\s+({_MONTH_RE})\b"
-    rf"(?!\s+\d)",
-    re.I,
-)
-
-_RELATIVE = [
-    (re.compile(r"\b(day after tomorrow|kesho kutwa)\b", re.I), 2),
-    (re.compile(r"\b(tomorrow|kesho)\b", re.I), 1),
-    (re.compile(r"\b(yesterday|jana)\b", re.I), -1),
-    (re.compile(r"\b(today|leo)\b", re.I), 0),
-]
-
-
-def _valid(year, month, day):
-    """A real calendar date? year may be None (then any leap year works)."""
-    try:
-        date(year if year else 2024, month, day)
-        return True
-    except ValueError:
-        return False
-
-
-def _needle(year, month, day):
-    # The closing bracket stops "-05-01" matching inside "-05-010" etc.
-    if year:
-        return f"{year:04d}-{month:02d}-{day:02d})"
-    return f"-{month:02d}-{day:02d})"
-
-
-def _add(found, year, month, day):
-    if 1 <= month <= 12 and _valid(year, month, day):
-        needle = _needle(year, month, day)
-        if needle not in found:
-            found.append(needle)
-
-
-def find_date_needles(question, today=None):
-    """
-    Returns (day_needles, month_needles) for the question.
-
-    day_needles   exact days, e.g. ["2026-05-01)"] or ["-05-01)"] when the
-                  question gave no year (matches that day in any year).
-    month_needles whole months, e.g. ["-05-"], for "what is in May".
-
-    Both lists are empty when the question mentions no date.
-    """
-    if not question:
-        return [], []
-    today = today or date.today()
-    days, months = [], []
-    text = question
-
-    for m in _RE_ISO.finditer(text):
-        _add(days, int(m.group(1)), int(m.group(2)), int(m.group(3)))
-
-    for m in _RE_DAY_MONTH.finditer(text):
-        year = int(m.group(3)) if m.group(3) else None
-        _add(days, year, _MONTHS[m.group(2).lower()], int(m.group(1)))
-
-    for m in _RE_MONTH_DAY.finditer(text):
-        year = int(m.group(3)) if m.group(3) else None
-        _add(days, year, _MONTHS[m.group(1).lower()], int(m.group(2)))
-
-    for m in _RE_NUMERIC.finditer(text):
-        year = int(m.group(3))
-        if year < 100:
-            year += 2000
-        _add(days, year, int(m.group(2)), int(m.group(1)))  # day/month/year
-
-    for pattern, offset in _RELATIVE:
-        if pattern.search(text):
-            d = today + timedelta(days=offset)
-            _add(days, d.year, d.month, d.day)
-
-    if not days:
-        for m in _RE_MONTH_ONLY.finditer(text):
-            needle = f"-{_MONTHS[m.group(1).lower()]:02d}-"
-            if needle not in months:
-                months.append(needle)
-
-    return days, months
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\favorite_service.py ---
@@ -18817,499 +17805,6 @@ def is_indoor_node(node_id):
     composer uses.
     """
     return not str(node_id).startswith("o")
-
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\knowledge_service.py ---
-
-"""
-knowledge_service.py
-
-The knowledge base pipeline. Reads a PDF or text file, extracts text
-and tables, converts each into chunks, embeds them, and stores them
-in ChromaDB.
-
-The pipeline per page:
-
-  1. Run `extract_tables()` first.
-  2. If tables exist, convert each row to a sentence, prefixed with
-     the nearest heading on the page.
-  3. Record the table's bounding box so its content can be excluded
-     from the plain-text pass.
-  4. Run `extract_text()` on the page, excluding the table bounding
-     boxes.
-  5. Split the remaining text into paragraph-sized chunks.
-  6. Store all chunks in Chroma with metadata:
-       {source_file, page_number, section_heading, type}
-
-Retrieval:
-
-  Given a query string, embed it and ask Chroma for the closest
-  chunks. Return the chunk texts and their metadata.
-"""
-
-import logging
-import re
-import uuid
-from pathlib import Path
-
-import os
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-
-import chromadb
-import pdfplumber
-
-from backend.api.settings import (
-    CHROMA_COLLECTION,
-    CHROMA_DIR,
-    EMBEDDING_MODEL,
-    KNOWLEDGE_CHUNK_WORDS,
-    KNOWLEDGE_TOP_K,
-)
-
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Chroma client — created lazily on first use
-# ---------------------------------------------------------------------------
-
-_client = None
-_embedder = None
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    return _client
-
-
-def _get_collection():
-    client = _get_client()
-    return client.get_or_create_collection(
-        name=CHROMA_COLLECTION,
-        metadata={"hnsw:space": "cosine"},
-    )
-
-
-def _get_embedder():
-    """
-    Load the sentence-transformers model once, on first use. The
-    first call downloads the model (~80 MB); after that it's cached.
-    """
-    global _embedder
-    if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-
-        logger.info("Loading embedding model %s", EMBEDDING_MODEL)
-        _embedder = SentenceTransformer(EMBEDDING_MODEL)
-    return _embedder
-
-
-def _embed(texts):
-    """Embed a list of strings. Returns a list of vectors."""
-    model = _get_embedder()
-    return model.encode(texts, show_progress_bar=False).tolist()
-
-
-# ---------------------------------------------------------------------------
-# Text cleaning
-# ---------------------------------------------------------------------------
-
-def _clean(text):
-    """Collapse whitespace and strip empty lines."""
-    if not text:
-        return ""
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
-    return text.strip()
-
-
-def _is_heading(line):
-    """
-    Heuristic: a short line, no trailing period, capitalised, on its
-    own, is likely a heading.
-
-    pdfplumber doesn't tell us font sizes via extract_text(), so this
-    is what we have. It's not perfect but it catches most headings.
-    """
-    if not line:
-        return False
-    line = line.strip()
-    if len(line) > 80:
-        return False
-    if line.endswith("."):
-        return False
-    # At least two words, first letter capitalised.
-    words = line.split()
-    if len(words) < 2:
-        return False
-    return words[0][0].isupper()
-
-
-def _nearest_heading_before(text, position):
-    """
-    Given a page's text and a character position, return the most
-    recent heading line before that position, or None.
-    """
-    before = text[:position]
-    lines = before.split("\n")
-    for line in reversed(lines):
-        stripped = line.strip()
-        if _is_heading(stripped):
-            return stripped
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Table extraction
-# ---------------------------------------------------------------------------
-
-def _table_rows_to_chunks(table, source_file, page_number, heading):
-    """
-    Convert a pdfplumber table into a list of chunk dicts.
-
-    Each row becomes one chunk. The row is prefixed with the heading
-    so the embedding has context, and joined with a colon between
-    cells so the sentence reads naturally.
-    """
-    chunks = []
-    if not table or len(table) < 2:
-        return chunks
-
-    # First row is the header.
-    header = [str(c).strip() if c else "" for c in table[0]]
-
-    for row in table[1:]:
-        if not row:
-            continue
-
-        cells = [str(c).strip() if c else "" for c in row]
-        # Build "Header1: cell1. Header2: cell2."
-        parts = []
-        for h, c in zip(header, cells):
-            if not c:
-                continue
-            if h:
-                parts.append(f"{h}: {c}")
-            else:
-                parts.append(c)
-
-        if not parts:
-            continue
-
-        sentence = ". ".join(parts)
-        if heading:
-            sentence = f"{heading}. {sentence}"
-
-        chunks.append({
-            "text": _clean(sentence),
-            "metadata": {
-                "source_file": source_file,
-                "page_number": page_number,
-                "section_heading": heading or "",
-                "type": "table_row",
-            },
-        })
-
-    return chunks
-
-
-# ---------------------------------------------------------------------------
-# Prose extraction
-# ---------------------------------------------------------------------------
-
-def _split_paragraphs(text, max_words):
-    """
-    Split prose into paragraph-sized chunks of at most `max_words`.
-
-    Splits on blank lines first. Any paragraph longer than the max is
-    split further at sentence boundaries.
-    """
-    paragraphs = re.split(r"\n\s*\n", text)
-    chunks = []
-
-    for para in paragraphs:
-        para = _clean(para)
-        if not para:
-            continue
-
-        words = para.split()
-        if len(words) <= max_words:
-            chunks.append(para)
-            continue
-
-        # Split long paragraphs at sentence boundaries.
-        sentences = re.split(r"(?<=[.!?])\s+", para)
-        current = []
-        current_len = 0
-        for sentence in sentences:
-            s_len = len(sentence.split())
-            if current_len + s_len > max_words and current:
-                chunks.append(" ".join(current))
-                current = [sentence]
-                current_len = s_len
-            else:
-                current.append(sentence)
-                current_len += s_len
-        if current:
-            chunks.append(" ".join(current))
-
-    return chunks
-
-
-# ---------------------------------------------------------------------------
-# PDF extraction
-# ---------------------------------------------------------------------------
-
-def extract_pdf(path):
-    """
-    Extract chunks from a PDF. Returns a list of
-    {text, metadata} dicts.
-    """
-    source_file = Path(path).name
-    all_chunks = []
-
-    with pdfplumber.open(str(path)) as pdf:
-        for page_index, page in enumerate(pdf.pages, start=1):
-            page_text = page.extract_text() or ""
-
-            # Tables first.
-            tables = page.extract_tables() or []
-            table_bboxes = []
-
-            for table_obj in page.find_tables():
-                table_bboxes.append(table_obj.bbox)
-
-            # The extract_tables() call returns the data, but we need
-            # the positions from find_tables(). They align by index.
-            for t_idx, table_data in enumerate(tables):
-                # Use the bounding box position to find the nearest
-                # heading above it.
-                heading = None
-                if t_idx < len(table_bboxes):
-                    bbox = table_bboxes[t_idx]
-                    # bbox is (x0, top, x1, bottom). The `top` is a
-                    # y-coordinate from the top of the page. We
-                    # approximate the position in the extracted text
-                    # by the ratio of `top` to the page height.
-                    if page.height > 0:
-                        ratio = bbox[1] / page.height
-                        char_pos = int(len(page_text) * ratio)
-                        heading = _nearest_heading_before(page_text, char_pos)
-
-                all_chunks.extend(
-                    _table_rows_to_chunks(
-                        table_data, source_file, page_index, heading
-                    )
-                )
-
-            # Now the prose, excluding the table regions.
-            prose_text = page_text
-            for bbox in table_bboxes:
-                try:
-                    # Crop the page to everything outside this table
-                    # and add its text.
-                    cropped = page.outside_bbox(bbox)
-                    # We only use this to filter — see the approach
-                    # below.
-                except Exception:
-                    pass
-
-            # Simpler approach: if there are tables, strip out any
-            # lines that appear verbatim as cells, so we don't
-            # double-count them.
-            if table_bboxes:
-                table_cells = set()
-                for table_data in tables:
-                    for row in table_data:
-                        for cell in row:
-                            if cell:
-                                table_cells.add(str(cell).strip())
-
-                lines = prose_text.split("\n")
-                filtered_lines = []
-                for line in lines:
-                    stripped = line.strip()
-                    # Skip lines that are entirely a table cell.
-                    if stripped in table_cells:
-                        continue
-                    # Skip lines that are mostly table-like (many
-                    # pipes or tabs).
-                    if stripped.count("|") >= 2 or stripped.count("\t") >= 2:
-                        continue
-                    filtered_lines.append(line)
-                prose_text = "\n".join(filtered_lines)
-
-            # Split the prose into chunks.
-            for chunk_text in _split_paragraphs(
-                prose_text, KNOWLEDGE_CHUNK_WORDS
-            ):
-                all_chunks.append({
-                    "text": chunk_text,
-                    "metadata": {
-                        "source_file": source_file,
-                        "page_number": page_index,
-                        "section_heading": "",
-                        "type": "prose",
-                    },
-                })
-
-    return all_chunks
-
-
-def extract_text_file(path):
-    """
-    Extract chunks from a plain text file. Treats the whole file as
-    prose and splits by paragraph.
-    """
-    source_file = Path(path).name
-    text = Path(path).read_text(encoding="utf-8", errors="replace")
-
-    chunks = []
-    for chunk_text in _split_paragraphs(text, KNOWLEDGE_CHUNK_WORDS):
-        chunks.append({
-            "text": chunk_text,
-            "metadata": {
-                "source_file": source_file,
-                "page_number": 1,
-                "section_heading": "",
-                "type": "prose",
-            },
-        })
-    return chunks
-
-
-def extract(path):
-    """
-    Extract chunks from a file. Picks PDF or text based on extension.
-    """
-    p = Path(path)
-    suffix = p.suffix.lower()
-
-    if suffix == ".pdf":
-        return extract_pdf(p)
-    if suffix in (".txt", ".md"):
-        return extract_text_file(p)
-
-    raise ValueError(f"Unsupported file type: {suffix}")
-
-
-# ---------------------------------------------------------------------------
-# Store
-# ---------------------------------------------------------------------------
-
-def store_chunks(chunks, document_id):
-    """
-    Embed and store a list of chunks in Chroma. Ids are namespaced by
-    document id so chunks from different documents can't collide.
-    """
-    if not chunks:
-        return 0
-
-    collection = _get_collection()
-    texts = [c["text"] for c in chunks]
-    embeddings = _embed(texts)
-    ids = [f"doc{document_id}-{uuid.uuid4().hex[:8]}" for _ in chunks]
-    metadatas = []
-    for c in chunks:
-        md = dict(c["metadata"])
-        md["document_id"] = document_id
-        metadatas.append(md)
-
-    collection.add(
-        ids=ids,
-        documents=texts,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
-    return len(chunks)
-
-
-def delete_document(document_id):
-    """
-    Remove every chunk belonging to a document.
-    """
-    collection = _get_collection()
-    try:
-        collection.delete(where={"document_id": document_id})
-    except Exception as e:
-        logger.warning("Chroma delete failed for doc %s: %s", document_id, e)
-
-
-# ---------------------------------------------------------------------------
-# Retrieval
-# ---------------------------------------------------------------------------
-
-def retrieve(query, top_k=KNOWLEDGE_TOP_K):
-    """
-    Find the chunks most relevant to a query. Returns a list of
-    {text, metadata, score}.
-    """
-    if not query or not query.strip():
-        return []
-
-    collection = _get_collection()
-
-    # If the collection is empty, avoid calling embed — it would load
-    # the model for nothing.
-    try:
-        if collection.count() == 0:
-            return []
-    except Exception:
-        return []
-
-    query_embedding = _embed([query])[0]
-
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(top_k, max(1, collection.count())),
-        include=["documents", "metadatas", "distances"],
-    )
-
-    out = []
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0]
-    dists = results.get("distances", [[]])[0]
-
-    for text, metadata, distance in zip(docs, metas, dists):
-        out.append({
-            "text": text,
-            "metadata": metadata,
-            "score": 1 - distance,  # cosine similarity
-        })
-
-    return out
-
-
-def retrieve_containing(substring, limit=40):
-    """
-    Find chunks whose text literally contains `substring` (case-sensitive).
-
-    Retrieval by meaning (retrieve above) is weak at exact values such as
-    dates; this is a plain text match, used for those. Returns the same
-    {text, metadata, score} shape as retrieve(). Returns [] on any problem.
-    """
-    if not substring:
-        return []
-    try:
-        collection = _get_collection()
-        result = collection.get(
-            where_document={"$contains": substring},
-            limit=limit,
-            include=["documents", "metadatas"],
-        )
-    except Exception as e:
-        logger.warning("Chroma text lookup failed for %r: %s", substring, e)
-        return []
-
-    docs = result.get("documents") or []
-    metas = result.get("metadatas") or []
-    return [
-        {"text": text, "metadata": metadata or {}, "score": 1.0}
-        for text, metadata in zip(docs, metas)
-    ]
-
-
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\llm_client.py ---
 
@@ -23121,32 +21616,6 @@ MEDIA_VARIANTS = [
     ("full", 1600),
 ]
 
-
-# ---------------------------------------------------------------------------
-# Knowledge base
-# ---------------------------------------------------------------------------
-
-CHROMA_DIR = Path(os.environ.get("CHROMA_DIR", DATA_DIR / "chroma"))
-CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-
-CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "campus_knowledge")
-
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-
-KNOWLEDGE_UPLOAD_DIR = Path(
-    os.environ.get("KNOWLEDGE_UPLOAD_DIR", DATA_DIR / "knowledge")
-)
-KNOWLEDGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-KNOWLEDGE_MAX_UPLOAD_BYTES = int(
-    os.environ.get("KNOWLEDGE_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
-)
-
-KNOWLEDGE_CHUNK_WORDS = int(os.environ.get("KNOWLEDGE_CHUNK_WORDS", 300))
-
-KNOWLEDGE_TOP_K = int(os.environ.get("KNOWLEDGE_TOP_K", 5))
-
-
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
@@ -23203,6 +21672,7 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 # ---------------------------------------------------------------------------
 
 SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\ai_navigator.py ---
 
@@ -29071,54 +27541,6 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\knowledge_probe.py ---
-
-"""
-knowledge_probe.py
-
-Test extraction on a document without uploading it. Prints the
-chunks the pipeline would produce, so you can see whether the tables
-and prose come out cleanly.
-
-Usage:
-    python -m backend.pipeline.knowledge_probe path/to/document.pdf
-    python -m backend.pipeline.knowledge_probe path/to/document.pdf --limit 10
-"""
-
-import argparse
-from pathlib import Path
-
-from backend.api.services import knowledge_service
-
-
-def probe(path, limit=None):
-    """Run extraction and print the resulting chunks."""
-    print(f"Probing {path}\n")
-
-    chunks = knowledge_service.extract(path)
-    print(f"Total chunks: {len(chunks)}\n")
-
-    # Count by type.
-    table_chunks = [c for c in chunks if c["metadata"]["type"] == "table_row"]
-    prose_chunks = [c for c in chunks if c["metadata"]["type"] == "prose"]
-    print(f"  Table rows:  {len(table_chunks)}")
-    print(f"  Prose:       {len(prose_chunks)}\n")
-
-    to_show = chunks[:limit] if limit else chunks
-    for i, chunk in enumerate(to_show):
-        print(f"--- Chunk {i + 1} ({chunk['metadata']['type']}, "
-              f"page {chunk['metadata']['page_number']}) ---")
-        print(chunk["text"][:300])
-        print()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("path")
-    parser.add_argument("--limit", type=int, default=5)
-    args = parser.parse_args()
-    probe(args.path, limit=args.limit)
-
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\pipeline\make_qr_codes.py ---
 
 """
@@ -30598,162 +29020,6 @@ class TestRouteChat:
         assert "document" not in reply
         assert "handbook" not in reply
         assert "almanac" not in reply
-
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_api_chat_doc.py ---
-
-"""
-Tests for the document chat endpoints.
-
-These upload a small text file to the knowledge base, then ask
-questions about it.
-"""
-
-import pytest
-
-
-@pytest.fixture(autouse=True)
-def clean_knowledge_base(client):
-    """
-    Wipe the knowledge base before each test so tests don't leak
-    documents into each other.
-
-    Chroma persists between test runs and between fixtures, so a
-    document uploaded in one test is still present in the next.
-    This fixture makes each test start from a clean collection.
-    """
-    # Delete all documents before the test runs.
-    docs = client.get(
-        "/api/admin/knowledge",
-        headers={"X-Admin-Key": "test-admin-key"},
-    ).json()
-    for d in docs:
-        client.delete(
-            f"/api/admin/knowledge/{d['id']}",
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-    yield
-
-
-def _upload_knowledge(client, filename, content):
-    return client.post(
-        "/api/admin/knowledge/upload",
-        files={"file": (filename, content.encode("utf-8"), "text/plain")},
-        headers={"X-Admin-Key": "test-admin-key"},
-    )
-
-
-class TestDocChatSession:
-    def test_start_session(self, client):
-        r = client.post("/api/chat/doc/session")
-        assert r.status_code == 200
-        assert len(r.json()["session_id"]) > 20
-
-    def test_end_session(self, client):
-        session_id = client.post("/api/chat/doc/session").json()["session_id"]
-        r = client.delete(f"/api/chat/doc/session/{session_id}")
-        assert r.status_code == 204
-
-
-class TestDocChatRequiresNoRoute:
-    def test_chat_does_not_accept_route_fields(self, client, temp_db):
-        """
-        The doc chat endpoint has no route fields. Sending them should
-        either be ignored or rejected — but the request should still
-        work.
-        """
-        _upload_knowledge(
-            client,
-            "hours.txt",
-            "The library is open from 8 AM to 10 PM on weekdays.",
-        )
-
-        r = client.post(
-            "/api/chat/doc",
-            json={
-                "message": "when is the library open",
-                # Some clients might send route fields by mistake.
-                # The endpoint should still work.
-                "from_place_id": 1,
-                "to_place_id": 2,
-            },
-        )
-        assert r.status_code == 200
-
-
-class TestDocChatWithKnowledge:
-    def test_knowledge_question_uses_documents(self, client, temp_db):
-        _upload_knowledge(
-            client,
-            "rules.txt",
-            "The library closes at 6 PM on Saturdays. "
-            "Late fees are 500 shillings per day.",
-        )
-
-        r = client.post(
-            "/api/chat/doc",
-            json={"message": "what time does the library close on Saturdays"},
-        )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["used_knowledge"] is True
-
-    def test_unrelated_question_returns_not_found_message(self, client, temp_db):
-        _upload_knowledge(
-            client,
-            "narrow.txt",
-            "The library has 200 study seats.",
-        )
-
-        r = client.post(
-            "/api/chat/doc",
-            json={"message": "what is the capital of France"},
-        )
-        assert r.status_code == 200
-        body = r.json()
-        # The knowledge base should either not retrieve anything
-        # relevant, or retrieve chunks that don't answer the question.
-        # Either way, the reply should indicate uncertainty.
-        reply = body["reply"].lower()
-        assert any(
-            phrase in reply
-            for phrase in [
-                "don't know",
-                "dont know",
-                "not sure",
-                "check the",
-                "don't have",
-                "dont have",
-                "no information",
-            ]
-        ) or body["used_knowledge"] is False
-
-    def test_chat_with_no_documents_says_so(self, client, temp_db):
-        r = client.post(
-            "/api/chat/doc",
-            json={"message": "anything at all"},
-        )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["used_knowledge"] is False
-
-
-class TestDocSearch:
-    def test_search_returns_chunks(self, client, temp_db):
-        _upload_knowledge(
-            client,
-            "facts.txt",
-            "The university was founded in 1988.",
-        )
-
-        r = client.get("/api/chat/doc/search?q=founded")
-        assert r.status_code == 200
-        results = r.json()
-        assert len(results) > 0
-        assert any("1988" in r["text"] for r in results)
-
-    def test_search_requires_query(self, client):
-        r = client.get("/api/chat/doc/search")
-        assert r.status_code == 422
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_api_destinations.py ---
 
@@ -33086,131 +31352,6 @@ class TestIngestIdempotent:
             count = session.query(Place).count()
         assert count == 2
 
---- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_knowledge.py ---
-
-"""
-Tests for the knowledge base.
-
-These tests use a small text file rather than a PDF, because a PDF
-would need to be committed to the repository. The text path exercises
-the same chunking and storage code that the PDF path does, minus the
-table extraction.
-"""
-
-import io
-
-
-def _make_text_file(content):
-    """Return the bytes of a simple text file."""
-    return content.encode("utf-8")
-
-
-class TestUpload:
-    def test_upload_text_file(self, client, temp_db):
-        """
-        Upload a small text file. It should extract, chunk, embed, and
-        return ready with a non-zero chunk count.
-        """
-        content = (
-            "The library is open from 8 AM to 10 PM Monday to Friday.\n\n"
-            "It closes at 6 PM on Saturdays and is closed on Sundays.\n\n"
-            "Late fees are 500 shillings per day."
-        )
-
-        r = client.post(
-            "/api/admin/knowledge/upload",
-            files={"file": ("library.txt", _make_text_file(content), "text/plain")},
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-        assert r.status_code == 201, r.text
-        body = r.json()
-        assert body["status"] == "ready"
-        assert body["chunk_count"] > 0
-        assert body["filename"] == "library.txt"
-
-    def test_upload_rejects_unsupported_type(self, client, temp_db):
-        r = client.post(
-            "/api/admin/knowledge/upload",
-            files={"file": ("image.png", b"\x89PNG", "image/png")},
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-        assert r.status_code == 400
-
-    def test_upload_requires_admin(self, client, temp_db):
-        r = client.post(
-            "/api/admin/knowledge/upload",
-            files={"file": ("x.txt", b"hello", "text/plain")},
-        )
-        assert r.status_code == 401
-
-
-class TestList:
-    def test_list_documents(self, client, temp_db):
-        client.post(
-            "/api/admin/knowledge/upload",
-            files={"file": ("a.txt", b"Some content here.", "text/plain")},
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-        r = client.get(
-            "/api/admin/knowledge",
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-        assert r.status_code == 200
-        docs = r.json()
-        assert len(docs) >= 1
-        assert docs[0]["filename"] == "a.txt"
-
-
-class TestSearch:
-    def test_search_finds_relevant_chunk(self, client, temp_db):
-        content = (
-            "The library closes at 6 PM on Saturdays.\n\n"
-            "The cafeteria serves lunch from noon to 2 PM."
-        )
-        client.post(
-            "/api/admin/knowledge/upload",
-            files={"file": ("facts.txt", _make_text_file(content), "text/plain")},
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-
-        r = client.get(
-            "/api/admin/knowledge/search?q=library+saturday+hours",
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-        assert r.status_code == 200
-        results = r.json()
-        assert len(results) > 0
-        # The top result should mention the library.
-        assert "librar" in results[0]["text"].lower()
-
-
-class TestDelete:
-    def test_delete_document(self, client, temp_db):
-        upload = client.post(
-            "/api/admin/knowledge/upload",
-            files={"file": ("del.txt", b"Temporary content.", "text/plain")},
-            headers={"X-Admin-Key": "test-admin-key"},
-        ).json()
-
-        r = client.delete(
-            f"/api/admin/knowledge/{upload['id']}",
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-        assert r.status_code == 204
-
-        docs = client.get(
-            "/api/admin/knowledge",
-            headers={"X-Admin-Key": "test-admin-key"},
-        ).json()
-        assert all(d["id"] != upload["id"] for d in docs)
-
-    def test_delete_missing_returns_404(self, client, temp_db):
-        r = client.delete(
-            "/api/admin/knowledge/99999999",
-            headers={"X-Admin-Key": "test-admin-key"},
-        )
-        assert r.status_code == 404
-
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_map_health.py ---
 
 """
@@ -35013,16 +33154,14 @@ export default function BuildingRoomsScreen() {
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\chat.jsx ---
 
-// Chat screen.
+// Walk chat screen.
 //
-// Two modes, decided by URL params:
+// Opened from the walking screen with route params (a from-place OR
+// from-coordinates, plus a destination and step index). Calls
+// /api/chat. The student is walking and asking about the walk.
 //
-//   - No route params → document chat. Calls /api/chat/doc.
-//     The student is asking about the university.
-//
-//   - Route params present (a from-place OR from-coordinates, plus a
-//     destination and step index) → route chat. Calls /api/chat. The
-//     student is walking and asking about the walk.
+// Without route params there is nothing to ask about, so the screen
+// sends the student back home.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -35041,26 +33180,12 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ChatBubble } from '@/components/ChatBubble';
 import {
-  // Route chat
   sendRouteChatMessage,
   startRouteChatSession,
   endRouteChatSession,
-  // Doc chat
-  sendDocChatMessage,
-  startDocChatSession,
-  endDocChatSession,
 } from '@/services/api';
 import { t } from '@/i18n';
-import { COLORS, FONT_SIZE, RADIUS, SPACING } from '@/constants/theme';
-
-// Quick-prompt chips for the doc chat. Tapping one fills the input
-// with that question and sends it.
-const DOC_QUICK_PROMPTS = [
-  'When does the semester end?',
-  'What are the exam rules?',
-  'What does MUSTSO cabinet comprise of?',
-  'Who is the head of the Computer Science department?',
-];
+import { COLORS, FONT_SIZE, SPACING } from '@/constants/theme';
 
 export default function ChatScreen() {
   const params = useLocalSearchParams();
@@ -35097,10 +33222,8 @@ export default function ChatScreen() {
       ? Number(params.currentLon)
       : null;
 
-  // Route chat is active when we have a destination AND some form of
-  // starting point. That covers both a place-started walk and a
-  // GPS-started walk — the case that used to silently fall through
-  // to doc chat.
+  // Route chat needs a destination AND some form of starting point.
+  // That covers both a place-started walk and a GPS-started walk.
   const hasRouteContext = !!(
     toPlaceId &&
     (fromPlaceId != null || (fromLat != null && fromLon != null))
@@ -35115,15 +33238,18 @@ export default function ChatScreen() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(null);
 
-  // Start the right kind of session on mount.
+  // Nothing to chat about without a walk — go home.
   useEffect(() => {
+    if (!hasRouteContext) router.replace('/');
+  }, [hasRouteContext]);
+
+  // Start a route chat session on mount.
+  useEffect(() => {
+    if (!hasRouteContext) return undefined;
     let cancelled = false;
     let startedSessionId = null;
 
-    const start = hasRouteContext ? startRouteChatSession : startDocChatSession;
-    const end = hasRouteContext ? endRouteChatSession : endDocChatSession;
-
-    start()
+    startRouteChatSession()
       .then((data) => {
         if (!cancelled) {
           startedSessionId = data.session_id;
@@ -35137,23 +33263,19 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
       if (startedSessionId) {
-        end(startedSessionId).catch(() => {});
+        endRouteChatSession(startedSessionId).catch(() => {});
       }
     };
   }, [hasRouteContext]);
 
-  // Greeting, tailored to the mode.
   useEffect(() => {
-    const greeting = hasRouteContext
-      ? t('chat.greetingWalk')
-      : t('chat.greetingDoc');
-    setMessages([{ role: 'assistant', content: greeting }]);
-  }, [hasRouteContext]);
+    setMessages([{ role: 'assistant', content: t('chat.greetingWalk') }]);
+  }, []);
 
   const send = useCallback(
     async (messageOverride) => {
       const message = (messageOverride ?? input).trim();
-      if (!message || sending) return;
+      if (!message || sending || !hasRouteContext) return;
 
       setInput('');
       setError(null);
@@ -35161,23 +33283,18 @@ export default function ChatScreen() {
       setSending(true);
 
       try {
-        let response;
-        if (hasRouteContext) {
-          response = await sendRouteChatMessage({
-            message,
-            sessionId,
-            fromPlaceId,
-            fromLat,
-            fromLon,
-            toPlaceId,
-            currentStepIndex,
-            distanceFromStartM,
-            currentLat,
-            currentLon,
-          });
-        } else {
-          response = await sendDocChatMessage({ message, sessionId });
-        }
+        const response = await sendRouteChatMessage({
+          message,
+          sessionId,
+          fromPlaceId,
+          fromLat,
+          fromLon,
+          toPlaceId,
+          currentStepIndex,
+          distanceFromStartM,
+          currentLat,
+          currentLon,
+        });
 
         setMessages((prev) => [
           ...prev,
@@ -35224,13 +33341,11 @@ export default function ChatScreen() {
     return () => clearTimeout(timeout);
   }, [messages]);
 
-  const showQuickPrompts = !hasRouteContext && messages.length <= 1;
-
   return (
     <>
       <Stack.Screen
         options={{
-          title: hasRouteContext ? t('chat.titleWalk') : t('chat.titleDoc'),
+          title: t('chat.titleWalk'),
         }}
       />
       <KeyboardAvoidingView
@@ -35253,30 +33368,6 @@ export default function ChatScreen() {
           ) : null}
         </ScrollView>
 
-        {/* Quick prompts for the doc chat, shown until the student
-            has asked something. */}
-        {showQuickPrompts ? (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.promptsRow}
-            style={styles.promptsScroll}
-          >
-            {DOC_QUICK_PROMPTS.map((prompt) => (
-              <TouchableOpacity
-                key={prompt}
-                style={styles.promptChip}
-                onPress={() => send(prompt)}
-                disabled={sending}
-                accessibilityRole="button"
-                accessibilityLabel={prompt}
-              >
-                <Text style={styles.promptText}>{prompt}</Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
-        ) : null}
-
         {error ? <Text style={styles.error}>{error}</Text> : null}
 
         <View
@@ -35289,9 +33380,7 @@ export default function ChatScreen() {
             style={styles.input}
             value={input}
             onChangeText={setInput}
-            placeholder={
-              hasRouteContext ? t('chat.placeholderWalk') : t('chat.placeholderDoc')
-            }
+            placeholder={t('chat.placeholderWalk')}
             placeholderTextColor={COLORS.textFaint}
             multiline
             maxLength={500}
@@ -35332,29 +33421,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.md,
     paddingVertical: SPACING.sm,
     alignItems: 'flex-start',
-  },
-  promptsScroll: {
-    flexGrow: 0,
-    borderTopWidth: 1,
-    borderTopColor: COLORS.borderSubtle,
-  },
-  promptsRow: {
-    paddingHorizontal: SPACING.md,
-    paddingVertical: SPACING.sm,
-    gap: SPACING.sm,
-  },
-  promptChip: {
-    backgroundColor: COLORS.backgroundSubtle,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: RADIUS.pill,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    marginRight: SPACING.sm,
-  },
-  promptText: {
-    fontSize: FONT_SIZE.small,
-    color: COLORS.text,
   },
   error: {
     color: COLORS.danger,
@@ -35400,6 +33466,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
 });
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\app\explore.jsx ---
 
@@ -35835,10 +33902,6 @@ export default function HomeScreen() {
     router.push(`/place/${id}`);
   }, []);
 
-  const openChat = useCallback(() => {
-    router.push('/chat');
-  }, []);
-
   const openExplore = useCallback(() => {
     router.push('/explore');
   }, []);
@@ -36132,29 +34195,6 @@ export default function HomeScreen() {
             style={styles.scroll}
             contentContainerStyle={styles.scrollContent}
           >
-            <View style={styles.featureRow}>
-              <FeatureCard
-                icon={ICONS.compass}
-                iconColor="#0d9488"
-                title={t('home.exploreTitle')}
-                description={t('home.exploreDescription')}
-                onPress={openExplore}
-              />
-              <FeatureCard
-                icon={ICONS.chat}
-                iconColor="#6366f1"
-                title={t('home.chatTitle')}
-                description={t('home.chatDescription')}
-                onPress={openChat}
-              />
-            </View>
-
-            <RecentStrip
-              recents={recents}
-              favorites={favorites}
-              onPress={openPlace}
-            />
-
             <View style={styles.chipsWrapper}>
               <Text style={styles.sectionTitle}>
                 {t('home.categoriesTitle')}
@@ -36165,6 +34205,21 @@ export default function HomeScreen() {
                 counts={categoryCounts}
               />
             </View>
+
+            <View style={styles.featureRow}>
+              <FeatureCard
+                icon={ICONS.compass}
+                title={t('home.exploreTitle')}
+                description={t('home.exploreDescription')}
+                onPress={openExplore}
+              />
+            </View>
+
+            <RecentStrip
+              recents={recents}
+              favorites={favorites}
+              onPress={openPlace}
+            />
           </ScrollView>
         )}
       </View>
@@ -36224,12 +34279,10 @@ const styles = StyleSheet.create({
   scroll: { flex: 1 },
   scrollContent: { paddingBottom: SPACING.xl },
   featureRow: {
-    flexDirection: 'row',
-    gap: SPACING.md,
     paddingHorizontal: SPACING.md,
     marginTop: SPACING.md,
   },
-  chipsWrapper: { marginTop: SPACING.md },
+  chipsWrapper: { marginTop: SPACING.sm },
   sectionTitle: {
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
@@ -36264,6 +34317,7 @@ const styles = StyleSheet.create({
   },
   listContent: { paddingBottom: 32 },
 });
+
 
 
 
@@ -40455,8 +38509,9 @@ const styles = StyleSheet.create({
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\FeatureCard.jsx ---
 
-// A large tappable card with an icon, title, and description.
-// Used on the Home screen for the two main entry points.
+// A full-width tappable banner: icon on the left, title and
+// description in the middle, a chevron on the right.
+// Used on the Home screen for the Explore entry point.
 
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
@@ -40464,10 +38519,13 @@ import { MaterialIcons } from '@expo/vector-icons';
 import { COLORS, FONT_SIZE, RADIUS, SPACING, TOUCH } from '@/constants/theme';
 
 export function FeatureCard({ icon, iconColor, title, description, onPress }) {
+  const tint = iconColor || COLORS.primary;
+
   return (
     <TouchableOpacity
       style={styles.card}
       onPress={onPress}
+      activeOpacity={0.7}
       accessibilityRole="button"
       accessibilityLabel={title}
       accessibilityHint={description}
@@ -40475,56 +38533,72 @@ export function FeatureCard({ icon, iconColor, title, description, onPress }) {
       <View
         style={[
           styles.iconCircle,
-          { backgroundColor: iconColor ? `${iconColor}20` : COLORS.borderSubtle },
+          { backgroundColor: iconColor ? `${iconColor}20` : COLORS.primaryTint },
         ]}
       >
-        <MaterialIcons
-          name={icon}
-          size={26}
-          color={iconColor || COLORS.text}
-        />
+        <MaterialIcons name={icon} size={28} color={tint} />
       </View>
-      <Text style={styles.title} numberOfLines={2}>
-        {title}
-      </Text>
-      <Text style={styles.description} numberOfLines={3}>
-        {description}
-      </Text>
+
+      <View style={styles.textBlock}>
+        <Text style={styles.title} numberOfLines={1}>
+          {title}
+        </Text>
+        <Text style={styles.description} numberOfLines={2}>
+          {description}
+        </Text>
+      </View>
+
+      <MaterialIcons
+        name="chevron-right"
+        size={28}
+        color={COLORS.textFaint}
+        style={styles.chevron}
+      />
     </TouchableOpacity>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
-    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'stretch',
+    minHeight: Math.max(TOUCH.minHeight, 84),
     backgroundColor: COLORS.background,
     borderWidth: 1,
     borderColor: COLORS.border,
     borderRadius: RADIUS.md,
-    padding: SPACING.md,
-    minHeight: 150,
-    justifyContent: 'flex-start',
+    paddingVertical: SPACING.md,
+    paddingHorizontal: SPACING.md,
   },
   iconCircle: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+    width: 52,
+    height: 52,
+    borderRadius: 26,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: SPACING.md,
+    marginRight: SPACING.md,
+  },
+  textBlock: {
+    flex: 1,
+    justifyContent: 'center',
   },
   title: {
     fontSize: FONT_SIZE.large,
     fontWeight: '700',
     color: COLORS.text,
-    marginBottom: 4,
+    marginBottom: 2,
   },
   description: {
     fontSize: FONT_SIZE.small,
     color: COLORS.textMuted,
     lineHeight: 18,
   },
+  chevron: {
+    marginLeft: SPACING.sm,
+  },
 });
+
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\components\FeaturedStrip.jsx ---
 
@@ -50431,9 +48505,7 @@ export function useWalkingProgress(route) {
     "nearbyTitle": "Near me",
     "emptyHint": "Search for a place or browse categories below.",
     "exploreTitle": "Explore",
-    "exploreDescription": "Browse buildings, food, and services",
-    "chatTitle": "Campus Chat",
-    "chatDescription": "Ask about rules, history, and hours"
+    "exploreDescription": "Browse buildings, food, and services"
   },
   "start": {
     "title": "Where are you starting from?",
@@ -50520,13 +48592,10 @@ export function useWalkingProgress(route) {
   "chat": {
     "title": "Chat",
     "titleWalk": "Ask about this walk",
-    "titleDoc": "Campus Chat",
     "greetingGeneral": "Hi! Ask me where you want to go — try \"take me to the library\".",
     "greetingWalk": "Ask me anything about this walk. I can tell you what's around and what's coming up.",
-    "greetingDoc": "Hi! Ask me about the university — its rules, history, opening hours, or anything else.",
     "placeholder": "Ask something…",
     "placeholderWalk": "Ask about this walk…",
-    "placeholderDoc": "Ask about the university…",
     "send": "Send",
     "error": "Sorry, I couldn't reach the assistant. Try again in a moment.",
     "foundDestination": "Found it. Opening the route to {name}."
@@ -50698,6 +48767,7 @@ export function useWalkingProgress(route) {
 }
 
 
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\i18n\index.js ---
 
 // i18n helper. No library, just lookups.
@@ -50808,9 +48878,7 @@ export function ttsLanguageForCurrentLang() {
     "nearbyTitle": "Karibu nami",
     "emptyHint": "Tafuta mahali au vinjari kwa aina hapa chini.",
     "exploreTitle": "Vinjari",
-    "exploreDescription": "Angalia majengo, chakula, na huduma",
-    "chatTitle": "Mazungumzo ya Chuo",
-    "chatDescription": "Uliza kuhusu sheria, historia, na saa za kufungua"
+    "exploreDescription": "Angalia majengo, chakula, na huduma"
   },
   "start": {
     "title": "Unaanza kutoka wapi?",
@@ -50897,13 +48965,10 @@ export function ttsLanguageForCurrentLang() {
   "chat": {
     "title": "Ujumbe",
     "titleWalk": "Uliza kuhusu safari hii",
-    "titleDoc": "Mazungumzo ya Chuo",
     "greetingGeneral": "Habari! Niambie unakwenda wapi — jaribu \"nipeleke maktaba\".",
     "greetingWalk": "Niulize kuhusu safari hii. Naweza kukuambia kilicho karibu na kinachofuata.",
-    "greetingDoc": "Habari! Niulize kuhusu chuo — sheria zake, historia, saa za kufungua, au kitu kingine chochote.",
     "placeholder": "Uliza kitu…",
     "placeholderWalk": "Uliza kuhusu safari hii…",
-    "placeholderDoc": "Uliza kuhusu chuo…",
     "send": "Tuma",
     "error": "Samahani, sikuweza kufikia msaidizi. Jaribu tena baadaye.",
     "foundDestination": "Nimeipata. Nafungua njia kwa {name}."
@@ -51073,6 +49138,7 @@ export function ttsLanguageForCurrentLang() {
     "number": "Ghorofa ya {n}"
   }
 }
+
 
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\jest.setup.js ---
@@ -68717,35 +66783,6 @@ export async function sendRouteChatMessage({
 }
 
 // ---------------------------------------------------------------
-// Doc chat (university questions)
-// ---------------------------------------------------------------
-
-export async function startDocChatSession() {
-  return request('/api/chat/doc/session', { method: 'POST' });
-}
-
-export async function endDocChatSession(sessionId) {
-  return request(`/api/chat/doc/session/${sessionId}`, { method: 'DELETE' });
-}
-
-export async function sendDocChatMessage({ message, sessionId }) {
-  const body = {
-    message,
-    session_id: sessionId || null,
-  };
-  return request('/api/chat/doc', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-}
-
-export async function searchKnowledge(q, { topK = 5 } = {}) {
-  const params = new URLSearchParams({ q, top_k: String(topK) });
-  return request(`/api/chat/doc/search?${params.toString()}`);
-}
-
-// ---------------------------------------------------------------
 // Wi-Fi
 // ---------------------------------------------------------------
 
@@ -68803,6 +66840,7 @@ export async function listIndoorDoors({ buildingName } = {}) {
 export async function getHealth() {
   return request('/api/health');
 }
+
 
 
 
