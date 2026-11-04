@@ -32,12 +32,10 @@ def temp_db(tmp_path, monkeypatch):
     import backend.api.settings as settings_module
     import backend.api.db.session as session_module
     import backend.api.services.media_service as media_service_module
-    import backend.api.services.knowledge_service as knowledge_service_module
 
     importlib.reload(settings_module)
     importlib.reload(session_module)
     importlib.reload(media_service_module)
-    importlib.reload(knowledge_service_module)
 
     from backend.api.db.init_db import init_db
 

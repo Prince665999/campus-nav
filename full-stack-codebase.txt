@@ -20049,6 +20049,106 @@ def _resolve_coord_start(
     return best_id, "your current location"
 
 
+# The id of the temporary node that stands for the walker's exact
+# position on a path. It starts with "o" so everything that tells indoor
+# from outdoor by the prefix treats it as outdoor.
+VIRTUAL_OUTDOOR_START_ID = "o__virtual_start__"
+
+
+def _is_outdoor_walk_edge(bundle):
+    """Edge filter: plain outdoor footpath edges only."""
+    outdoor_ids = bundle["outdoor_node_ids"]
+
+    def keep(a, entry):
+        info = entry[2] if len(entry) > 2 else None
+        return (
+            bool(info)
+            and info.get("outdoor") is True
+            and not info.get("connector")
+            and a in outdoor_ids
+            and entry[0] in outdoor_ids
+        )
+
+    return keep
+
+
+def _snap_live_fix_to_outdoor_edge(lat, lon, bundle, accuracy_m=None):
+    """
+    Snap a live GPS fix to the nearest POINT on an outdoor footpath.
+
+    Returns a snap dict (see campus_graph.nearest_point_on_graph), or
+    None if the fix is too far from every outdoor path to trust. Uses
+    the same distance limit as the outdoor engine.
+    """
+    from backend.core.campus_graph import nearest_point_on_graph
+    from .routing_service import _snap_limit_m
+
+    if accuracy_m is not None:
+        logger.info(
+            "Composer: routing from live fix at (%.5f, %.5f) accuracy %.1fm",
+            lat, lon, accuracy_m,
+        )
+
+    snap = nearest_point_on_graph(
+        bundle["graph"], bundle["nodes"], lat, lon,
+        edge_filter=_is_outdoor_walk_edge(bundle),
+    )
+    if snap is None or snap["distance_m"] > _snap_limit_m(accuracy_m):
+        logger.info(
+            "Composer: live fix is too far from any outdoor path "
+            "(nearest %.1fm) — refusing to route from it",
+            snap["distance_m"] if snap else float("inf"),
+        )
+        return None
+    return snap
+
+
+def _start_node_for_snap(snap):
+    """
+    (node_id, snap_or_None) for a snapped start.
+
+    If the snap lands within VIRTUAL_SNAP_MIN_M of a real node, that
+    node IS the start (no virtual node, so no zero-length edge that
+    would invent a bearing). Otherwise the start is the virtual node.
+    """
+    from backend.core.campus_graph import VIRTUAL_SNAP_MIN_M
+
+    da = snap["t"] * snap["edge_len_m"]
+    db = (1.0 - snap["t"]) * snap["edge_len_m"]
+    if da <= VIRTUAL_SNAP_MIN_M:
+        return snap["a"], None
+    if db <= VIRTUAL_SNAP_MIN_M:
+        return snap["b"], None
+    return VIRTUAL_OUTDOOR_START_ID, snap
+
+
+def _with_virtual_outdoor_start(graph, nodes, snap):
+    """
+    Copy of the merged graph and nodes in which the snapped point is a
+    real node, joined to both ends of the edge it sits on.
+
+    The copies are shallow: only the two adjacency lists touched are
+    replaced. The shared bundle is never modified.
+    """
+    a, b, t, length = snap["a"], snap["b"], snap["t"], snap["edge_len_m"]
+    da = t * length
+    db = (1.0 - t) * length
+    info = snap["info"]
+
+    g = dict(graph)
+    g[a] = list(graph[a]) + [(VIRTUAL_OUTDOOR_START_ID, da, info)]
+    g[b] = list(graph[b]) + [(VIRTUAL_OUTDOOR_START_ID, db, info)]
+    g[VIRTUAL_OUTDOOR_START_ID] = [(a, da, info), (b, db, info)]
+
+    n = dict(nodes)
+    n[VIRTUAL_OUTDOOR_START_ID] = {
+        "lat": snap["lat"],
+        "lon": snap["lon"],
+        "tags": {},
+    }
+    return g, n
+
+
 # ---------------------------------------------------------------------------
 # Composer
 # ---------------------------------------------------------------------------
@@ -20105,20 +20205,23 @@ def compose_route(
     if from_place is not None:
         from_ep = _classify_endpoint(from_place)
     elif from_lat is not None and from_lon is not None:
-        node_id, display_name = _resolve_coord_start(
-            from_lat, from_lon, bundle,
-            is_live_fix=True,
-            accuracy_m=from_accuracy_m,
+        # Start from the point on the footpath nearest the student, not
+        # from the nearest junction/node (which can be 20-40 m away and
+        # behind them). See _with_virtual_outdoor_start.
+        snap = _snap_live_fix_to_outdoor_edge(
+            from_lat, from_lon, bundle, accuracy_m=from_accuracy_m
         )
-        if node_id is None:
+        if snap is None:
             raise UnreliableLocationError()
+        start_id, virtual_snap = _start_node_for_snap(snap)
         from_ep = {
             "engine": "indoor",
             "place_id": None,
             "kind": "outdoor",
-            "node_id": node_id,
-            "osm_id": node_id[1:] if node_id.startswith("o") else node_id,
-            "name": display_name,
+            "node_id": start_id,
+            "osm_id": start_id[1:] if start_id.startswith("o") else start_id,
+            "name": "your current location",
+            "snap": virtual_snap,
         }
     else:
         raise RouteCompositionError(
@@ -20213,6 +20316,13 @@ def _resolve_path_for_outdoor_route(
     from .routing_service import _resolve_endpoint
     from backend.core.campus_graph import a_star
 
+    # The route engine already knows the exact path it walked, including
+    # a virtual start on the nearest path edge for a live GPS start.
+    # Re-deriving it here from the nearest NODE would give a different
+    # path, so use the engine's when it exists.
+    if getattr(route, "node_path", None):
+        return list(route.node_path)
+
     from_node, _ = _resolve_endpoint(
         session, graph, nodes,
         place_id=from_place_id,
@@ -20248,6 +20358,14 @@ def _route_via_indoor_engine(from_ep, to_ep):
 
     from_id = from_ep["node_id"]
     to_id = to_ep["node_id"]
+
+    # A live GPS start carries the exact point on the footpath the
+    # student is standing on. Put that point into a temporary copy of
+    # the graph; everything below then works on that copy exactly as it
+    # would on the shared graph.
+    snap = from_ep.get("snap")
+    if snap is not None:
+        graph, nodes = _with_virtual_outdoor_start(graph, nodes, snap)
 
     if from_id not in graph:
         raise RouteCompositionError(
@@ -20309,7 +20427,9 @@ def _route_via_indoor_engine(from_ep, to_ep):
         "from_name": from_ep["name"],
         "to_name": to_ep["name"],
         "legs": legs,
-        "node_path": path,
+        # The virtual start is not in the OSM data; narration looks
+        # every node up there, so it only receives real nodes.
+        "node_path": [n for n in path if n != VIRTUAL_OUTDOOR_START_ID],
     }
 
 
@@ -20790,8 +20910,6 @@ def _enrich_indoor_steps(annotated_steps, path, nodes, graph):
         step["level"] = level_at[gi] or "0"
         step["building_name"] = building_at[gi]
 
-
-
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\routing_service.py ---
 
 """
@@ -20808,9 +20926,12 @@ import math
 from sqlalchemy.orm import Session
 
 from backend.core.campus_graph import (
+    VIRTUAL_START_ID,
     a_star,
     generate_turn_by_turn,
     haversine_m,
+    nearest_point_on_graph,
+    with_virtual_start,
 )
 
 from ..models.place import Place
@@ -20818,7 +20939,7 @@ from ..models.route_cache import RouteCache
 from ..schemas.common import LatLon
 from ..schemas.route import RouteResponse, TurnStep
 from . import cache_service
-from .step_merge import merge_opening_step
+from .step_merge import anchor_steps_to_leg_start
 
 logger = logging.getLogger(__name__)
 
@@ -20832,6 +20953,20 @@ logger = logging.getLogger(__name__)
 # location, indoors, under cover). In both cases, the honest answer
 # is "we can't confidently place you," not "route from across campus."
 SNAP_MAX_DISTANCE_M = 40
+
+# A live fix is snapped to the nearest POINT ON A PATH (not the nearest
+# node), so the distance that matters is fix -> path. When the phone
+# itself says its accuracy is worse than SNAP_MAX_DISTANCE_M (rain, tree
+# cover), a fix that far from the path can still be a student standing
+# on it, so the limit widens to the reported accuracy, up to this cap.
+SNAP_MAX_DISTANCE_CAP_M = 75
+
+# Bump this whenever the shape of a cached route changes. The Redis key
+# and the durable RouteCache rows are both keyed on it, so old routes
+# (with the old step anchors) are simply never read again.
+#   fastest    : steps anchored to the END of each leg (one step late)
+#   fastest-v2 : steps anchored to the START of each leg
+ROUTE_CACHE_PROFILE = "fastest-v2"
 
 
 class UnreliableLocationError(Exception):
@@ -20860,6 +20995,31 @@ def _find_nearest_node(graph, nodes, lat, lon, max_distance_m=None):
     if max_distance_m is not None and best_dist > max_distance_m:
         return None
     return best_id
+
+
+def _snap_limit_m(accuracy_m):
+    if accuracy_m is None:
+        return SNAP_MAX_DISTANCE_M
+    return min(SNAP_MAX_DISTANCE_CAP_M, max(SNAP_MAX_DISTANCE_M, accuracy_m))
+
+
+def _snap_live_fix(graph, nodes, lat, lon, accuracy_m):
+    """
+    Snap a live GPS fix to the nearest point on a path edge.
+
+    Returns (graph, nodes, start_id): a graph in which the snapped
+    point exists as a node. Raises UnreliableLocationError if the fix
+    is too far from every path to trust.
+    """
+    if accuracy_m is not None:
+        logger.info(
+            "Routing from live fix at (%.5f, %.5f) accuracy %.1fm",
+            lat, lon, accuracy_m,
+        )
+    snap = nearest_point_on_graph(graph, nodes, lat, lon)
+    if snap is None or snap["distance_m"] > _snap_limit_m(accuracy_m):
+        raise UnreliableLocationError()
+    return with_virtual_start(graph, nodes, snap)
 
 
 def _resolve_endpoint(
@@ -20922,16 +21082,28 @@ def _compute_route_uncached(
     to_lat,
     to_lon,
 ):
-    from_node, from_name = _resolve_endpoint(
-        session,
-        graph,
-        nodes,
-        place_id=from_place_id,
-        lat=from_lat,
-        lon=from_lon,
-        accuracy_m=from_accuracy_m,
-        is_live_fix=(from_place_id is None and from_lat is not None),
-    )
+    is_live_start = from_place_id is None and from_lat is not None
+
+    if is_live_start:
+        # Start from the point on the path nearest the student, not the
+        # nearest junction. See nearest_point_on_graph.
+        route_graph, route_nodes, from_node = _snap_live_fix(
+            graph, nodes, from_lat, from_lon, from_accuracy_m
+        )
+        from_name = "your current location"
+    else:
+        route_graph, route_nodes = graph, nodes
+        from_node, from_name = _resolve_endpoint(
+            session,
+            graph,
+            nodes,
+            place_id=from_place_id,
+            lat=from_lat,
+            lon=from_lon,
+            accuracy_m=from_accuracy_m,
+            is_live_fix=False,
+        )
+
     to_node, to_name = _resolve_endpoint(
         session,
         graph,
@@ -20947,19 +21119,20 @@ def _compute_route_uncached(
     if from_node == to_node:
         return None
 
-    path, distance = a_star(graph, nodes, from_node, to_node)
+    path, distance = a_star(route_graph, route_nodes, from_node, to_node)
     if not path:
         return None
 
-    steps = generate_turn_by_turn(path, nodes)
-    # Fold the engine's pure opening step into the first real leg so
-    # the first instruction shown covers both the heading and the
-    # length of the first leg, instead of the length arriving a step
-    # late. See step_merge.py for the reasoning.
-    steps = merge_opening_step(steps)
+    steps = generate_turn_by_turn(path, route_nodes)
+    # Anchor every instruction to where its leg STARTS, so it is shown
+    # as soon as the walker makes the previous turn. Before this only
+    # the first step was corrected and every later one appeared a full
+    # leg late. See step_merge.anchor_steps_to_leg_start.
+    steps = anchor_steps_to_leg_start(steps)
 
     geometry = [
-        LatLon(lat=nodes[nid]["lat"], lon=nodes[nid]["lon"]) for nid in path
+        LatLon(lat=route_nodes[nid]["lat"], lon=route_nodes[nid]["lon"])
+        for nid in path
     ]
 
     return RouteResponse(
@@ -20976,6 +21149,9 @@ def _compute_route_uncached(
         geometry=geometry,
         from_name=from_name,
         to_name=to_name,
+        # Real graph nodes only: the virtual start is not in the OSM
+        # data, and narration looks every node up there.
+        node_path=["o" + n for n in path if n != VIRTUAL_START_ID],
     )
 
 
@@ -21022,7 +21198,9 @@ def compute_route(
             to_place_id, to_lat, to_lon,
         )
 
-    key = cache_service.route_key(from_place_id, to_place_id)
+    key = cache_service.route_key(
+        from_place_id, to_place_id, ROUTE_CACHE_PROFILE
+    )
     cached = cache_service.get_cached_route(key)
     if cached is not None:
         try:
@@ -21035,7 +21213,7 @@ def compute_route(
         .filter_by(
             start_place_id=from_place_id,
             end_place_id=to_place_id,
-            profile="fastest",
+            profile=ROUTE_CACHE_PROFILE,
         )
         .one_or_none()
     )
@@ -21073,7 +21251,7 @@ def _upsert_durable_cache(
         .filter_by(
             start_place_id=from_place_id,
             end_place_id=to_place_id,
-            profile="fastest",
+            profile=ROUTE_CACHE_PROFILE,
         )
         .one_or_none()
     )
@@ -21083,7 +21261,7 @@ def _upsert_durable_cache(
             RouteCache(
                 start_place_id=from_place_id,
                 end_place_id=to_place_id,
-                profile="fastest",
+                profile=ROUTE_CACHE_PROFILE,
                 path_json=json.dumps(route_dict),
                 distance_m=route_dict["distance_m"],
                 hit_count=1,
@@ -21184,6 +21362,45 @@ def merge_opening_step(steps):
         "instruction": merged_text,
     }
     return [merged, *rest]
+
+
+def anchor_steps_to_leg_start(steps):
+    """
+    Make every step's `at_m` the distance where its LEG BEGINS.
+
+    The engine writes "Continue for 80 meters, then turn right" on the
+    step whose at_m is the turn node: the END of that 80 m leg. The
+    walking screen switches to a step when the walker reaches its at_m,
+    so each instruction only appeared after the walker had already
+    walked the leg it describes. `merge_opening_step` fixed this for
+    the first step only; every later step stayed one leg behind
+    (instruction N shown during leg N+1).
+
+    This function applies the fix to all of them:
+
+        engine:  [start@0, t1@T1, t2@T2, ..., arrive@total]
+        result:  [(start+t1)@0, t2@T1, t3@T2, ..., arrive@Tlast]
+
+    Step k now begins at the turn that ends the previous leg, so it is
+    shown as soon as the walker makes that turn. `distance_m`, `kind`
+    and every instruction are unchanged.
+
+    The last step ("...and you'll arrive") begins at the final turn.
+    Its distance-to-go must therefore be measured to the route's total
+    length, not to its own at_m; the app does this.
+    """
+    if not steps or len(steps) < 2:
+        return steps
+
+    merged = merge_opening_step(steps)
+
+    # merged[0] came from steps[0] + steps[1] and stays at 0.0.
+    # merged[k] for k >= 1 is the engine's steps[k + 1], whose leg
+    # starts at the previous engine step's at_m, i.e. steps[k].
+    out = [merged[0]]
+    for k in range(1, len(merged)):
+        out.append({**merged[k], "at_m": steps[k]["at_m"]})
+    return out
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\api\services\timetable_service.py ---
 
@@ -22926,6 +23143,116 @@ def build_graph(nodes, ways):
             edge_tags[frozenset((a, b))] = tags
 
     return graph, footpath_edges, edge_tags
+
+
+# ---------- Snapping a live position onto the path network ----------
+#
+# A footpath is a chain of nodes joined by straight edges. A student
+# standing on a long edge may be 30 m from the nearest node, and that
+# node can be BEHIND them. Snapping to the nearest NODE therefore puts
+# the start of the route on a junction or a corner, away from where the
+# student really is, and can even send them backwards first.
+#
+# The helpers below snap to the nearest POINT ON AN EDGE instead, and
+# insert that point into a temporary copy of the graph as a virtual
+# start node. The graph itself is never modified.
+
+VIRTUAL_START_ID = "__virtual_start__"
+
+# If the snapped point is this close to a real node, just use the node.
+VIRTUAL_SNAP_MIN_M = 1.5
+
+
+def nearest_point_on_graph(graph, nodes, lat, lon, edge_filter=None):
+    """
+    Closest point to (lat, lon) on ANY edge of the graph.
+
+    Adjacency entries may be (neighbour, distance) as in the outdoor
+    graph, or (neighbour, distance, edge_info) as in the merged
+    indoor/outdoor graph. `edge_filter(a, entry)`, if given, can skip
+    edges (the merged graph uses it to ignore indoor and connector
+    edges).
+
+    Returns a dict:
+        a, b          the edge's two node ids
+        t             0..1, how far from a toward b the point lies
+        edge_len_m    length of the edge
+        lat, lon      the snapped point
+        distance_m    how far (lat, lon) is from the snapped point
+        info          the edge's info dict (merged graph) or None
+    or None if the graph has no edges.
+    """
+    best = None
+    seen = set()
+    p = (lat, lon)
+
+    for a, neighbours in graph.items():
+        na = nodes.get(a)
+        if na is None:
+            continue
+        for entry in neighbours:
+            if edge_filter is not None and not edge_filter(a, entry):
+                continue
+            b, edge_len = entry[0], entry[1]
+            key = (a, b) if str(a) < str(b) else (b, a)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            nb = nodes.get(b)
+            if nb is None:
+                continue
+
+            dist, t, _side = point_segment_info(
+                p, (na["lat"], na["lon"]), (nb["lat"], nb["lon"])
+            )
+            if best is None or dist < best["distance_m"]:
+                best = {
+                    "a": a,
+                    "b": b,
+                    "t": t,
+                    "edge_len_m": edge_len,
+                    "lat": na["lat"] + (nb["lat"] - na["lat"]) * t,
+                    "lon": na["lon"] + (nb["lon"] - na["lon"]) * t,
+                    "distance_m": dist,
+                    "info": entry[2] if len(entry) > 2 else None,
+                }
+
+    return best
+
+
+def with_virtual_start(graph, nodes, snap, name="your current location"):
+    """
+    Build a temporary graph in which the snapped point is a real node.
+
+    Returns (graph2, nodes2, start_id). If the snap lands within
+    VIRTUAL_SNAP_MIN_M of an existing node, that node is used and the
+    original graph and nodes are returned unchanged.
+
+    The copies are shallow: only the two adjacency lists touched are
+    replaced, so this is cheap and the caller's graph is never mutated.
+    """
+    a, b, t, length = snap["a"], snap["b"], snap["t"], snap["edge_len_m"]
+    da = t * length
+    db = (1.0 - t) * length
+
+    if da <= VIRTUAL_SNAP_MIN_M:
+        return graph, nodes, a
+    if db <= VIRTUAL_SNAP_MIN_M:
+        return graph, nodes, b
+
+    g = dict(graph)
+    g[a] = list(graph[a]) + [(VIRTUAL_START_ID, da)]
+    g[b] = list(graph[b]) + [(VIRTUAL_START_ID, db)]
+    g[VIRTUAL_START_ID] = [(a, da), (b, db)]
+
+    n = dict(nodes)
+    n[VIRTUAL_START_ID] = {
+        "lat": snap["lat"],
+        "lon": snap["lon"],
+        "tags": {"name": name},
+    }
+    return g, n, VIRTUAL_START_ID
 
 
 def named_nodes(nodes):
@@ -25052,6 +25379,456 @@ def alongside_doors(analysis):
             if d["node_id"] not in best or e["perp_m"] < best[d["node_id"]]["perp_m"]:
                 best[d["node_id"]] = e
     return sorted(best.values(), key=lambda e: e["route_m"])
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\indoor\test_indoor.py ---
+
+"""
+test_indoor.py
+
+A standalone terminal tester for the indoor navigation engine.
+It only needs:
+  - final.osm (your indoor map)
+  - the three frozen files in this folder:
+        campus_graph.py
+        ai_navigator.py
+        turn_by_turn.py
+
+Nothing else from the project is imported. No database, no FastAPI,
+no backend.api.* — this is purely the indoor engine.
+
+Usage
+-----
+    # Simplest: run it and follow the prompts.
+    python backend/core/indoor/test_indoor.py backend/data/final.osm
+
+    # Or set the map path in the environment and skip the argument.
+    INDOOR_OSM_PATH=backend/data/final.osm python backend/core/indoor/test_indoor.py
+
+    # Non-interactive (useful for scripts / CI):
+    python backend/core/indoor/test_indoor.py backend/data/final.osm \
+        --from "Room 106" --to "Library Entrance" --no-ai
+
+    # See the raw door-count analysis (why it trusted or rejected a count).
+    python backend/core/indoor/test_indoor.py backend/data/final.osm \
+        --from "Room 106" --to "Room 210" --explain-doors
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# --- Make the three frozen files importable. -------------------------------
+# They import each other as top-level modules (`import campus_graph`), so
+# their folder has to be on sys.path.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from campus_graph import (                                 # noqa: E402
+    parse_osm,
+    build_graph,
+    named_nodes,
+    find_named_node,
+    a_star,
+    generate_turn_by_turn,
+    total_distance_m,
+    level_label,
+    node_display_name,
+    is_door,
+    is_entrance,
+)
+from ai_navigator import (                                 # noqa: E402
+    route_door_facts,
+    landmarks_along_route,
+    corridor_notes,
+    build_prompt,
+    call_groq,
+    door_count_summary,
+    merge_steps_for_narration,
+)
+
+
+# ---------------------------------------------------------------------------
+# Graph diagnostics
+# ---------------------------------------------------------------------------
+
+def _graph_diagnostics(nodes, graph, door_nodes, entrance_nodes):
+    """
+    Return a dict describing the health of the loaded graph.
+    These are the things that most commonly stop routing from working.
+    """
+    all_ids = set(nodes.keys())
+    on_graph = set(graph.keys())
+    routable = all_ids & on_graph
+
+    # Components: how many disconnected islands are there?
+    seen = set()
+    components = 0
+    component_sizes = []
+    for start in routable:
+        if start in seen:
+            continue
+        components += 1
+        stack = [start]
+        size = 0
+        while stack:
+            n = stack.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            size += 1
+            for nb, _d, _info in graph.get(n, ()):
+                if nb not in seen:
+                    stack.append(nb)
+        component_sizes.append(size)
+    component_sizes.sort(reverse=True)
+
+    doors_on_graph = door_nodes & on_graph
+    doors_off_graph = door_nodes - on_graph
+    entrances_on_graph = entrance_nodes & on_graph
+    entrances_off_graph = entrance_nodes - on_graph
+
+    return {
+        "total_nodes": len(all_ids),
+        "on_graph_nodes": len(routable),
+        "components": components,
+        "component_sizes": component_sizes,
+        "door_nodes": len(door_nodes),
+        "doors_on_graph": len(doors_on_graph),
+        "doors_off_graph": len(doors_off_graph),
+        "entrance_nodes": len(entrance_nodes),
+        "entrances_on_graph": len(entrances_on_graph),
+        "entrances_off_graph": len(entrances_off_graph),
+    }
+
+
+def _print_diagnostics(diag):
+    print("── Graph health ─────────────────────────────────────")
+    print(f"  nodes in file:          {diag['total_nodes']}")
+    print(f"  nodes on graph:         {diag['on_graph_nodes']}")
+    print(f"  connected components:   {diag['components']}  "
+          f"(sizes: {diag['component_sizes'][:6]}"
+          f"{' …' if len(diag['component_sizes']) > 6 else ''})")
+    print(f"  doors total:            {diag['door_nodes']}")
+    print(f"    on graph:             {diag['doors_on_graph']}")
+    print(f"    off graph:            {diag['doors_off_graph']}")
+    print(f"  entrances total:        {diag['entrance_nodes']}")
+    print(f"    on graph:             {diag['entrances_on_graph']}")
+    print(f"    off graph:            {diag['entrances_off_graph']}")
+
+    if diag["components"] > 1:
+        print()
+        print("  ⚠ The graph has more than one component.")
+        print("    Routing only works between nodes in the SAME component.")
+        print("    If a route fails, check whether the start and end are")
+        print("    in the same connected island (see component_sizes).")
+    if diag["doors_off_graph"]:
+        print()
+        print(f"  ⚠ {diag['doors_off_graph']} door node(s) are not on any")
+        print("    walkable way. Students can't route TO them until they")
+        print("    are connected to the corridor network.")
+    if diag["entrances_off_graph"]:
+        print()
+        print(f"  ⚠ {diag['entrances_off_graph']} entrance node(s) are")
+        print("    not on any walkable way. The outdoor engine can't")
+        print("    link through them.")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Location picker
+# ---------------------------------------------------------------------------
+
+def _format_locations_by_floor(nodes, graph, door_nodes):
+    """Group routable, named nodes by floor for display."""
+    named = named_nodes(nodes)
+    by_level = {}
+    for nid, d in named.items():
+        if nid not in graph:
+            continue
+        tags = d["tags"]
+        name = tags.get("name", "")
+        # Skip generic door names — they're navigation plumbing, not
+        # something a student would type.
+        if name.startswith("door") and name[4:].isdigit():
+            continue
+        lvl = str(tags.get("level", "0")).split(";")[0]
+        label = node_display_name(tags) or name or nid
+        marker = "  [door]" if nid in door_nodes else ""
+        by_level.setdefault(lvl, []).append(f"{label}{marker}")
+
+    return by_level
+
+
+def _print_locations(by_level):
+    if not by_level:
+        print("  (no routable named nodes found)")
+        return
+    for lvl in sorted(by_level):
+        print(f"\n  {level_label(lvl).replace('the ', '').title()}:")
+        for label in sorted(by_level[lvl]):
+            print(f"     • {label}")
+
+
+def _prompt(prompt_text):
+    try:
+        return input(prompt_text).strip()
+    except EOFError:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Step printing
+# ---------------------------------------------------------------------------
+
+def _print_steps(steps):
+    print("── Turn-by-turn ─────────────────────────────────────")
+    for i, s in enumerate(steps, 1):
+        print(f"  {i:>2}. {s['instruction']}")
+    print()
+
+
+def _print_door_analysis(door_facts, verbose):
+    if not door_facts:
+        print("  Door analysis: not available (analysis threw).")
+        return
+
+    print("── Door count ───────────────────────────────────────")
+    print(f"  {door_count_summary(door_facts)}")
+
+    if not verbose:
+        print()
+        return
+
+    dest = door_facts.get("destination") or {}
+    print(f"  reason:     {dest.get('reason') or '—'}")
+    print(f"  side:       {dest.get('side') or '—'}")
+    print(f"  ordinal:    {dest.get('ordinal') or '—'}")
+    print(f"  reliable:   {dest.get('reliable')}")
+    if dest.get("passed"):
+        print("  passed doors:")
+        for d in dest["passed"]:
+            label = d.get("name") or "(unnamed)"
+            print(f"     • #{d.get('ordinal')}  {label}  (node {d.get('node_id')})")
+    for st in door_facts.get("stretches", []) or []:
+        print(f"  stretch: level={st.get('level')} "
+              f"start_m={st.get('start_m', 0):.1f} "
+              f"len={st.get('length_m', 0):.1f} "
+              f"doors={len(st.get('doors', []))}")
+    print()
+
+
+def _print_landmarks(landmarks):
+    if not landmarks:
+        return
+    print("── Landmarks beside the route ───────────────────────")
+    for lm in landmarks:
+        desc = f" — {lm['description']}" if lm.get("description") else ""
+        print(f"  • {lm['name']} on your {lm['side']} "
+              f"(~{lm['meters_from_start']:.0f} m){desc}")
+    print()
+
+
+def _print_corridor_notes(notes):
+    if not notes:
+        return
+    print("── Corridor / path notes ────────────────────────────")
+    for n in notes:
+        print(f"  • {n}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Narration (optional, requires a Groq key)
+# ---------------------------------------------------------------------------
+
+def _run_narration(start_name, end_name, start_level, end_level,
+                   total_m, steps, landmarks, notes, door_facts, api_key):
+    print("── Narration (Groq) ─────────────────────────────────")
+    print("  Asking the model to narrate the route…")
+    print()
+
+    prompt = build_prompt(
+        start_name, end_name, start_level, end_level, total_m,
+        steps, landmarks, notes, door_facts,
+    )
+    try:
+        text = call_groq(prompt, api_key)
+    except Exception as e:                                # noqa: BLE001
+        print(f"  ✗ Groq call failed: {e}")
+        print("  Falling back to plain steps:")
+        for i, s in enumerate(steps, 1):
+            print(f"    {i}. {s['instruction']}")
+        print()
+        return
+
+    print(text.strip())
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run(args):
+    osm_path = Path(args.osm)
+    if not osm_path.exists():
+        print(f"✗ Map not found at {osm_path}", file=sys.stderr)
+        return 1
+
+    print(f"Loading {osm_path} …")
+    nodes, ways = parse_osm(str(osm_path))
+    (graph, _edge_tags, door_nodes, entrance_nodes,
+     corridor_of_door, _rooms, _stairs) = build_graph(nodes, ways)
+
+    named = named_nodes(nodes)
+    routable_named = {nid: d for nid, d in named.items() if nid in graph}
+    print(f"Loaded {len(nodes)} nodes, {len(ways)} ways, "
+          f"{len(routable_named)} routable named locations.")
+    print()
+
+    diag = _graph_diagnostics(nodes, graph, door_nodes, entrance_nodes)
+    _print_diagnostics(diag)
+
+    # --- Pick start and end. ---------------------------------------------
+    if args.show_locations:
+        print("── Available locations ──────────────────────────────")
+        _print_locations(_format_locations_by_floor(nodes, graph, door_nodes))
+        print()
+        return 0
+
+    start_query = args.start or _prompt("Start from: ")
+    if not start_query:
+        print("✗ No start given.", file=sys.stderr)
+        return 1
+
+    end_query = args.end or _prompt("Go to: ")
+    if not end_query:
+        print("✗ No destination given.", file=sys.stderr)
+        return 1
+
+    start_id = find_named_node(nodes, start_query, graph)
+    end_id = find_named_node(nodes, end_query, graph)
+
+    if not start_id:
+        print(f"✗ Couldn't match '{start_query}' to a location.", file=sys.stderr)
+        print("  Try --show-locations to see what's available.", file=sys.stderr)
+        return 1
+    if not end_id:
+        print(f"✗ Couldn't match '{end_query}' to a location.", file=sys.stderr)
+        print("  Try --show-locations to see what's available.", file=sys.stderr)
+        return 1
+    if start_id == end_id:
+        print("✗ Start and end are the same location.", file=sys.stderr)
+        return 1
+
+    start_name = node_display_name(nodes[start_id]["tags"]) or start_query
+    end_name = node_display_name(nodes[end_id]["tags"]) or end_query
+    start_level = str(nodes[start_id]["tags"].get("level", "0")).split(";")[0]
+    end_level = str(nodes[end_id]["tags"].get("level", "0")).split(";")[0]
+
+    # --- Route. ----------------------------------------------------------
+    path, distance = a_star(graph, nodes, start_id, end_id)
+    if not path:
+        print()
+        print("✗ No route found between those two nodes.", file=sys.stderr)
+        print("  Common causes:", file=sys.stderr)
+        print("    • They are in different connected components (see graph health).",
+              file=sys.stderr)
+        print("    • The end node is a door that is not on a corridor way.",
+              file=sys.stderr)
+        print("    • A corridor is missing the connecting footway.", file=sys.stderr)
+        return 1
+
+    total_m = total_distance_m(path, nodes)
+
+    print("── Route ────────────────────────────────────────────")
+    print(f"  from:      {start_name}  ({level_label(start_level)})")
+    print(f"  to:        {end_name}  ({level_label(end_level)})")
+    print(f"  distance:  about {total_m:.0f} metres")
+    print(f"  nodes:     {len(path)}")
+    if start_level != end_level:
+        print(f"  floors:    {level_label(start_level)} → {level_label(end_level)}")
+    print()
+
+    # --- Turn-by-turn. ---------------------------------------------------
+    steps = generate_turn_by_turn(path, nodes, graph, door_nodes, corridor_of_door)
+    _print_steps(steps)
+
+    # --- Door count, landmarks, corridor notes. --------------------------
+    door_facts = route_door_facts(path, nodes, graph, door_nodes)
+    landmarks = landmarks_along_route(path, nodes, door_nodes, graph, door_facts)
+    notes = corridor_notes(path, nodes, corridor_of_door, graph)
+
+    _print_door_analysis(door_facts, verbose=args.explain_doors)
+    _print_landmarks(landmarks)
+    _print_corridor_notes(notes)
+
+    # --- Optional AI narration. ------------------------------------------
+    if not args.no_ai:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            print("── Narration ────────────────────────────────────────")
+            print("  No GROQ_API_KEY set; skipping AI narration.")
+            print("  To try it, set GROQ_API_KEY (see ai_navigator.py docstring).")
+            print("  Set --no-ai to hide this message next time.")
+            print()
+        else:
+            _run_narration(
+                start_name, end_name, start_level, end_level, total_m,
+                steps, landmarks, notes, door_facts, api_key,
+            )
+
+    # --- Concise merged steps (useful for spotting merged "moves"). -----
+    if args.show_moves:
+        print("── Merged moves (what the AI prompt sees) ───────────")
+        for i, m in enumerate(merge_steps_for_narration(steps), 1):
+            print(f"  {i:>2}. {m}")
+        print()
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Standalone tester for the indoor navigation engine.",
+    )
+    parser.add_argument(
+        "osm",
+        nargs="?",
+        default=os.environ.get("INDOOR_OSM_PATH", "backend/data/final.osm"),
+        help="Path to the indoor map (default: backend/data/final.osm).",
+    )
+    parser.add_argument("--from", dest="start", help="Start location name.")
+    parser.add_argument("--to", dest="end", help="Destination name.")
+    parser.add_argument(
+        "--show-locations",
+        action="store_true",
+        help="Only list the routable named locations and exit.",
+    )
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="Skip the Groq narration step.",
+    )
+    parser.add_argument(
+        "--explain-doors",
+        action="store_true",
+        help="Print the full door-count analysis (why it trusted/rejected).",
+    )
+    parser.add_argument(
+        "--show-moves",
+        action="store_true",
+        help="Print the merged moves the AI prompt would receive.",
+    )
+
+    args = parser.parse_args()
+    sys.exit(run(args))
+
+
+if __name__ == "__main__":
+    main()
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\core\indoor\turn_by_turn.py ---
 
@@ -31445,6 +32222,188 @@ class TestChecksNeverRaise:
 
         assert check.count == direct_count
 
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_mixed_live_start.py ---
+
+"""
+Tests for a live GPS start on a MIXED (outdoor -> indoor) route.
+
+Bug being guarded against: the route used to start at the nearest
+outdoor NODE. A student standing mid-path was placed on a junction up
+to half a path length away, sometimes behind them. The start is now the
+nearest point on the footpath itself.
+
+These tests use a tiny synthetic map injected in place of the real
+indoor graph bundle, so they need no database and no OSM files.
+"""
+
+import pytest
+
+from backend.api.services import indoor_graph_builder, route_composer
+from backend.api.services.route_composer import (
+    VIRTUAL_OUTDOOR_START_ID,
+    _route_via_indoor_engine,
+    _snap_live_fix_to_outdoor_edge,
+    _start_node_for_snap,
+)
+from backend.core.campus_graph import haversine_m
+
+M = 111_195.0  # metres per degree of latitude
+
+
+def _walk(level="0", **extra):
+    return {"kind": "walk", "level": level, "way_tags": {"highway": "footway"}, **extra}
+
+
+def _bundle():
+    lat0, lon0 = -8.9430, 33.4180
+    nodes = {
+        # outdoor: o1 --(111 m north)--> o2 --(~110 m east)--> o3
+        "o1": {"lat": lat0, "lon": lon0, "tags": {}},
+        "o2": {"lat": lat0 + 111 / M, "lon": lon0, "tags": {}},
+        "o3": {"lat": lat0 + 111 / M, "lon": lon0 + 0.001, "tags": {}},
+        # building: entrance, then corridor to the destination
+        "500": {"lat": lat0 + 111 / M, "lon": lon0 + 0.0011,
+                "tags": {"entrance": "yes", "name": "Main Entrance", "level": "0"}},
+        "501": {"lat": lat0 + 111 / M, "lon": lon0 + 0.0013,
+                "tags": {"level": "0"}},
+        "502": {"lat": lat0 + 111 / M, "lon": lon0 + 0.0015,
+                "tags": {"level": "0", "name": "Room 1"}},
+    }
+
+    graph = {}
+
+    def edge(a, b, info):
+        d = haversine_m(nodes[a]["lat"], nodes[a]["lon"], nodes[b]["lat"], nodes[b]["lon"])
+        graph.setdefault(a, []).append((b, d, info))
+        graph.setdefault(b, []).append((a, d, info))
+
+    outdoor = _walk(outdoor=True)
+    edge("o1", "o2", outdoor)
+    edge("o2", "o3", outdoor)
+    edge("o3", "500", _walk(connector=True))      # connector: must NOT be snapped to
+    edge("500", "501", _walk())
+    edge("501", "502", _walk())
+
+    return {
+        "nodes": nodes,
+        "graph": graph,
+        "edge_tags": {},
+        "door_node_ids": set(),
+        "entrance_node_ids": {"500"},
+        "corridor_of_door": {},
+        "rooms": [],
+        "stair_ways": [],
+        "entrance_to_outdoor": {},
+        "outdoor_node_ids": {"o1", "o2", "o3"},
+        "indoor_node_ids": {"500", "501", "502"},
+    }
+
+
+@pytest.fixture
+def bundle(monkeypatch):
+    b = _bundle()
+    monkeypatch.setattr(indoor_graph_builder, "get_indoor_graph", lambda: b)
+    return b
+
+
+def _mid_path_fix(bundle):
+    n = bundle["nodes"]
+    # 40 m up the first path, 2 m to the side.
+    return n["o1"]["lat"] + 40 / M, n["o1"]["lon"] + 2 / 110_000
+
+
+def _route_from_fix(bundle, lat, lon, accuracy=10.0):
+    snap = _snap_live_fix_to_outdoor_edge(lat, lon, bundle, accuracy_m=accuracy)
+    assert snap is not None
+    start_id, virtual = _start_node_for_snap(snap)
+    from_ep = {
+        "engine": "indoor", "place_id": None, "kind": "outdoor",
+        "node_id": start_id,
+        "osm_id": start_id[1:] if start_id.startswith("o") else start_id,
+        "name": "your current location", "snap": virtual,
+    }
+    to_ep = {
+        "engine": "indoor", "place_id": 1, "kind": "indoor",
+        "node_id": "502", "osm_id": "502", "name": "Room 1",
+    }
+    return _route_via_indoor_engine(from_ep, to_ep), snap
+
+
+def test_snap_ignores_connector_and_indoor_edges(bundle):
+    n = bundle["nodes"]
+    # Standing right at the entrance: the nearest outdoor FOOTPATH is
+    # still o2-o3, never the connector or the corridor.
+    snap = _snap_live_fix_to_outdoor_edge(
+        n["500"]["lat"], n["500"]["lon"], bundle, accuracy_m=10
+    )
+    assert {snap["a"], snap["b"]} == {"o2", "o3"}
+
+
+def test_route_starts_at_the_exact_point_on_the_path(bundle):
+    lat, lon = _mid_path_fix(bundle)
+    route, snap = _route_from_fix(bundle, lat, lon)
+
+    first = route["geometry"][0]
+    assert haversine_m(first["lat"], first["lon"], snap["lat"], snap["lon"]) < 0.01
+    # Not on any node.
+    for nid in ("o1", "o2", "o3"):
+        n = bundle["nodes"][nid]
+        assert haversine_m(first["lat"], first["lon"], n["lat"], n["lon"]) > 20
+
+
+def test_route_heads_forward_not_back_to_the_nearest_node(bundle):
+    lat, lon = _mid_path_fix(bundle)
+    route, _ = _route_from_fix(bundle, lat, lon)
+    # 40 m up a 111 m path: only ~71 m remain to o2, then east.
+    # Walking back to o1 first would add ~80 m.
+    first_leg = route["geometry"][1]
+    o2 = bundle["nodes"]["o2"]
+    assert (first_leg["lat"], first_leg["lon"]) == (o2["lat"], o2["lon"])
+
+
+def test_virtual_node_never_leaks_out(bundle):
+    lat, lon = _mid_path_fix(bundle)
+    route, _ = _route_from_fix(bundle, lat, lon)
+    assert VIRTUAL_OUTDOOR_START_ID not in route["node_path"]
+    assert route["node_path"][0] == "o2"
+    for nid in route["node_path"]:
+        assert nid in bundle["nodes"]
+
+
+def test_shared_bundle_is_not_modified(bundle):
+    before_graph = {k: list(v) for k, v in bundle["graph"].items()}
+    before_nodes = set(bundle["nodes"])
+    lat, lon = _mid_path_fix(bundle)
+    _route_from_fix(bundle, lat, lon)
+    assert {k: list(v) for k, v in bundle["graph"].items()} == before_graph
+    assert set(bundle["nodes"]) == before_nodes
+
+
+def test_steps_start_outdoor_and_at_m_increases(bundle):
+    lat, lon = _mid_path_fix(bundle)
+    route, _ = _route_from_fix(bundle, lat, lon)
+    steps = route["steps"]
+    assert steps[0]["at_m"] == 0.0
+    assert steps[0]["mode"] == "outdoor"
+    at = [s["at_m"] for s in steps]
+    assert at == sorted(at)
+    assert route["legs"][0]["mode"] == "outdoor"
+
+
+def test_fix_too_far_from_every_path_is_refused(bundle):
+    n = bundle["nodes"]["o1"]
+    assert _snap_live_fix_to_outdoor_edge(
+        n["lat"] - 500 / M, n["lon"], bundle, accuracy_m=10
+    ) is None
+
+
+def test_snap_next_to_a_node_uses_that_node(bundle):
+    n = bundle["nodes"]["o2"]
+    snap = _snap_live_fix_to_outdoor_edge(n["lat"], n["lon"], bundle, accuracy_m=5)
+    start_id, virtual = _start_node_for_snap(snap)
+    assert start_id == "o2"
+    assert virtual is None
+
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_mixed_narration.py ---
 
 """
@@ -32669,6 +33628,82 @@ class TestExistingFiltersStillWork:
             pytest.skip("No indoor places")
         detail = client.get(f"/api/places/{items[0]['id']}").json()
         assert "building_name" in detail
+
+--- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\backend\tests\test_step_anchor.py ---
+
+"""
+Tests for step_merge.anchor_steps_to_leg_start.
+
+Bug being guarded against: every instruction after the first was shown
+one leg late. The engine pins "Continue for X, then turn left" to the
+node where that leg ENDS; the app shows a step once the walker reaches
+its at_m, so the text for leg N appeared during leg N+1.
+"""
+
+import importlib.util
+from pathlib import Path
+
+_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "api" / "services" / "step_merge.py"
+)
+_spec = importlib.util.spec_from_file_location("step_merge_under_test", _PATH)
+step_merge = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(step_merge)
+
+anchor = step_merge.anchor_steps_to_leg_start
+
+
+def _engine_steps():
+    # Legs: 0-18 m, 18-98 m, 98-148 m, 148-200 m
+    return [
+        {"kind": "start", "instruction": "Head north from Gate",
+         "at_m": 0.0, "distance_m": 0.0},
+        {"kind": "turn", "instruction": "Continue for about 18 meters, then turn left",
+         "at_m": 18.0, "distance_m": 18.0},
+        {"kind": "turn", "instruction": "Continue for about 80 meters, then turn right",
+         "at_m": 98.0, "distance_m": 80.0},
+        {"kind": "turn", "instruction": "Continue for about 50 meters, then turn left",
+         "at_m": 148.0, "distance_m": 50.0},
+        {"kind": "arrive", "instruction": "Continue for about 52 meters and you'll arrive",
+         "at_m": 200.0, "distance_m": 52.0},
+    ]
+
+
+def test_each_step_begins_where_its_leg_begins():
+    out = anchor(_engine_steps())
+    assert [s["at_m"] for s in out] == [0.0, 18.0, 98.0, 148.0]
+
+
+def test_instruction_for_a_leg_is_active_while_walking_that_leg():
+    out = anchor(_engine_steps())
+    # Walking the 80 m leg (18 m -> 98 m) must show the 80 m instruction.
+    active = [s for s in out if s["at_m"] <= 50.0][-1]
+    assert "80 meters" in active["instruction"]
+
+
+def test_first_instruction_still_merged_with_opening_heading():
+    out = anchor(_engine_steps())
+    assert out[0]["instruction"] == (
+        "Head north from Gate, continue for about 18 meters, then turn left"
+    )
+
+
+def test_distances_and_kinds_are_untouched():
+    out = anchor(_engine_steps())
+    assert [s["distance_m"] for s in out] == [18.0, 80.0, 50.0, 52.0]
+    assert [s["kind"] for s in out] == ["turn", "turn", "turn", "arrive"]
+
+
+def test_at_m_never_decreases():
+    at = [s["at_m"] for s in anchor(_engine_steps())]
+    assert at == sorted(at)
+
+
+def test_short_lists_pass_through():
+    assert anchor([]) == []
+    one = [{"kind": "start", "instruction": "x", "at_m": 0.0, "distance_m": 0.0}]
+    assert anchor(one) == one
 
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\export-selected.js ---
 
@@ -48196,7 +49231,7 @@ import {
 import { snapToRoute, haversineM } from '@/utils/geo';
 import {
   createOffRouteDetector,
-  currentStepIndex,
+  resolveStepIndex,
   distanceRemaining,
   distanceToNextStep,
   progressFraction,
@@ -48241,7 +49276,9 @@ export function useWalkingProgress(route) {
   const [distanceFromStart, setDistanceFromStart] = useState(0);
   const [offRoute, setOffRoute] = useState(false);
   const [gpsStale, setGpsStale] = useState(false);
+  const [stepIndexState, setStepIndexState] = useState(0);
 
+  const stepsRef = useRef([]);
   const detectorRef = useRef(createOffRouteDetector());
   const lastSegmentIndexRef = useRef(null);
   const lastSnapDistanceRef = useRef(0);
@@ -48255,10 +49292,12 @@ export function useWalkingProgress(route) {
       route && route.geometry && route.geometry.length > 1
         ? route.geometry
         : null;
+    stepsRef.current = route?.steps || [];
   }, [route]);
 
   // Reset smoothing and snap continuity when the route changes.
   useEffect(() => {
+    setStepIndexState(0);
     smoothRef.current = null;
     lastSegmentIndexRef.current = null;
     lastSnapDistanceRef.current = 0;
@@ -48334,6 +49373,19 @@ export function useWalkingProgress(route) {
               const isOffRoute = detectorRef.current.record(snapped.offRouteM);
               setOffRoute((prev) => (prev === isOffRoute ? prev : isOffRoute));
             }
+
+            // Step progress is updated here, on every fix we snapped,
+            // not only on fixes that pass the display gate below. A
+            // corner is passed in a second or two; waiting for a "good
+            // enough to draw" fix could skip the step change entirely
+            // until the walker was well past it.
+            setStepIndexState((prevIdx) =>
+              resolveStepIndex(
+                stepsRef.current,
+                snapped.distanceFromStartM,
+                prevIdx
+              )
+            );
           }
         }
 
@@ -48436,14 +49488,15 @@ export function useWalkingProgress(route) {
   const totalDistance = route?.distance_m || 0;
   const steps = route?.steps || [];
 
-  const stepIndex = currentStepIndex(steps, distanceFromStart);
+  const stepIndex = steps.length === 0 ? -1 : Math.min(stepIndexState, steps.length - 1);
   const step = stepIndex >= 0 ? steps[stepIndex] : null;
 
   const remaining = distanceRemaining(totalDistance, distanceFromStart);
   const nextStepDistance = distanceToNextStep(
     steps,
     stepIndex,
-    distanceFromStart
+    distanceFromStart,
+    totalDistance
   );
   const progress = progressFraction(totalDistance, distanceFromStart);
 
@@ -69010,6 +70063,16 @@ export function polygonLabelInfo(ring) {
 --- FILE: C:\Users\Prince\Desktop\CAMPUS NAVIGATION\campus-nav\mobile\utils\progress.js ---
 
 // Walks the instruction timeline forward as the student moves.
+//
+// Step anchoring contract (set by the backend, see
+// backend/api/services/step_merge.py):
+//
+//   steps[k].at_m is the distance from the start at which step k's LEG
+//   BEGINS. Step k is the instruction for walking from at_m[k] to
+//   at_m[k + 1] (the turn that ends it). So step k becomes current when
+//   the walker reaches at_m[k], and the distance to the next turn is
+//   at_m[k + 1] - distance. The last step runs to the route's total
+//   distance.
 
 export const OFF_ROUTE_THRESHOLD_M = 35;
 export const OFF_ROUTE_CONSECUTIVE_FIXES = 5;
@@ -69029,15 +70092,68 @@ export function currentStepIndex(steps, distanceFromStartM) {
   return steps.length - 1;
 }
 
+// How far BEFORE a step's at_m we already switch to it. GPS reports
+// arrive late and the voice takes a couple of seconds to speak, so
+// switching exactly at the corner means the instruction lands after
+// the walker has already taken it. Kept small: the text describes the
+// leg that starts at the corner.
+export const STEP_SWITCH_LOOKAHEAD_M = 3;
+
+// How far back along the route the walker must go before we allow the
+// step index to go back to an earlier step. Smaller than this is GPS
+// noise and snap flicker at a corner, which must not re-announce a
+// step that was already spoken.
+export const STEP_BACKTRACK_M = 25;
+
+/**
+ * Pick the step index for a position, never flickering backwards.
+ *
+ * currentStepIndex() is a pure function of distance. Near a corner the
+ * snapped distance can wobble by a few metres either side of at_m, which
+ * flipped the card (and the spoken instruction) back and forth. This
+ * keeps the highest step reached, and only lets the index drop when
+ * the walker has genuinely gone back STEP_BACKTRACK_M behind where
+ * that step began.
+ *
+ * It also never lags: if the walker has passed several corners between
+ * two fixes (a shortcut, a gap in GPS), the index jumps straight to
+ * the step they are on now, not one at a time.
+ */
+export function resolveStepIndex(steps, distanceFromStartM, previousIndex = 0) {
+  if (!steps || steps.length === 0) return -1;
+
+  const raw = currentStepIndex(
+    steps,
+    distanceFromStartM + STEP_SWITCH_LOOKAHEAD_M
+  );
+
+  const prev = Math.min(Math.max(previousIndex ?? 0, 0), steps.length - 1);
+  if (raw >= prev) return raw;
+
+  // The walker appears to be behind the step already shown.
+  const backtracked = steps[prev].at_m - distanceFromStartM;
+  return backtracked > STEP_BACKTRACK_M ? raw : prev;
+}
+
 export function distanceRemaining(totalDistanceM, distanceFromStartM) {
   return Math.max(0, totalDistanceM - distanceFromStartM);
 }
 
-export function distanceToNextStep(steps, currentIndex, distanceFromStartM) {
+export function distanceToNextStep(
+  steps,
+  currentIndex,
+  distanceFromStartM,
+  totalDistanceM = null
+) {
   if (!steps || steps.length === 0) return 0;
   if (currentIndex >= steps.length - 1) {
-    const last = steps[steps.length - 1];
-    return Math.max(0, last.at_m - distanceFromStartM);
+    // The last step's leg ends at the destination. (Its own at_m is
+    // where the leg BEGINS, so measuring to it would always give 0.)
+    const end =
+      totalDistanceM != null && totalDistanceM > 0
+        ? totalDistanceM
+        : steps[steps.length - 1].at_m;
+    return Math.max(0, end - distanceFromStartM);
   }
   const next = steps[currentIndex + 1];
   return Math.max(0, next.at_m - distanceFromStartM);
@@ -70384,6 +71500,9 @@ import {
   currentStepIndex,
   distanceRemaining,
   distanceToNextStep,
+  resolveStepIndex,
+  STEP_SWITCH_LOOKAHEAD_M,
+  STEP_BACKTRACK_M,
   createOffRouteDetector,
   progressFraction,
   OFF_ROUTE_THRESHOLD_M,
@@ -70442,6 +71561,64 @@ describe('distanceToNextStep', () => {
 
   test('on the last step, gives distance to arrival', () => {
     expect(distanceToNextStep(steps, 3, 180)).toBe(20);
+  });
+});
+
+describe('distanceToNextStep with a total distance', () => {
+  test('last step measures to the route total, not its own at_m', () => {
+    // The last step BEGINS at 200 m; the route ends at 252 m.
+    expect(distanceToNextStep(steps, 3, 210, 252)).toBe(42);
+  });
+});
+
+// Steps as the backend now sends them: at_m is where each leg BEGINS.
+//   leg 0:   0 -  18 m  "Head north, continue 18 m, then turn left"
+//   leg 1:  18 -  98 m  "Continue 80 m, then turn right"
+//   leg 2:  98 - 148 m  "Continue 50 m, then turn left"
+//   leg 3: 148 - 200 m  "Continue 52 m and you'll arrive"
+const legSteps = [
+  { at_m: 0, instruction: 'leg0' },
+  { at_m: 18, instruction: 'leg1' },
+  { at_m: 98, instruction: 'leg2' },
+  { at_m: 148, instruction: 'leg3' },
+];
+
+describe('resolveStepIndex', () => {
+  test('short first leg: the second instruction appears once the first turn is made', () => {
+    // Regression: with a short first leg the card stayed on step 0
+    // until the walker was far into leg 2.
+    expect(resolveStepIndex(legSteps, 10, 0)).toBe(0);
+    expect(resolveStepIndex(legSteps, 25, 0)).toBe(1);
+  });
+
+  test('every instruction is shown during its own leg, never one behind', () => {
+    expect(resolveStepIndex(legSteps, 60, 1)).toBe(1);
+    expect(resolveStepIndex(legSteps, 110, 1)).toBe(2);
+    expect(resolveStepIndex(legSteps, 160, 2)).toBe(3);
+  });
+
+  test('switches slightly early to absorb GPS and voice delay', () => {
+    expect(resolveStepIndex(legSteps, 18 - STEP_SWITCH_LOOKAHEAD_M, 0)).toBe(1);
+    expect(resolveStepIndex(legSteps, 18 - STEP_SWITCH_LOOKAHEAD_M - 1, 0)).toBe(0);
+  });
+
+  test('skipped corners catch up in one jump', () => {
+    // A shortcut or GPS gap carries the walker across two corners
+    // between fixes: land on the step they are on, not the next one.
+    expect(resolveStepIndex(legSteps, 120, 0)).toBe(2);
+  });
+
+  test('snap flicker at a corner does not move the index backwards', () => {
+    expect(resolveStepIndex(legSteps, 14, 1)).toBe(1);
+    expect(resolveStepIndex(legSteps, 18 - STEP_BACKTRACK_M + 1, 1)).toBe(1);
+  });
+
+  test('walking genuinely back past the threshold allows an earlier step', () => {
+    expect(resolveStepIndex(legSteps, 80 - STEP_BACKTRACK_M - 5, 2)).toBe(1);
+  });
+
+  test('empty steps returns -1', () => {
+    expect(resolveStepIndex([], 10, 0)).toBe(-1);
   });
 });
 
